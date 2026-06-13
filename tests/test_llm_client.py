@@ -33,3 +33,37 @@ def test_complete_raises_on_http_error():
     llm = LocalLLMClient("http://localhost:8000/v1", "m", client=client)
     with pytest.raises(httpx.HTTPStatusError):
         llm.complete("hi")
+
+
+def _routed(models):
+    def handler(request: "httpx.Request") -> "httpx.Response":
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": m} for m in models]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]})
+    return httpx.MockTransport(handler)
+
+
+def test_check_ok_when_reachable_and_model_present():
+    client = httpx.Client(transport=_routed(["qwen2.5:14b-instruct"]))
+    llm = LocalLLMClient("http://win-pc:11434/v1", "qwen2.5:14b-instruct", client=client)
+    ok, msg = llm.check()
+    assert ok is True
+    assert "reachable" in msg and "OK" in msg
+
+
+def test_check_warns_when_model_missing_but_still_ok():
+    client = httpx.Client(transport=_routed(["some-other-model"]))
+    llm = LocalLLMClient("http://win-pc:11434/v1", "qwen2.5:14b-instruct", client=client)
+    ok, msg = llm.check()
+    assert ok is True  # endpoint works; just a model-name warning
+    assert "WARNING" in msg
+
+
+def test_check_fails_when_unreachable():
+    def boom(request):
+        raise httpx.ConnectError("connection refused")
+    client = httpx.Client(transport=httpx.MockTransport(boom))
+    llm = LocalLLMClient("http://win-pc:11434/v1", "m", client=client)
+    ok, msg = llm.check()
+    assert ok is False
+    assert "cannot reach LLM" in msg

@@ -220,8 +220,21 @@ async def run(
     return last
 
 
+def check_llm(settings: Settings) -> int:
+    """Probe the configured local LLM and print a diagnosis. Returns an exit code."""
+    from bot.matching.llm_client import LocalLLMClient
+
+    client = LocalLLMClient(settings.llm.base_url, settings.llm.reasoning_model)
+    ok, message = client.check()
+    client.close()
+    print(("OK: " if ok else "FAIL: ") + message)
+    return 0 if ok else 1
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Live read-only DRY_RUN arbitrage monitor")
+    p.add_argument("--check-llm", action="store_true",
+                   help="probe the local LLM (LLM_BASE_URL) and exit")
     p.add_argument("--once", action="store_true", help="run a single cycle and exit")
     p.add_argument("--interval", type=float, default=15.0, help="seconds between cycles")
     p.add_argument("--limit", type=int, default=50, help="markets to pull per venue")
@@ -234,6 +247,10 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.check_llm:
+        raise SystemExit(check_llm(load_settings()))
+
     asyncio.run(run(
         once=args.once, interval=args.interval, limit=args.limit,
         use_llm=args.llm, match_threshold=args.match_threshold, min_edge=args.min_edge,

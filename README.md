@@ -73,6 +73,10 @@ python -m bot.dryrun --interval 15         # continuous soak (Ctrl-C to stop)
 python -m bot.dryrun --interval 15 --llm   # also confirm cross-venue matches via local LLM
 ```
 
+> Running the bot on an Ubuntu VM with the LLM on a separate Windows PC? See
+> **[NETWORK_SETUP.md](NETWORK_SETUP.md)** for the full LAN runbook. Verify the link
+> first with `python -m bot.dryrun --check-llm`.
+
 - **Kalshi runs immediately.** If its read endpoints require auth (or your IP is
   blocked), set `KALSHI_API_KEY_ID` + the RSA key in `.env` — the bot signs requests
   automatically when credentials are present. It stays read-only regardless.
