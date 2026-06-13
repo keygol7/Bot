@@ -14,13 +14,62 @@ Kalshi conventions:
 
 from __future__ import annotations
 
+import base64
+import time
 from typing import Any, AsyncIterator
+from urllib.parse import urlsplit
 
 from bot.fees import KalshiFeeModel
 from bot.models import MarketQuote, PriceLevel, Side
 from bot.venues.base import OrderNotPermitted, RawMarket
+from bot.venues.ratelimit import AsyncRateLimiter
 
 VENUE = "kalshi"
+
+# ---------------------------------------------------------------------------
+# Request signing (optional). Kalshi authenticates API-key requests with an
+# RSA-PSS signature over ``timestamp + METHOD + path``; the bot signs only when
+# credentials are configured, so unauthenticated reads still work where allowed.
+# Read-only here regardless — signing never enables order placement.
+# ---------------------------------------------------------------------------
+
+
+def load_private_key(path: str):
+    """Load an RSA private key from a PEM file (lazy ``cryptography`` import)."""
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+    with open(path, "rb") as fh:
+        return load_pem_private_key(fh.read(), password=None)
+
+
+def pss_sign(private_key, message: str) -> str:
+    """RSA-PSS (SHA-256, MGF1-SHA256, digest-length salt) signature, base64-encoded."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    signature = private_key.sign(
+        message.encode(),
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+        hashes.SHA256(),
+    )
+    return base64.b64encode(signature).decode()
+
+
+def build_signature_headers(
+    api_key_id: str, private_key, method: str, path: str, timestamp_ms: str | None = None
+) -> dict[str, str]:
+    """Build the Kalshi auth headers for one request.
+
+    ``path`` is the full request path Kalshi expects in the signed string
+    (e.g. ``/trade-api/v2/markets``), excluding any query string.
+    """
+    ts = timestamp_ms if timestamp_ms is not None else str(int(time.time() * 1000))
+    message = ts + method.upper() + path
+    return {
+        "KALSHI-ACCESS-KEY": api_key_id,
+        "KALSHI-ACCESS-SIGNATURE": pss_sign(private_key, message),
+        "KALSHI-ACCESS-TIMESTAMP": ts,
+    }
 
 
 def _best(levels: list[list[Any]]) -> tuple[float, float] | None:
@@ -76,10 +125,19 @@ class KalshiVenue:
 
     name = VENUE
 
-    def __init__(self, cfg: Any, fee_rate: float = 0.07) -> None:
+    def __init__(self, cfg: Any, fee_rate: float = 0.07, rate_per_min: float = 55.0) -> None:
         self.cfg = cfg
         self.fee_model = KalshiFeeModel(rate=fee_rate)
         self._client = None  # lazy httpx.AsyncClient
+        self._private_key = None
+        self._base_path = urlsplit(cfg.api_base).path.rstrip("/")  # e.g. /trade-api/v2
+        self._limiter = AsyncRateLimiter(rate_per_min)
+
+    @property
+    def authenticated(self) -> bool:
+        return bool(getattr(self.cfg, "api_key_id", "")) and bool(
+            getattr(self.cfg, "private_key_path", "")
+        )
 
     def _http(self):
         if self._client is None:
@@ -88,8 +146,23 @@ class KalshiVenue:
             self._client = httpx.AsyncClient(base_url=self.cfg.api_base, timeout=10.0)
         return self._client
 
+    def _auth_headers(self, method: str, endpoint_path: str) -> dict[str, str]:
+        """Signed headers when credentials are configured; empty dict otherwise."""
+        if not self.authenticated:
+            return {}
+        if self._private_key is None:
+            self._private_key = load_private_key(self.cfg.private_key_path)
+        return build_signature_headers(
+            self.cfg.api_key_id, self._private_key, method, self._base_path + endpoint_path
+        )
+
     async def list_markets(self, limit: int = 200) -> list[RawMarket]:
-        resp = await self._http().get("/markets", params={"limit": limit, "status": "open"})
+        await self._limiter.wait()
+        resp = await self._http().get(
+            "/markets",
+            params={"limit": limit, "status": "open"},
+            headers=self._auth_headers("GET", "/markets"),
+        )
         resp.raise_for_status()
         data = resp.json()
         return [
@@ -98,10 +171,16 @@ class KalshiVenue:
         ]
 
     async def fetch_orderbook(self, ticker: str, title: str = "") -> MarketQuote:
-        resp = await self._http().get(f"/markets/{ticker}/orderbook")
+        await self._limiter.wait()
+        endpoint = f"/markets/{ticker}/orderbook"
+        resp = await self._http().get(endpoint, headers=self._auth_headers("GET", endpoint))
         resp.raise_for_status()
         ob = resp.json().get("orderbook", {})
         return normalize_orderbook(ticker, title, ob)
+
+    async def fetch_quote(self, market: RawMarket) -> MarketQuote:
+        """Uniform venue interface used by the runner."""
+        return await self.fetch_orderbook(market.market_id, market.title)
 
     async def stream_order_book(self, market_ids: list[str]) -> AsyncIterator[MarketQuote]:
         # WebSocket streaming lands with the latency hot path; not exercised yet.

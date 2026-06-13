@@ -36,6 +36,14 @@ class Venue(Protocol):
         """Fetch open markets (read-only)."""
         ...
 
+    async def fetch_quote(self, market: RawMarket) -> MarketQuote | None:
+        """Fetch current top-of-book for one market as a normalized quote (read-only).
+
+        Returns ``None`` when the market has no usable book. This is the uniform
+        entry point the polling DRY_RUN runner uses across venues.
+        """
+        ...
+
     async def stream_order_book(
         self, market_ids: list[str]
     ) -> AsyncIterator[MarketQuote]:

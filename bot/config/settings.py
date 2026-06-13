@@ -50,6 +50,11 @@ class QcexConfig:
     ws_base: str = "wss://api.qcex.com/ws"
     use_sandbox: bool = True
 
+    @property
+    def is_configured(self) -> bool:
+        """True once QCEX credentials are present (drives venue enablement)."""
+        return bool(self.api_key_id)
+
 
 @dataclass
 class LLMConfig:

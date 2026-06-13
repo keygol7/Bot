@@ -17,11 +17,45 @@ import base64
 import time
 from typing import Any, AsyncIterator
 
+import json
+
 from bot.fees import ZeroFeeModel
 from bot.models import MarketQuote, PriceLevel, Side
 from bot.venues.base import OrderNotPermitted, RawMarket
+from bot.venues.ratelimit import AsyncRateLimiter
 
 VENUE = "polymarket_us"
+
+
+def extract_token_ids(raw: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Pull the (YES, NO) CLOB token ids out of a market payload.
+
+    Handles both shapes seen in the wild:
+      - ``tokens``: [{"token_id": "...", "outcome": "Yes"}, {...}]
+      - ``clobTokenIds``: a list or JSON-encoded string of two ids ([yes, no]).
+    Returns ``(None, None)`` if neither is present.
+    """
+    tokens = raw.get("tokens")
+    if isinstance(tokens, list) and tokens:
+        yes_id = no_id = None
+        for t in tokens:
+            outcome = str(t.get("outcome", "")).strip().lower()
+            if outcome in ("yes", "true"):
+                yes_id = t.get("token_id") or t.get("tokenId")
+            elif outcome in ("no", "false"):
+                no_id = t.get("token_id") or t.get("tokenId")
+        if yes_id or no_id:
+            return yes_id, no_id
+
+    clob = raw.get("clobTokenIds") or raw.get("clob_token_ids")
+    if isinstance(clob, str):
+        try:
+            clob = json.loads(clob)
+        except (ValueError, TypeError):
+            clob = None
+    if isinstance(clob, (list, tuple)) and len(clob) >= 2:
+        return clob[0], clob[1]
+    return None, None
 
 
 def normalize_clob_book(book: dict[str, Any]) -> tuple[PriceLevel | None, PriceLevel | None]:
@@ -98,10 +132,15 @@ class PolymarketUSVenue:
 
     name = VENUE
 
-    def __init__(self, cfg: Any) -> None:
+    def __init__(self, cfg: Any, rate_per_min: float = 100.0) -> None:
         self.cfg = cfg
         self.fee_model = ZeroFeeModel()
         self._client = None
+        self._limiter = AsyncRateLimiter(rate_per_min)
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(getattr(self.cfg, "api_key_id", ""))
 
     def _http(self):
         if self._client is None:
@@ -109,6 +148,24 @@ class PolymarketUSVenue:
 
             self._client = httpx.AsyncClient(base_url=self.cfg.api_base, timeout=10.0)
         return self._client
+
+    async def _fetch_book(self, token_id: str) -> dict[str, Any]:
+        await self._limiter.wait()
+        resp = await self._http().get("/book", params={"token_id": token_id})
+        resp.raise_for_status()
+        return resp.json()
+
+    async def fetch_quote(self, market: RawMarket) -> MarketQuote | None:
+        """Fetch and combine the YES/NO token books into one quote.
+
+        Returns ``None`` if the market exposes no usable token ids.
+        """
+        yes_id, no_id = extract_token_ids(market.raw)
+        if not yes_id:
+            return None
+        yes_book = await self._fetch_book(yes_id)
+        no_book = await self._fetch_book(no_id) if no_id else None
+        return build_quote(market.market_id, market.title, yes_book, no_book)
 
     async def list_markets(self, limit: int = 200) -> list[RawMarket]:
         resp = await self._http().get("/markets", params={"limit": limit})

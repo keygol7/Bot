@@ -49,6 +49,14 @@ def test_verdict_cache_is_order_independent():
     s.close()
 
 
+def test_creates_parent_directory(tmp_path):
+    db = tmp_path / "nested" / "dir" / "bot.db"
+    s = Store(str(db))
+    assert db.exists()
+    s.upsert_market("kalshi", "A", "Market A")
+    s.close()
+
+
 def test_audit_log():
     s = Store(":memory:")
     s.audit("startup", {"mode": "DRY_RUN"})

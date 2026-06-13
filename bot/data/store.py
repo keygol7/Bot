@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 _SCHEMA = """
@@ -82,6 +83,11 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 class Store:
     def __init__(self, path: str = ":memory:") -> None:
+        # Create the parent directory for a file-backed DB (no-op for :memory:).
+        if path != ":memory:":
+            parent = Path(path).expanduser().parent
+            if parent and not parent.exists():
+                parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)

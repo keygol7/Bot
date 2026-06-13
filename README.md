@@ -6,10 +6,11 @@ NO on the other when their combined cost is below \$1 after fees); a local-LLM
 analyst layer confirms that two markets are truly the same event before any trade,
 and an LLM-assisted **directional** strategy is planned as a separate, capped book.
 
-> **Status: Phase 1 + DRY_RUN core.** Read-only venue normalization, the in-memory
-> book, the arbitrage detector, risk gating, persistence, the matching pipeline, and
-> the DRY_RUN engine are implemented and unit-tested. **No live order placement yet**
-> — that lands in the latency-optimized execution phase.
+> **Status: live read-only DRY_RUN.** Read-only venue adapters (with optional Kalshi
+> request signing), the arbitrage detector, risk gating, persistence, the matching
+> pipeline, and a **live dry-run runner that paper-trades on real prices** are
+> implemented and unit-tested (64 tests). **No live order placement yet** — that lands
+> in the latency-optimized execution phase.
 
 ## Design at a glance
 
@@ -60,6 +61,31 @@ The demo builds synthetic books for the same event on both venues, shortlists th
 pair, confirms it (stand-in for the local LLM), and prints the arbitrage the engine
 would act on — without placing any order.
 
+## Live dry run (paper trading on real prices)
+
+`python -m bot.dryrun` polls **live** markets, runs the same matching → detection →
+risk pipeline on real prices, and persists every opportunity to SQLite — placing
+**no orders**.
+
+```bash
+python -m bot.dryrun --once --limit 25     # one cycle, smoke test
+python -m bot.dryrun --interval 15         # continuous soak (Ctrl-C to stop)
+python -m bot.dryrun --interval 15 --llm   # also confirm cross-venue matches via local LLM
+```
+
+- **Kalshi runs immediately.** If its read endpoints require auth (or your IP is
+  blocked), set `KALSHI_API_KEY_ID` + the RSA key in `.env` — the bot signs requests
+  automatically when credentials are present. It stays read-only regardless.
+- **QCEX activates automatically** once `QCEX_API_KEY_ID` is set; until then it runs
+  Kalshi-only, where **single-venue bundle arbs** (YES+NO < \$1) still produce signal.
+- **Cross-venue arbs need `--llm`** (and a local model at `LLM_BASE_URL`): without it
+  the runner lists candidate pairs but never marks one tradeable. Verdicts are cached.
+- Review findings with `sqlite3 data/bot.db "SELECT * FROM opportunities;"`.
+
+This is the soak stage from the plan — run it for a sustained period and check the
+opportunity log for real edges and matcher false positives before enabling live
+trading.
+
 ## Safety model
 
 - **DRY_RUN by default** — detects and logs, never trades. Live order placement is
@@ -76,9 +102,10 @@ would act on — without placing any order.
 
 1. ✅ Scaffold + read-only venue adapters + normalization + persistence
 2. ✅ Matching pipeline (lexical pre-filter + local-LLM confirmation + cache)
-3. ✅ Arbitrage detector + DRY_RUN engine (this phase)
-4. ⏳ Live WebSocket ingest + latency-optimized two-leg execution (LIVE_SMALL)
-5. ⏳ Dashboard + LLM-driven directional book (separate capped strategy)
+3. ✅ Arbitrage detector + DRY_RUN engine
+4. ✅ Live read-only DRY_RUN runner (`python -m bot.dryrun`) — paper trading on real prices
+5. ⏳ Live WebSocket ingest + latency-optimized two-leg execution (LIVE_SMALL)
+6. ⏳ Dashboard + LLM-driven directional book (separate capped strategy)
 
 ## Legal note
 
