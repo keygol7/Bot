@@ -1,0 +1,21 @@
+# Secrets — never commit real credentials
+.env
+*.key
+*.pem
+
+# Local state / data
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/

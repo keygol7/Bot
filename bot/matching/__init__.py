@@ -1,0 +1,6 @@
+"""Cross-venue market matching: cheap lexical pre-filter -> local-LLM confirmation."""
+
+from bot.matching.embed import candidate_pairs, lexical_similarity
+from bot.matching.llm_match import MatchVerdict, confirm_match
+
+__all__ = ["candidate_pairs", "lexical_similarity", "MatchVerdict", "confirm_match"]

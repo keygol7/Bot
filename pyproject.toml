@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prediction-arb-bot"
+version = "0.1.0"
+description = "Self-hosted arbitrage + directional trading bot for Kalshi and Polymarket US (QCEX)."
+requires-python = ">=3.11"
+# The deterministic core (models, fees, arbitrage, risk, book, store) depends only
+# on the standard library so the test suite runs with no third-party installs.
+# Venue adapters and the local-LLM analyst pull their dependencies lazily.
+dependencies = []
+
+[project.optional-dependencies]
+venues = [
+    "httpx>=0.27",
+    "websockets>=12",
+    "cryptography>=42",   # Ed25519 request signing for Polymarket US / QCEX
+]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools.packages.find]
+include = ["bot*"]
