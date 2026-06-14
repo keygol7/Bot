@@ -134,6 +134,40 @@ def test_kalshi_scan_quotes_stops_when_cursor_exhausted():
     assert len(quotes) == 1                              # no infinite loop on a short feed
 
 
+def test_polymarket_scan_quotes_paginates_offset():
+    def page(prefix, n):
+        return {"markets": [{"slug": f"{prefix}{i}", "question": f"{prefix}{i}",
+                             "bestAsk": "0.40", "bestBid": "0.38"} for i in range(n)]}
+    seen_offsets = []
+
+    def handler(req):
+        off = int(req.url.params.get("offset", "0"))
+        seen_offsets.append(off)
+        return httpx.Response(200, json=page("A", 500) if off == 0 else page("B", 100))
+
+    cfg = QcexConfig()
+    v = PolymarketUSVenue(cfg)
+    v._gateway_client = _client(handler, cfg.gateway_base)
+
+    quotes = asyncio.run(v.scan_quotes(1000))
+    assert len(quotes) == 600                     # 500 + 100 across two pages
+    assert seen_offsets == [0, 500]               # second call advanced the offset
+
+
+def test_polymarket_scan_quotes_stops_when_offset_ignored():
+    # Gateway ignores offset and returns the same first page -> dedupe, stop, no loop.
+    def handler(req):
+        return httpx.Response(200, json={"markets": [
+            {"slug": f"A{i}", "question": f"A{i}", "bestAsk": "0.40", "bestBid": "0.38"}
+            for i in range(500)]})
+
+    cfg = QcexConfig()
+    v = PolymarketUSVenue(cfg)
+    v._gateway_client = _client(handler, cfg.gateway_base)
+    quotes = asyncio.run(v.scan_quotes(5000))
+    assert len(quotes) == 500                      # only the unique first page kept
+
+
 def test_place_order_requires_credentials():
     from bot.venues.base import OrderNotPermitted
 

@@ -239,35 +239,55 @@ class PolymarketUSVenue:
         return out
 
     async def scan_quotes(self, limit: int = 500) -> list[MarketQuote]:
-        """Phase 1: one /v1/markets call -> price-only quotes (bestBid/bestAsk).
+        """Phase 1: paginate /v1/markets -> price-only quotes (bestBid/bestAsk).
 
         Sizes are not in the list payload, so this is the cheap wide scan; the sized
         quote comes from :meth:`fetch_quote` (BBO) for shortlisted markets only.
+
+        ``limit`` is a TOTAL cap across pages. We page via ``offset`` and dedupe by
+        slug; if the gateway ignores ``offset`` (returns the same page) we get no new
+        slugs and stop, so this is safe whether or not paging is supported.
         """
-        await self._limiter.wait()
-        resp = await self._gateway().get(
-            "/v1/markets", params={"limit": limit, "active": "true", "closed": "false"}
-        )
-        resp.raise_for_status()
         out: list[MarketQuote] = []
-        for m in resp.json().get("markets", []):
-            slug = m.get("slug") or m.get("id")
-            if not slug:
-                continue
-            best_ask = _amount(m.get("bestAsk"))
-            best_bid = _amount(m.get("bestBid"))
-            out.append(
-                MarketQuote(
-                    venue=VENUE,
-                    market_id=slug,
-                    title=build_market_title(m),
-                    yes_ask=best_ask,
-                    yes_ask_size=0.0,
-                    no_ask=round(1.0 - best_bid, 6) if best_bid is not None else None,
-                    no_ask_size=0.0,
-                    close_time=parse_iso8601(m.get("endDate")),
-                )
+        seen: set[str] = set()
+        offset = 0
+        while len(out) < limit:
+            await self._limiter.wait()
+            page_size = min(limit - len(out), 500)
+            resp = await self._gateway().get(
+                "/v1/markets",
+                params={"limit": page_size, "active": "true", "closed": "false",
+                        "offset": offset},
             )
+            resp.raise_for_status()
+            markets = resp.json().get("markets", [])
+            if not markets:
+                break
+            new = 0
+            for m in markets:
+                slug = m.get("slug") or m.get("id")
+                if not slug or slug in seen:
+                    continue
+                seen.add(slug)
+                new += 1
+                best_ask = _amount(m.get("bestAsk"))
+                best_bid = _amount(m.get("bestBid"))
+                out.append(
+                    MarketQuote(
+                        venue=VENUE,
+                        market_id=slug,
+                        title=build_market_title(m),
+                        yes_ask=best_ask,
+                        yes_ask_size=0.0,
+                        no_ask=round(1.0 - best_bid, 6) if best_bid is not None else None,
+                        no_ask_size=0.0,
+                        close_time=parse_iso8601(m.get("endDate")),
+                    )
+                )
+            offset += len(markets)
+            # No new slugs (offset ignored / end of feed), or a short page -> done.
+            if new == 0 or len(markets) < page_size:
+                break
         return out
 
     async def fetch_quote(self, market: RawMarket) -> MarketQuote | None:
