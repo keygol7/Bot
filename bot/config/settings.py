@@ -44,16 +44,27 @@ class KalshiConfig:
 
 @dataclass
 class QcexConfig:
+    # Reads use the PUBLIC gateway (no key). Trading uses the authenticated API.
+    gateway_base: str = "https://gateway.polymarket.us"   # public market data
+    api_base: str = "https://api.polymarket.us"           # authenticated trading
+    ws_markets: str = "wss://api.polymarket.us/v1/ws/markets"
+    ws_private: str = "wss://api.polymarket.us/v1/ws/private"
+    # Trading credentials (only needed to place orders, not for the dry run):
     api_key_id: str = ""
-    ed25519_private_key_path: str = "secrets/qcex_ed25519.pem"
-    api_base: str = "https://api.qcex.com"
-    ws_base: str = "wss://api.qcex.com/ws"
-    use_sandbox: bool = True
+    secret_key: str = ""                                   # raw base64 secret (preferred)
+    ed25519_private_key_path: str = "secrets/qcex_ed25519.pem"  # PEM fallback
+    use_sandbox: bool = False
 
     @property
-    def is_configured(self) -> bool:
-        """True once QCEX credentials are present (drives venue enablement)."""
-        return bool(self.api_key_id)
+    def is_trading_configured(self) -> bool:
+        """True once order-placement credentials are present (key id + a secret)."""
+        from pathlib import Path
+
+        has_secret = bool(self.secret_key) or (
+            bool(self.ed25519_private_key_path)
+            and Path(self.ed25519_private_key_path).expanduser().exists()
+        )
+        return bool(self.api_key_id) and has_secret
 
 
 @dataclass
@@ -86,13 +97,16 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
             ws_base=env("KALSHI_WS_BASE", KalshiConfig.ws_base),
         ),
         qcex=QcexConfig(
+            gateway_base=env("QCEX_GATEWAY_BASE", QcexConfig.gateway_base),
+            api_base=env("QCEX_API_BASE", QcexConfig.api_base),
+            ws_markets=env("QCEX_WS_MARKETS", QcexConfig.ws_markets),
+            ws_private=env("QCEX_WS_PRIVATE", QcexConfig.ws_private),
             api_key_id=env("QCEX_API_KEY_ID", "") or "",
+            secret_key=env("QCEX_SECRET_KEY", "") or "",
             ed25519_private_key_path=env(
                 "QCEX_ED25519_PRIVATE_KEY_PATH", QcexConfig.ed25519_private_key_path
             ),
-            api_base=env("QCEX_API_BASE", QcexConfig.api_base),
-            ws_base=env("QCEX_WS_BASE", QcexConfig.ws_base),
-            use_sandbox=(env("QCEX_USE_SANDBOX", "true") or "true").lower() == "true",
+            use_sandbox=(env("QCEX_USE_SANDBOX", "false") or "false").lower() == "true",
         ),
         llm=LLMConfig(
             base_url=env("LLM_BASE_URL", LLMConfig.base_url),

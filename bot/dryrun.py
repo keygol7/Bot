@@ -156,17 +156,17 @@ async def run_cycle(
 
 
 def _build_venues(settings: Settings) -> list:
-    """Kalshi is always enabled; QCEX joins once credentials are configured."""
+    """Both venues read live. Polymarket US market data is on a PUBLIC gateway, so
+    no credentials are needed for the dry run — they're only required to place
+    orders later."""
     from bot.venues.kalshi import KalshiVenue
+    from bot.venues.polymarket_us import PolymarketUSVenue
 
-    venues = [KalshiVenue(settings.kalshi)]
-    if settings.qcex.is_configured:
-        from bot.venues.polymarket_us import PolymarketUSVenue
-
-        venues.append(PolymarketUSVenue(settings.qcex))
-        log.info("QCEX enabled (credentials configured)")
+    venues = [KalshiVenue(settings.kalshi), PolymarketUSVenue(settings.qcex)]
+    if settings.qcex.is_trading_configured:
+        log.info("Polymarket US: public-gateway reads + trading creds present")
     else:
-        log.info("QCEX disabled (no credentials) — Kalshi-only; bundle arbs active")
+        log.info("Polymarket US: public-gateway reads (no trading creds — read-only)")
     return venues
 
 

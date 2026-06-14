@@ -28,7 +28,9 @@ def test_load_settings_defaults(tmp_path, monkeypatch):
     assert settings.run_mode is RunMode.DRY_RUN
     assert settings.risk.max_daily_loss == 500.0
     assert settings.risk.min_edge == 0.01
-    assert settings.qcex.use_sandbox is True
+    assert settings.qcex.use_sandbox is False
+    assert settings.qcex.gateway_base == "https://gateway.polymarket.us"
+    assert settings.qcex.is_trading_configured is False  # no creds by default
 
 
 def test_load_settings_reads_env(tmp_path, monkeypatch):

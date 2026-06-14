@@ -115,16 +115,43 @@ def build_quote(
     )
 
 
-def sign_request(private_key_pem: bytes, message: bytes) -> str:
-    """Ed25519-sign ``message`` and return a base64 signature (QCEX private auth).
+def load_ed25519_key(secret_key: str = "", pem_path: str = ""):
+    """Load the Ed25519 signing key from a raw base64 secret (preferred) or a PEM.
 
-    Imports ``cryptography`` lazily; only needed for authenticated endpoints.
+    Polymarket US issues the secret as a base64 string; per their docs the private
+    key is ``Ed25519PrivateKey.from_private_bytes(b64decode(secret)[:32])``. A PEM
+    file containing the same key also works (lazy ``cryptography`` import).
     """
-    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-    key = load_pem_private_key(private_key_pem, password=None)
-    signature = key.sign(message)  # type: ignore[call-arg]  # Ed25519 sign(data)
-    return base64.b64encode(signature).decode()
+    if secret_key:
+        raw = base64.b64decode(secret_key + "=" * (-len(secret_key) % 4))
+        return Ed25519PrivateKey.from_private_bytes(raw[:32])
+    if pem_path:
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+        with open(pem_path, "rb") as fh:
+            return load_pem_private_key(fh.read(), password=None)
+    raise ValueError("no QCEX secret_key or PEM path provided")
+
+
+def build_auth_headers(
+    key_id: str, private_key, method: str, path: str, timestamp_ms: str | None = None
+) -> dict[str, str]:
+    """Polymarket US authenticated-request headers (X-PM-* / Ed25519).
+
+    Signs ``timestamp + METHOD + path`` (path excludes the query string). Used only
+    for trading endpoints — public market-data reads need no auth.
+    """
+    ts = timestamp_ms if timestamp_ms is not None else str(int(time.time() * 1000))
+    message = f"{ts}{method.upper()}{path}"
+    signature = base64.b64encode(private_key.sign(message.encode())).decode()
+    return {
+        "X-PM-Access-Key": key_id,
+        "X-PM-Timestamp": ts,
+        "X-PM-Signature": signature,
+        "Content-Type": "application/json",
+    }
 
 
 class PolymarketUSVenue:
@@ -135,23 +162,40 @@ class PolymarketUSVenue:
     def __init__(self, cfg: Any, rate_per_min: float = 100.0) -> None:
         self.cfg = cfg
         self.fee_model = ZeroFeeModel()
-        self._client = None
+        self._gateway_client = None  # public reads
+        self._api_client = None      # authenticated trading (later)
+        self._key = None
         self._limiter = AsyncRateLimiter(rate_per_min)
 
     @property
-    def is_configured(self) -> bool:
-        return bool(getattr(self.cfg, "api_key_id", ""))
+    def is_trading_configured(self) -> bool:
+        """Order placement needs creds; reads (this phase) do not."""
+        return getattr(self.cfg, "is_trading_configured", False)
 
-    def _http(self):
-        if self._client is None:
+    def _gateway(self):
+        """HTTP client for the PUBLIC market-data gateway (no auth)."""
+        if self._gateway_client is None:
             import httpx  # lazy
 
-            self._client = httpx.AsyncClient(base_url=self.cfg.api_base, timeout=10.0)
-        return self._client
+            self._gateway_client = httpx.AsyncClient(
+                base_url=self.cfg.gateway_base, timeout=10.0
+            )
+        return self._gateway_client
+
+    def _auth_headers(self, method: str, path: str) -> dict[str, str]:
+        """X-PM-* signed headers for authenticated (trading) requests."""
+        if self._key is None:
+            self._key = load_ed25519_key(
+                getattr(self.cfg, "secret_key", ""),
+                getattr(self.cfg, "ed25519_private_key_path", ""),
+            )
+        return build_auth_headers(self.cfg.api_key_id, self._key, method, path)
 
     async def _fetch_book(self, token_id: str) -> dict[str, Any]:
+        # NOTE: endpoint path/params pending confirmation from the public Markets
+        # API reference (docs.polymarket.us). Reads hit the public gateway.
         await self._limiter.wait()
-        resp = await self._http().get("/book", params={"token_id": token_id})
+        resp = await self._gateway().get("/book", params={"token_id": token_id})
         resp.raise_for_status()
         return resp.json()
 
@@ -168,7 +212,9 @@ class PolymarketUSVenue:
         return build_quote(market.market_id, market.title, yes_book, no_book)
 
     async def list_markets(self, limit: int = 200) -> list[RawMarket]:
-        resp = await self._http().get("/markets", params={"limit": limit})
+        # NOTE: path/shape pending confirmation from the public Markets API reference.
+        await self._limiter.wait()
+        resp = await self._gateway().get("/markets", params={"limit": limit})
         resp.raise_for_status()
         data = resp.json()
         markets = data.get("data", data) if isinstance(data, dict) else data
@@ -195,6 +241,8 @@ class PolymarketUSVenue:
         raise NotImplementedError("positions endpoint lands with the live phase")
 
     async def aclose(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        for attr in ("_gateway_client", "_api_client"):
+            client = getattr(self, attr)
+            if client is not None:
+                await client.aclose()
+                setattr(self, attr, None)

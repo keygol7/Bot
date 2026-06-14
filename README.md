@@ -80,8 +80,10 @@ python -m bot.dryrun --interval 15 --llm   # also confirm cross-venue matches vi
 - **Kalshi runs immediately.** If its read endpoints require auth (or your IP is
   blocked), set `KALSHI_API_KEY_ID` + the RSA key in `.env` — the bot signs requests
   automatically when credentials are present. It stays read-only regardless.
-- **QCEX activates automatically** once `QCEX_API_KEY_ID` is set; until then it runs
-  Kalshi-only, where **single-venue bundle arbs** (YES+NO < \$1) still produce signal.
+- **Polymarket US reads need no key** — market data is on the public
+  `gateway.polymarket.us`, so cross-venue detection works in the dry run without
+  credentials. (API keys are only needed to *place orders* later.) Single-venue
+  **bundle arbs** (YES+NO < \$1) also produce signal on each venue alone.
 - **Cross-venue arbs need `--llm`** (and a local model at `LLM_BASE_URL`): without it
   the runner lists candidate pairs but never marks one tradeable. Verdicts are cached.
 - Review findings with `sqlite3 data/bot.db "SELECT * FROM opportunities;"`.
