@@ -146,3 +146,45 @@ def detect_bundle(
     if opp is not None and opp.edge_per_contract > min_edge:
         return opp
     return None
+
+
+# --- Price-only edge checks (ignore size) -----------------------------------
+# Used by the two-phase scanner: a cheap wide price scan returns top-of-book
+# prices without depth, so these compute the per-contract edge from prices alone
+# to shortlist which markets are worth a deeper (sized) fetch. Detection of an
+# actionable, sizeable opportunity still uses detect_cross_venue / detect_bundle
+# on the sized quotes.
+
+
+def _pair_price_edge(
+    yes_q: MarketQuote, yes_fee: FeeModel, no_q: MarketQuote, no_fee: FeeModel
+) -> float | None:
+    """Per-contract edge of buying YES on ``yes_q`` and NO on ``no_q``, prices only."""
+    if yes_q.yes_ask is None or no_q.no_ask is None:
+        return None
+    fees = yes_fee.fee(yes_q.yes_ask, 1) + no_fee.fee(no_q.no_ask, 1)
+    return 1.0 - (yes_q.yes_ask + no_q.no_ask) - fees
+
+
+def cross_price_edge(
+    a: MarketQuote, b: MarketQuote,
+    fee_a: FeeModel | None = None, fee_b: FeeModel | None = None,
+) -> float:
+    """Best per-contract cross-venue edge across both directions (prices only).
+
+    Returns ``-inf`` if neither direction has both legs quoted.
+    """
+    fee_a = fee_a or ZeroFeeModel()
+    fee_b = fee_b or ZeroFeeModel()
+    edges = [
+        _pair_price_edge(a, fee_a, b, fee_b),   # YES@a + NO@b
+        _pair_price_edge(b, fee_b, a, fee_a),   # YES@b + NO@a
+    ]
+    present = [e for e in edges if e is not None]
+    return max(present) if present else float("-inf")
+
+
+def bundle_price_edge(q: MarketQuote, fee: FeeModel | None = None) -> float | None:
+    """Per-contract single-venue (YES+NO) edge from prices only."""
+    fee = fee or ZeroFeeModel()
+    return _pair_price_edge(q, fee, q, fee)

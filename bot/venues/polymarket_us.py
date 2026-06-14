@@ -163,8 +163,39 @@ class PolymarketUSVenue:
             )
         return out
 
+    async def scan_quotes(self, limit: int = 500) -> list[MarketQuote]:
+        """Phase 1: one /v1/markets call -> price-only quotes (bestBid/bestAsk).
+
+        Sizes are not in the list payload, so this is the cheap wide scan; the sized
+        quote comes from :meth:`fetch_quote` (BBO) for shortlisted markets only.
+        """
+        await self._limiter.wait()
+        resp = await self._gateway().get(
+            "/v1/markets", params={"limit": limit, "active": "true", "closed": "false"}
+        )
+        resp.raise_for_status()
+        out: list[MarketQuote] = []
+        for m in resp.json().get("markets", []):
+            slug = m.get("slug") or m.get("id")
+            if not slug:
+                continue
+            best_ask = _amount(m.get("bestAsk"))
+            best_bid = _amount(m.get("bestBid"))
+            out.append(
+                MarketQuote(
+                    venue=VENUE,
+                    market_id=slug,
+                    title=m.get("question") or m.get("title") or "",
+                    yes_ask=best_ask,
+                    yes_ask_size=0.0,
+                    no_ask=round(1.0 - best_bid, 6) if best_bid is not None else None,
+                    no_ask_size=0.0,
+                )
+            )
+        return out
+
     async def fetch_quote(self, market: RawMarket) -> MarketQuote | None:
-        """Fetch BBO for one market (by slug) and normalize to a quote."""
+        """Deep (sized) quote: BBO for one market (by slug), used in phase 2."""
         await self._limiter.wait()
         resp = await self._gateway().get(f"/v1/markets/{market.market_id}/bbo")
         if resp.status_code == 404:

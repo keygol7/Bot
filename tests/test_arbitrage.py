@@ -1,6 +1,11 @@
 from bot.fees import KalshiFeeModel, ZeroFeeModel
 from bot.models import MarketQuote
-from bot.strategies.arbitrage import detect_bundle, detect_cross_venue
+from bot.strategies.arbitrage import (
+    bundle_price_edge,
+    cross_price_edge,
+    detect_bundle,
+    detect_cross_venue,
+)
 
 
 def q(venue, mid, yes_ask=None, ya=0.0, no_ask=None, na=0.0, event="E1"):
@@ -78,3 +83,38 @@ def test_bundle_single_venue():
 def test_bundle_none_when_no_edge():
     qq = q("kalshi", "A", yes_ask=0.50, ya=100, no_ask=0.55, na=70)
     assert detect_bundle(qq) is None
+
+
+# --- price-only edge helpers (size-independent, used by the two-phase scanner) ---
+
+def test_bundle_price_edge_ignores_size():
+    # size 0 -> detect_bundle finds nothing, but the price edge is still visible.
+    qq = q("kalshi", "A", yes_ask=0.40, ya=0, no_ask=0.55, na=0)
+    assert detect_bundle(qq) is None
+    assert round(bundle_price_edge(qq), 4) == 0.05
+
+
+def test_bundle_price_edge_none_when_side_missing():
+    qq = q("kalshi", "A", yes_ask=0.40, ya=0, no_ask=None, na=0)
+    assert bundle_price_edge(qq) is None
+
+
+def test_cross_price_edge_best_direction():
+    a = q("kalshi", "A", yes_ask=0.40, ya=0, no_ask=0.65, na=0)
+    b = q("polymarket_us", "B", yes_ask=0.62, ya=0, no_ask=0.55, na=0)
+    # YES@A + NO@B = 0.95 -> 0.05; the other direction is negative.
+    assert round(cross_price_edge(a, b), 4) == 0.05
+
+
+def test_cross_price_edge_negative_when_no_arb():
+    a = q("kalshi", "A", yes_ask=0.55, ya=0, no_ask=0.55, na=0)
+    b = q("polymarket_us", "B", yes_ask=0.55, ya=0, no_ask=0.55, na=0)
+    assert cross_price_edge(a, b) < 0
+
+
+def test_cross_price_edge_subtracts_fees():
+    a = q("kalshi", "A", yes_ask=0.47, ya=0, no_ask=0.60, na=0)
+    b = q("polymarket_us", "B", yes_ask=0.60, ya=0, no_ask=0.50, na=0)
+    with_fee = cross_price_edge(a, b, fee_a=KalshiFeeModel(), fee_b=ZeroFeeModel())
+    without = cross_price_edge(a, b)
+    assert with_fee < without

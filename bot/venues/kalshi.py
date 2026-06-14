@@ -120,6 +120,35 @@ def normalize_orderbook(
     )
 
 
+def _cents_to_price(cents: Any) -> float | None:
+    """Convert a Kalshi cents price (1..99) to dollars; 0/None -> None (no quote)."""
+    if cents in (None, "", 0, 0.0):
+        return None
+    try:
+        return round(float(cents) / 100.0, 4)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_summary(m: dict[str, Any], *, event_key: str | None = None) -> MarketQuote:
+    """Build a price-only quote from a Kalshi /markets summary row (no per-market call).
+
+    The summary already carries ``yes_ask`` / ``no_ask`` (cents). Sizes are not in the
+    summary, so this is for the cheap wide scan; the sized quote comes from
+    :meth:`KalshiVenue.fetch_orderbook` for shortlisted markets only.
+    """
+    return MarketQuote(
+        venue=VENUE,
+        market_id=m.get("ticker", ""),
+        title=m.get("title", ""),
+        event_key=event_key,
+        yes_ask=_cents_to_price(m.get("yes_ask")),
+        yes_ask_size=0.0,
+        no_ask=_cents_to_price(m.get("no_ask")),
+        no_ask_size=0.0,
+    )
+
+
 class KalshiVenue:
     """Read-only Kalshi client. ``cfg`` is a ``bot.config.settings.KalshiConfig``."""
 
@@ -179,8 +208,20 @@ class KalshiVenue:
         return normalize_orderbook(ticker, title, ob)
 
     async def fetch_quote(self, market: RawMarket) -> MarketQuote:
-        """Uniform venue interface used by the runner."""
+        """Deep (sized) quote for one market — used in phase 2 for shortlisted markets."""
         return await self.fetch_orderbook(market.market_id, market.title)
+
+    async def scan_quotes(self, limit: int = 500) -> list[MarketQuote]:
+        """Phase 1: one /markets call -> price-only quotes for every open market."""
+        await self._limiter.wait()
+        resp = await self._http().get(
+            "/markets",
+            params={"limit": limit, "status": "open"},
+            headers=self._auth_headers("GET", "/markets"),
+        )
+        resp.raise_for_status()
+        markets = resp.json().get("markets", [])
+        return [normalize_summary(m) for m in markets if m.get("ticker")]
 
     async def stream_order_book(self, market_ids: list[str]) -> AsyncIterator[MarketQuote]:
         # WebSocket streaming lands with the latency hot path; not exercised yet.

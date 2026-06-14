@@ -88,6 +88,11 @@ python -m bot.dryrun --interval 15 --llm   # also confirm cross-venue matches vi
   the runner lists candidate pairs but never marks one tradeable. Verdicts are cached.
 - Review findings with `sqlite3 data/bot.db "SELECT * FROM opportunities;"`.
 
+**Two-phase scan (scales to the whole board):** each cycle makes just *one* list
+call per venue to price every market (top-of-book), shortlists candidates by price
+edge + title match, and only then fetches per-market depth for that handful. So
+`--limit 500` is two calls, not a thousand — set it high to cover more of the board.
+
 This is the soak stage from the plan — run it for a sustained period and check the
 opportunity log for real edges and matcher false positives before enabling live
 trading.

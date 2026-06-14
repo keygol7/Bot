@@ -1,7 +1,23 @@
 """Tests for the pure venue normalization functions (no network, no SDKs)."""
 
-from bot.venues.kalshi import normalize_orderbook
+from bot.venues.kalshi import normalize_orderbook, normalize_summary
 from bot.venues.polymarket_us import normalize_bbo
+
+
+def test_kalshi_summary_price_only():
+    # Phase-1 scan: prices from the /markets summary (cents), sizes unknown (0).
+    m = {"ticker": "FED-MAR26", "title": "Fed cut", "yes_ask": 41, "no_ask": 60}
+    quote = normalize_summary(m)
+    assert quote.market_id == "FED-MAR26"
+    assert quote.yes_ask == 0.41 and quote.no_ask == 0.60
+    assert quote.yes_ask_size == 0.0 and quote.no_ask_size == 0.0
+
+
+def test_kalshi_summary_zero_price_means_no_quote():
+    m = {"ticker": "X", "title": "X", "yes_ask": 0, "no_ask": 55}
+    quote = normalize_summary(m)
+    assert quote.yes_ask is None
+    assert quote.no_ask == 0.55
 
 
 def test_kalshi_orderbook_normalization():

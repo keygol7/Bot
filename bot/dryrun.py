@@ -32,7 +32,13 @@ from bot.matching.embed import candidate_pairs
 from bot.matching.llm_match import MatchVerdict, confirm_match
 from bot.models import MarketQuote
 from bot.modes import RunMode
-from bot.strategies.arbitrage import ArbOpportunity, detect_bundle
+from bot.strategies.arbitrage import (
+    ArbOpportunity,
+    bundle_price_edge,
+    cross_price_edge,
+    detect_bundle,
+)
+from bot.venues.base import RawMarket
 
 log = logging.getLogger("bot.dryrun")
 
@@ -41,6 +47,7 @@ log = logging.getLogger("bot.dryrun")
 class CycleResult:
     markets_seen: int = 0
     quotes: int = 0
+    deep_fetches: int = 0
     bundle_opps: list[ArbOpportunity] = field(default_factory=list)
     candidate_pairs: int = 0
     cross: ScanResult = field(default_factory=ScanResult)
@@ -48,7 +55,8 @@ class CycleResult:
     def summary(self) -> str:
         return (
             f"markets={self.markets_seen} quotes={self.quotes} "
-            f"bundle_arbs={len(self.bundle_opps)} cross_candidates={self.candidate_pairs} "
+            f"deep_fetches={self.deep_fetches} bundle_arbs={len(self.bundle_opps)} "
+            f"cross_candidates={self.candidate_pairs} "
             f"cross_detected={len(self.cross.detected)} "
             f"cross_actionable={len(self.cross.actionable)}"
         )
@@ -90,62 +98,102 @@ async def run_cycle(
     limit: int,
 ) -> CycleResult:
     result = CycleResult()
+
+    # ----- Phase 1: cheap wide price scan (one list call per venue) -----
+    # Price-only quotes (no depth) for every market, so we can match/shortlist
+    # across the whole board without an order-book call per market. A venue being
+    # down must not kill the cycle.
     quotes_by_venue: dict[str, list[MarketQuote]] = {}
-
-    # 1. Pull markets + top-of-book from each venue (read-only). A venue being
-    #    down (network error, 4xx/5xx) must not kill the cycle — log and move on,
-    #    so the soak keeps running and retries on the next cycle.
     for v in venues:
-        qs: list[MarketQuote] = []
         try:
-            markets = await v.list_markets(limit)
+            qs = await v.scan_quotes(limit)
         except Exception as exc:
-            log.warning("list_markets failed for %s: %s", v.name, exc)
-            quotes_by_venue[v.name] = qs
+            log.warning("scan_quotes failed for %s: %s", v.name, exc)
+            quotes_by_venue[v.name] = []
             continue
-        result.markets_seen += len(markets)
-        for m in markets:
-            if store is not None:
-                store.upsert_market(v.name, m.market_id, m.title)
-            try:
-                q = await v.fetch_quote(m)
-            except Exception as exc:  # one bad market shouldn't kill the cycle
-                log.warning("fetch_quote failed %s:%s: %s", v.name, m.market_id, exc)
-                continue
-            if q is not None:
-                qs.append(q)
         quotes_by_venue[v.name] = qs
+        result.markets_seen += len(qs)
         result.quotes += len(qs)
+        if store is not None:
+            for q in qs:
+                store.upsert_market(v.name, q.market_id, q.title)
 
-    # 2. Single-venue bundle arbs (works with one venue — immediate signal).
+    price_lookup = {
+        (q.venue, q.market_id): q for qs in quotes_by_venue.values() for q in qs
+    }
+    deep_needed: set[tuple[str, str]] = set()
+
+    # Bundle candidates by price (single venue): shortlist for a sized fetch.
+    bundle_candidates: list[tuple[str, MarketQuote]] = []
     for vname, qs in quotes_by_venue.items():
         fee = fee_models.get(vname, ZeroFeeModel())
         for q in qs:
-            opp = detect_bundle(q, fee=fee, min_edge=min_edge)
-            if opp is None:
-                continue
-            decision = risk.check(f"{q.venue}:{q.market_id}", opp.notional)
-            if store is not None:
-                store.record_opportunity(opp, acted=False)
-            result.bundle_opps.append(opp)
-            log.info("BUNDLE %s | risk: %s", opp, decision.reason or "ok")
+            edge = bundle_price_edge(q, fee)
+            if edge is not None and edge > min_edge:
+                bundle_candidates.append((vname, q))
+                deep_needed.add((vname, q.market_id))
 
-    # 3. Cross-venue arbs across confirmed same-event pairs.
-    confirmed: list[tuple[MarketQuote, MarketQuote]] = []
+    # Cross candidates: lexical similarity -> price edge -> LLM confirmation.
+    confirmed_lite: list[tuple[MarketQuote, MarketQuote]] = []
     names = list(quotes_by_venue)
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
-            cands = candidate_pairs(
+            for c in candidate_pairs(
                 quotes_by_venue[names[i]], quotes_by_venue[names[j]],
                 threshold=match_threshold,
-            )
-            result.candidate_pairs += len(cands)
-            for c in cands:
+            ):
+                edge = cross_price_edge(
+                    c.a, c.b, fee_models.get(c.a.venue), fee_models.get(c.b.venue)
+                )
+                if edge <= min_edge:
+                    continue  # no price edge -> don't spend an LLM call on it
+                result.candidate_pairs += 1
                 verdict = await _verdict_for(c.a, c.b, store, complete_fn)
                 if verdict is not None and verdict.tradeable():
-                    event_key = f"{c.a.label}|{c.b.label}"
-                    c.a.event_key = c.b.event_key = event_key
-                    confirmed.append((c.a, c.b))
+                    confirmed_lite.append((c.a, c.b))
+                    deep_needed.add((c.a.venue, c.a.market_id))
+                    deep_needed.add((c.b.venue, c.b.market_id))
+
+    # ----- Phase 2: deep (sized) fetch, only for shortlisted markets -----
+    venue_by_name = {v.name: v for v in venues}
+    deep: dict[tuple[str, str], MarketQuote] = {}
+    for key in deep_needed:
+        v = venue_by_name.get(key[0])
+        base = price_lookup.get(key)
+        if v is None or base is None:
+            continue
+        try:
+            dq = await v.fetch_quote(RawMarket(market_id=key[1], title=base.title, raw={}))
+        except Exception as exc:
+            log.warning("deep fetch failed %s:%s: %s", key[0], key[1], exc)
+            continue
+        if dq is not None:
+            deep[key] = dq
+    result.deep_fetches = len(deep_needed)
+
+    # Finalize bundle arbs with real sizes.
+    for vname, q in bundle_candidates:
+        dq = deep.get((vname, q.market_id))
+        if dq is None:
+            continue
+        opp = detect_bundle(dq, fee=fee_models.get(vname, ZeroFeeModel()), min_edge=min_edge)
+        if opp is None:
+            continue
+        decision = risk.check(f"{vname}:{q.market_id}", opp.notional)
+        if store is not None:
+            store.record_opportunity(opp, acted=False)
+        result.bundle_opps.append(opp)
+        log.info("BUNDLE %s | risk: %s", opp, decision.reason or "ok")
+
+    # Finalize cross-venue arbs with real sizes.
+    confirmed: list[tuple[MarketQuote, MarketQuote]] = []
+    for a, b in confirmed_lite:
+        da = deep.get((a.venue, a.market_id))
+        db = deep.get((b.venue, b.market_id))
+        if da is None or db is None:
+            continue
+        da.event_key = db.event_key = f"{a.label}|{b.label}"
+        confirmed.append((da, db))
 
     engine = Engine(
         fee_models=fee_models, risk=risk, store=store,
