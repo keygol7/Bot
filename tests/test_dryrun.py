@@ -297,6 +297,34 @@ def test_build_watchlist_survives_probe_error():
     assert out == []                                    # error treated as not-live, no crash
 
 
+def test_inspect_matches_lists_confirmed_with_titles(capsys):
+    from bot.dryrun import inspect_matches
+
+    s = Store(":memory:")
+    s.upsert_market("kalshi", "K1", "Lima vs Borshchev")
+    s.upsert_market("polymarket_us", "P1", "UFC: Lima vs Borshchev")
+    s.cache_verdict("kalshi", "K1", "polymarket_us", "P1",
+                    same_event=True, confidence=0.95, rationale="same fight")
+    s.cache_verdict("kalshi", "K2", "polymarket_us", "P2",
+                    same_event=False, confidence=0.2, rationale="different fights")
+
+    # Point inspect_matches at our in-memory store by monkeypatching Store construction.
+    import bot.dryrun as dr
+    orig = dr.Store
+    dr.Store = lambda path: s          # type: ignore[assignment]
+    try:
+        rc = inspect_matches(Settings(), show_rejected=True)
+    finally:
+        dr.Store = orig
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "1 confirmed same-event" in out
+    assert "Lima vs Borshchev" in out
+    assert "same fight" in out
+    assert "rejected (not same event)" in out     # rejected section shown
+    s.close()
+
+
 def test_check_ws_probe_collects_quotes():
     from bot.dryrun import _probe_stream
 

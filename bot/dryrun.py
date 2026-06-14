@@ -587,12 +587,64 @@ def check_llm(settings: Settings) -> int:
     return 0 if ok else 1
 
 
+def inspect_matches(settings: Settings, *, show_rejected: bool = False, limit: int = 50) -> int:
+    """Print the cached match verdicts with both market titles so a human can audit
+    whether the matcher pairs the *same* event/resolution. Read-only.
+
+    Confirmed pairs (same_event=1) are the ones that can be traded, so a false
+    positive here is the dangerous case — eyeball that the two titles really are the
+    same event with the same resolution. ``--show-rejected`` also lists rejected pairs
+    to catch false negatives (missed matches)."""
+    store = Store(settings.db_path)
+    try:
+        def rows(same_event: int):
+            return store.conn.execute(
+                """SELECT v.confidence AS conf, v.rationale AS why,
+                          v.venue_a, v.market_a, v.venue_b, v.market_b,
+                          ma.title AS title_a, mb.title AS title_b
+                   FROM match_verdicts v
+                   LEFT JOIN markets ma ON ma.venue=v.venue_a AND ma.market_id=v.market_a
+                   LEFT JOIN markets mb ON mb.venue=v.venue_b AND mb.market_id=v.market_b
+                   WHERE v.same_event=?
+                   ORDER BY v.confidence DESC
+                   LIMIT ?""",
+                (same_event, limit),
+            ).fetchall()
+
+        total = store.conn.execute("SELECT COUNT(*) c FROM match_verdicts").fetchone()["c"]
+        confirmed = rows(1)
+        print(f"match cache: {total} verdicts total, {len(confirmed)} confirmed "
+              f"same-event (showing up to {limit})\n")
+        if not confirmed:
+            print("  (no confirmed pairs yet — discovery hasn't matched anything; "
+                  "check --check-llm and that --embed/--llm are on)")
+        for r in confirmed:
+            print(f"  ✓ {r['conf']:.2f}  [{r['venue_a']}] {r['title_a'] or r['market_a']}")
+            print(f"          [{r['venue_b']}] {r['title_b'] or r['market_b']}")
+            if r["why"]:
+                print(f"          → {r['why']}")
+        if show_rejected:
+            rej = rows(0)
+            print(f"\nrejected (not same event), showing up to {limit}:")
+            for r in rej:
+                print(f"  ✗ {r['conf']:.2f}  [{r['venue_a']}] {r['title_a'] or r['market_a']}"
+                      f"  vs  [{r['venue_b']}] {r['title_b'] or r['market_b']}")
+        return 0
+    finally:
+        store.close()
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Live read-only DRY_RUN arbitrage monitor")
     p.add_argument("--check-llm", action="store_true",
                    help="probe the local LLM (LLM_BASE_URL) and exit")
     p.add_argument("--check-ws", action="store_true",
                    help="probe each venue's market WebSocket and exit")
+    p.add_argument("--inspect-matches", action="store_true",
+                   help="print cached match verdicts (with titles) to audit the "
+                        "matcher, then exit")
+    p.add_argument("--show-rejected", action="store_true",
+                   help="with --inspect-matches, also list rejected (non-match) pairs")
     p.add_argument("--once", action="store_true", help="run a single cycle and exit")
     p.add_argument("--interval", type=float, default=15.0, help="seconds between cycles")
     p.add_argument("--limit", type=int, default=50, help="markets to pull per venue")
@@ -627,6 +679,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.check_ws:
         raise SystemExit(check_ws(load_settings()))
+
+    if args.inspect_matches:
+        raise SystemExit(inspect_matches(load_settings(), show_rejected=args.show_rejected))
 
     threshold = args.match_threshold
     if threshold is None:
