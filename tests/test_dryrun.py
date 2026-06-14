@@ -132,15 +132,30 @@ def test_cross_venue_skipped_without_llm():
     assert result.cross.detected == []
 
 
-def test_no_price_edge_pair_does_not_reach_llm():
-    # Same event, but no combined price edge (0.55 + 0.55 > 1) -> never LLM-confirmed.
-    ka = mq("kalshi", "K1", "Rain in Seattle tomorrow", yes_ask=0.55, yes_ask_size=100, no_ask=0.55, no_ask_size=100)
-    pa = mq("polymarket_us", "P1", "Rain in Seattle tomorrow", yes_ask=0.55, yes_ask_size=100, no_ask=0.55, no_ask_size=100)
+def test_confirmed_no_edge_pair_is_watched_but_not_acted():
+    # Same event, no current price edge (0.55+0.55 > 1). It must still be confirmed
+    # and added to the streaming watchlist (confirmed_pairs), but NOT traded.
+    ka = mq("kalshi", "K1", "Fed cut March", yes_ask=0.55, yes_ask_size=100, no_ask=0.55, no_ask_size=100)
+    pa = mq("polymarket_us", "P1", "Fed cut March", yes_ask=0.55, yes_ask_size=100, no_ask=0.55, no_ask_size=100)
     called = []
     fake = lambda p: called.append(1) or '{"same_event": true, "confidence": 0.95}'
     result = run_cycle_kw([StubVenue("kalshi", {"K1": ka}), StubVenue("polymarket_us", {"P1": pa})], complete_fn=fake)
-    assert result.candidate_pairs == 0
-    assert called == []                                         # LLM never invoked
+    assert result.candidate_pairs >= 1
+    assert len(called) >= 1                      # confirmation runs regardless of edge
+    assert len(result.confirmed_pairs) >= 1      # on the watchlist for streaming
+    assert result.cross.detected == []           # but no edge -> not acted
+    assert result.deep_fetches == 0
+
+
+def test_date_gate_still_skips_before_llm():
+    # Far-apart resolution dates are rejected before any LLM call (unchanged).
+    JUN, SEP = 1781725200.0, 1790683200.0
+    ka = mq("kalshi", "K1", "X", yes_ask=0.40, yes_ask_size=100, no_ask=0.65, no_ask_size=100, close_time=JUN)
+    pa = mq("polymarket_us", "P1", "X", yes_ask=0.62, yes_ask_size=100, no_ask=0.55, no_ask_size=60, close_time=SEP)
+    called = []
+    fake = lambda p: called.append(1) or '{"same_event": true, "confidence": 0.95}'
+    result = run_cycle_kw([StubVenue("kalshi", {"K1": ka}), StubVenue("polymarket_us", {"P1": pa})], complete_fn=fake)
+    assert result.candidate_pairs == 0 and called == [] and result.confirmed_pairs == []
 
 
 def test_cross_pair_without_list_prices_still_confirmed():

@@ -153,9 +153,17 @@ class StreamingEngine:
         """
         while True:
             try:
-                self.set_pairs(await refresh_specs())
+                pairs = await refresh_specs()
             except Exception as exc:
-                log.warning("spec refresh failed: %s", exc)
+                log.warning("spec refresh failed (%s); keeping %d existing pairs",
+                            exc, len(self._pairs))
+                pairs = None
+            if pairs:
+                self.set_pairs(pairs)
+            elif pairs is not None and self._pairs:
+                # Successful refresh but empty (e.g. transient: no edge/markets this
+                # cycle) — keep the last-good watchlist rather than going dark.
+                log.info("refresh returned 0 pairs; keeping %d existing", len(self._pairs))
             log.info("streaming %d confirmed pairs across %d venues",
                      len(self._pairs), len(self.market_ids))
             consumers = [asyncio.create_task(self._consume(v)) for v in venues]

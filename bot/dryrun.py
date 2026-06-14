@@ -147,17 +147,8 @@ async def run_cycle(
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             for c in shortlist(quotes_by_venue[names[i]], quotes_by_venue[names[j]]):
-                edge = cross_price_edge(
-                    c.a, c.b, fee_models.get(c.a.venue), fee_models.get(c.b.venue)
-                )
-                # Skip only when both legs are priced in the scan AND show no edge.
-                # If a leg has no list price (edge == -inf), let it through — the real
-                # price/edge is resolved from the depth fetch after confirmation.
-                if edge != float("-inf") and edge <= min_edge:
-                    continue
-                # Deterministic settlement guard: markets that resolve far apart in
-                # time cannot be the same event (e.g. a single game vs a season-long
-                # championship). This catches mismatches the LLM gets wrong.
+                # Deterministic settlement guard FIRST: markets that resolve far apart
+                # in time cannot be the same event (single game vs season championship).
                 if (
                     c.a.close_time is not None and c.b.close_time is not None
                     and abs(c.a.close_time - c.b.close_time) > max_resolve_gap_days * 86400
@@ -167,9 +158,8 @@ async def run_cycle(
 
                 verdict = _cached_verdict(store, c.a, c.b)
                 if verdict is None:
-                    # Not cached: confirm with the LLM, but bound calls per cycle.
-                    # Candidates are highest-similarity first; the cache fills in the
-                    # rest over subsequent cycles, so each cycle stays bounded.
+                    # Not cached: confirm with the LLM, bounded per cycle. Highest-
+                    # similarity first; the cache fills in the rest over cycles.
                     if complete_fn is None or result.llm_confirms >= max_confirms:
                         continue
                     verdict = await asyncio.to_thread(confirm_match, c.a, c.b, complete_fn)
@@ -181,12 +171,24 @@ async def run_cycle(
                             rationale=verdict.rationale,
                         )
 
-                if verdict.tradeable():
+                if not verdict.tradeable():
+                    continue
+
+                # Confirmed same-event pair -> always part of the streaming watchlist,
+                # regardless of whether there's an edge *right now*. The live price edge
+                # is checked per-tick by the streaming engine (or below for polling).
+                result.confirmed_pairs.append(
+                    (c.a.venue, c.a.market_id, c.b.venue, c.b.market_id,
+                     f"{c.a.label}|{c.b.label}")
+                )
+
+                # Act this cycle only if there's a current price edge (or no list price,
+                # in which case resolve it from the depth fetch).
+                edge = cross_price_edge(
+                    c.a, c.b, fee_models.get(c.a.venue), fee_models.get(c.b.venue)
+                )
+                if edge == float("-inf") or edge > min_edge:
                     confirmed_lite.append((c.a, c.b))
-                    result.confirmed_pairs.append(
-                        (c.a.venue, c.a.market_id, c.b.venue, c.b.market_id,
-                         f"{c.a.label}|{c.b.label}")
-                    )
                     deep_needed.add((c.a.venue, c.a.market_id))
                     deep_needed.add((c.b.venue, c.b.market_id))
 
