@@ -133,9 +133,14 @@ async def run_cycle(
 
     # Cross candidates: lexical similarity -> price edge -> LLM confirmation.
     def shortlist(ga, gb):
-        if embed_fn is not None:
-            return semantic_candidate_pairs(ga, gb, embed_fn, threshold=match_threshold)
-        return candidate_pairs(ga, gb, threshold=match_threshold)
+        # Matching (embeddings/LLM) must not crash the cycle — isolate failures.
+        try:
+            if embed_fn is not None:
+                return semantic_candidate_pairs(ga, gb, embed_fn, threshold=match_threshold)
+            return candidate_pairs(ga, gb, threshold=match_threshold)
+        except Exception as exc:
+            log.warning("matching failed this cycle (%s); skipping cross-venue", exc)
+            return []
 
     confirmed_lite: list[tuple[MarketQuote, MarketQuote]] = []
     names = list(quotes_by_venue)

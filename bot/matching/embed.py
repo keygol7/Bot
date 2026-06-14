@@ -92,6 +92,10 @@ def semantic_candidate_pairs(
     across venues. ``embed_fn`` maps a list of titles to vectors (one batch each
     side). Returns candidates at/above ``threshold``, highest similarity first.
     """
+    # Drop blank titles — they can't match and an empty string makes some embedding
+    # servers (e.g. Ollama) return 400.
+    group_a = [q for q in group_a if q.title and q.title.strip()]
+    group_b = [q for q in group_b if q.title and q.title.strip()]
     if not group_a or not group_b:
         return []
     vecs_a = embed_fn([q.title for q in group_a])

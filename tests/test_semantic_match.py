@@ -52,6 +52,31 @@ def test_semantic_pairs_empty_groups():
     assert semantic_candidate_pairs([], [mq("p", "1", "x")], lambda t: []) == []
 
 
+def test_semantic_filters_blank_titles():
+    # Blank/whitespace titles are dropped before embedding (Ollama 400s on "").
+    seen = []
+
+    def fake(texts):
+        seen.append(list(texts))
+        return [[1.0, 0.0]] * len(texts)
+
+    a = [mq("kalshi", "K1", "Fed cut March"), mq("kalshi", "K2", "   ")]
+    b = [mq("polymarket_us", "P1", "Fed cut March")]
+    pairs = semantic_candidate_pairs(a, b, fake, threshold=0.5)
+    assert seen[0] == ["Fed cut March"]              # blank K2 not embedded
+    assert all(t.strip() for batch in seen for t in batch)
+    assert len(pairs) == 1 and pairs[0].a.market_id == "K1"
+
+
+def test_semantic_all_blank_one_side_returns_empty():
+    called = []
+    fake = lambda texts: called.append(texts) or [[1.0, 0.0]] * len(texts)
+    a = [mq("kalshi", "K1", "Fed cut")]
+    b = [mq("polymarket_us", "P1", ""), mq("polymarket_us", "P2", "  ")]
+    assert semantic_candidate_pairs(a, b, fake, threshold=0.5) == []
+    assert called == []   # never calls the embedder when a side is all-blank
+
+
 def test_embedding_client_parses_response():
     httpx = pytest.importorskip("httpx")
     from bot.matching.embed_client import EmbeddingClient
