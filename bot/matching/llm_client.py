@@ -78,7 +78,12 @@ class LocalLLMClient:
         try:
             reply = self.complete("Reply with exactly: OK")
         except Exception as exc:
-            return False, f"reachable at {self.base_url} but completion failed: {exc}"
+            return False, (
+                f"reachable at {self.base_url} but completion failed: {exc}\n"
+                f"  configured model: {self.model!r}\n"
+                f"  available models: {models}\n"
+                f"  -> set LLM_REASONING_MODEL to one of the available tags (exact match)."
+            )
         return True, (
             f"LLM reachable at {self.base_url}\n{note}"
             f"  available models: {models}\n"
