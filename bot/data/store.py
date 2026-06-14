@@ -90,6 +90,12 @@ class Store:
                 parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
+        # WAL + NORMAL sync: many small writes per cycle without an fsync per commit.
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.OperationalError:
+            pass  # e.g. :memory: — fall back to defaults
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
 
@@ -108,6 +114,27 @@ class Store:
                  event_key=COALESCE(excluded.event_key, markets.event_key),
                  updated_at=excluded.updated_at""",
             (venue, market_id, title, event_key, time.time()),
+        )
+        self.conn.commit()
+
+    def upsert_markets(self, rows) -> None:
+        """Bulk upsert markets in a single transaction (one commit for the batch).
+
+        ``rows`` is an iterable of ``(venue, market_id, title, event_key)``. This is
+        the hot path during the wide scan — per-row commits are far too slow.
+        """
+        now = time.time()
+        payload = [(v, mid, title, ek, now) for (v, mid, title, ek) in rows]
+        if not payload:
+            return
+        self.conn.executemany(
+            """INSERT INTO markets (venue, market_id, title, event_key, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(venue, market_id) DO UPDATE SET
+                 title=excluded.title,
+                 event_key=COALESCE(excluded.event_key, markets.event_key),
+                 updated_at=excluded.updated_at""",
+            payload,
         )
         self.conn.commit()
 

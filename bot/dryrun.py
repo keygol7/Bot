@@ -115,8 +115,7 @@ async def run_cycle(
         result.markets_seen += len(qs)
         result.quotes += len(qs)
         if store is not None:
-            for q in qs:
-                store.upsert_market(v.name, q.market_id, q.title)
+            store.upsert_markets((v.name, q.market_id, q.title, None) for q in qs)
 
     price_lookup = {
         (q.venue, q.market_id): q for qs in quotes_by_venue.values() for q in qs

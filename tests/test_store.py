@@ -49,6 +49,20 @@ def test_verdict_cache_is_order_independent():
     s.close()
 
 
+def test_bulk_upsert_markets():
+    s = Store(":memory:")
+    rows = [("kalshi", f"K{i}", f"Market {i}", None) for i in range(200)]
+    s.upsert_markets(rows)
+    assert s.conn.execute("SELECT COUNT(*) c FROM markets").fetchone()["c"] == 200
+    # Upsert again updates in place (no duplicates).
+    s.upsert_markets([("kalshi", "K0", "Renamed", "E1")])
+    row = s.conn.execute("SELECT * FROM markets WHERE market_id='K0'").fetchone()
+    assert row["title"] == "Renamed" and row["event_key"] == "E1"
+    assert s.conn.execute("SELECT COUNT(*) c FROM markets").fetchone()["c"] == 200
+    s.upsert_markets([])  # empty is a no-op
+    s.close()
+
+
 def test_creates_parent_directory(tmp_path):
     db = tmp_path / "nested" / "dir" / "bot.db"
     s = Store(str(db))
