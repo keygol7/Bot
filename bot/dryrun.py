@@ -118,6 +118,11 @@ async def run_cycle(
         result.scanned.update((v.name, q.market_id) for q in qs)
         if store is not None:
             store.upsert_markets((v.name, q.market_id, q.title, None) for q in qs)
+        log.info("scan: %s returned %d markets", v.name, len(qs))
+
+    # Milestone: the full market pulldown is complete; matching begins next.
+    log.info("scan complete: %d markets across %d venues — matching...",
+             result.markets_seen, len(quotes_by_venue))
 
     price_lookup = {
         (q.venue, q.market_id): q for qs in quotes_by_venue.values() for q in qs
@@ -167,6 +172,12 @@ async def run_cycle(
                         continue
                     verdict = await asyncio.to_thread(confirm_match, c.a, c.b, complete_fn)
                     result.llm_confirms += 1
+                    # Heartbeat for long seed runs: a count every 25 confirmations.
+                    if result.llm_confirms % 25 == 0:
+                        log.info("matching progress: %d confirmations done "
+                                 "(%d candidates seen, %d confirmed so far)",
+                                 result.llm_confirms, result.candidate_pairs,
+                                 len(result.confirmed_pairs))
                     if store is not None:
                         store.cache_verdict(
                             c.a.venue, c.a.market_id, c.b.venue, c.b.market_id,
