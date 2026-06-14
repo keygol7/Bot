@@ -647,7 +647,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="with --inspect-matches, also list rejected (non-match) pairs")
     p.add_argument("--once", action="store_true", help="run a single cycle and exit")
     p.add_argument("--interval", type=float, default=15.0, help="seconds between cycles")
-    p.add_argument("--limit", type=int, default=50, help="markets to pull per venue")
+    p.add_argument("--limit", type=int, default=50,
+                   help="max markets to scan per venue (TOTAL across paginated pages; "
+                        "Kalshi pages at 1000, so >1000 follows the cursor)")
     p.add_argument("--match-threshold", type=float, default=None,
                    help="title-match cutoff to shortlist a cross-venue pair "
                         "(default 0.5 lexical, 0.65 with --embed)")

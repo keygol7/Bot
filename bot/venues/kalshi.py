@@ -298,23 +298,44 @@ class KalshiVenue:
         return await self.fetch_orderbook(market.market_id, market.title)
 
     async def scan_quotes(self, limit: int = 500) -> list[MarketQuote]:
-        """Phase 1: one /markets call -> price-only quotes for every open market."""
-        await self._limiter.wait()
-        resp = await self._http().get(
-            "/markets",
-            # mve_filter=exclude drops multivariate/parlay markets server-side, which
-            # otherwise dominate the open feed. The client-side filter below is a backstop.
-            params={"limit": limit, "status": "open", "mve_filter": "exclude"},
-            headers=self._auth_headers("GET", "/markets"),
-        )
-        resp.raise_for_status()
-        markets = resp.json().get("markets", [])
-        # Drop multivariate/parlay markets — not arbitrageable, junk titles.
-        return [
-            normalize_summary(m)
-            for m in markets
-            if m.get("ticker") and not is_multivariate(m["ticker"])
-        ]
+        """Phase 1: price-only quotes for open markets, up to ``limit`` markets total.
+
+        Kalshi caps a single /markets page at 1000 and the markets we care about can
+        sit past the first page (e.g. UFC fights), so we follow the ``cursor`` until
+        we've scanned ``limit`` markets or the feed is exhausted. ``limit`` is a TOTAL
+        cap across pages, not a per-page size.
+        """
+        out: list[MarketQuote] = []
+        cursor: str | None = None
+        fetched = 0
+        while fetched < limit:
+            await self._limiter.wait()
+            params = {
+                # mve_filter=exclude drops multivariate/parlay markets server-side,
+                # which otherwise dominate the feed. Client-side filter below backs it up.
+                "limit": min(limit - fetched, 1000),
+                "status": "open",
+                "mve_filter": "exclude",
+            }
+            if cursor:
+                params["cursor"] = cursor  # query only — not part of the signed path
+            resp = await self._http().get(
+                "/markets", params=params, headers=self._auth_headers("GET", "/markets"),
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            markets = body.get("markets", [])
+            fetched += len(markets)
+            # Drop multivariate/parlay markets — not arbitrageable, junk titles.
+            out.extend(
+                normalize_summary(m)
+                for m in markets
+                if m.get("ticker") and not is_multivariate(m["ticker"])
+            )
+            cursor = body.get("cursor")
+            if not cursor or not markets:
+                break  # end of feed
+        return out
 
     def _ws_auth_headers(self) -> dict[str, str]:
         """Auth headers for the WS handshake (signs GET + the WS path)."""

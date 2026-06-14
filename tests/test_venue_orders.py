@@ -92,6 +92,48 @@ def test_polymarket_buy_yes_price_is_yes_side():
     assert r.status.value == "KILLED"
 
 
+def test_kalshi_scan_quotes_paginates_cursor():
+    # Two pages: cursor on page 1 -> page 2 -> no cursor (end). limit=1500 spans both.
+    pages = [
+        {"markets": [{"ticker": f"A{i}", "title": f"A{i}", "yes_bid": 40, "yes_ask": 41,
+                      "no_bid": 59, "no_ask": 60} for i in range(1000)], "cursor": "CUR2"},
+        {"markets": [{"ticker": f"B{i}", "title": f"B{i}", "yes_bid": 40, "yes_ask": 41,
+                      "no_bid": 59, "no_ask": 60} for i in range(500)], "cursor": ""},
+    ]
+    seen_params = []
+
+    def handler(req):
+        seen_params.append(dict(req.url.params))
+        page = pages[1] if req.url.params.get("cursor") == "CUR2" else pages[0]
+        return httpx.Response(200, json=page)
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+
+    quotes = asyncio.run(v.scan_quotes(1500))
+    assert len(quotes) == 1500                          # both pages collected
+    assert {q.market_id for q in quotes} >= {"A0", "B0", "B499"}
+    assert len(seen_params) == 2                         # exactly two HTTP calls
+    assert seen_params[0].get("cursor") is None          # first page has no cursor
+    assert seen_params[1]["cursor"] == "CUR2"            # second follows the cursor
+    assert seen_params[1]["limit"] == "500"              # remaining cap, not a full page
+
+
+def test_kalshi_scan_quotes_stops_when_cursor_exhausted():
+    # limit asks for 5000 but the feed ends after one short page with no cursor.
+    def handler(req):
+        return httpx.Response(200, json={"markets": [
+            {"ticker": "A0", "title": "A0", "yes_bid": 40, "yes_ask": 41,
+             "no_bid": 59, "no_ask": 60}], "cursor": ""})
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    quotes = asyncio.run(v.scan_quotes(5000))
+    assert len(quotes) == 1                              # no infinite loop on a short feed
+
+
 def test_place_order_requires_credentials():
     from bot.venues.base import OrderNotPermitted
 
