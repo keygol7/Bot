@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import base64
 import time
+import uuid
 from typing import Any, AsyncIterator
 from urllib.parse import urlsplit
 
+from bot.execution.orders import OrderResult, OrderStatus
 from bot.fees import KalshiFeeModel
 from bot.models import MarketQuote, PriceLevel, Side
 from bot.timeutil import parse_iso8601
@@ -263,11 +265,68 @@ class KalshiVenue:
         raise NotImplementedError("Kalshi WS streaming is implemented in the live phase")
         yield  # pragma: no cover - makes this an async generator
 
-    async def place_order(self, market_id: str, side: Side, price: float, contracts: float) -> dict:
-        raise OrderNotPermitted("order placement is not enabled in this phase (DRY_RUN)")
+    async def place_order(
+        self, market_id: str, side: Side, action: str, price: float, contracts: float,
+        *, tif: str = "fill_or_kill",
+    ) -> OrderResult:
+        """Place an order via legacy /portfolio/orders (explicit yes/no side).
+
+        ``price`` is the cost to buy that ``side`` (dollars 0.01-0.99); converted to
+        Kalshi cents. ``contracts`` is whole contracts. Requires credentials.
+        NOTE: fill-response field mapping should be confirmed against the demo
+        environment before live use.
+        """
+        if not self.authenticated:
+            raise OrderNotPermitted("Kalshi credentials not configured")
+        cents = int(round(price * 100))
+        count = int(round(contracts))
+        body: dict[str, Any] = {
+            "ticker": market_id,
+            "action": action,                 # "buy" | "sell"
+            "side": side.value.lower(),        # "yes" | "no"
+            "count": count,
+            "time_in_force": tif,              # fill_or_kill | immediate_or_cancel | ...
+            "client_order_id": str(uuid.uuid4()),
+        }
+        body["yes_price" if side is Side.YES else "no_price"] = cents
+
+        await self._limiter.wait()
+        try:
+            resp = await self._http().post(
+                "/portfolio/orders", json=body,
+                headers=self._auth_headers("POST", "/portfolio/orders"),
+            )
+            resp.raise_for_status()
+            order = resp.json().get("order", {})
+        except Exception as exc:  # network/HTTP error -> position state UNKNOWN
+            return OrderResult(VENUE, market_id, side, action, count, status=OrderStatus.ERROR,
+                               raw={"error": str(exc)})
+
+        filled = float(order.get("fill_count_fp") or order.get("fill_count") or 0)
+        price_key = "yes_price_dollars" if side is Side.YES else "no_price_dollars"
+        avg = order.get(price_key)
+        status = (
+            OrderStatus.FILLED if filled >= count - 1e-9
+            else OrderStatus.KILLED if filled <= 1e-9
+            else OrderStatus.PARTIAL
+        )
+        return OrderResult(
+            venue=VENUE, market_id=market_id, side=side, action=action,
+            requested=count, filled=filled,
+            avg_price=float(avg) if avg not in (None, "") else None,
+            order_id=order.get("order_id"), status=status, raw=order,
+        )
 
     async def cancel_order(self, order_id: str) -> dict:
-        raise OrderNotPermitted("order placement is not enabled in this phase (DRY_RUN)")
+        if not self.authenticated:
+            raise OrderNotPermitted("Kalshi credentials not configured")
+        path = f"/portfolio/orders/{order_id}"
+        await self._limiter.wait()
+        resp = await self._http().request(
+            "DELETE", path, headers=self._auth_headers("DELETE", path)
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     async def get_positions(self) -> dict:
         raise NotImplementedError("positions endpoint lands with the live phase")

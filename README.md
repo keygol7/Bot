@@ -118,11 +118,28 @@ trading.
 ## Roadmap
 
 1. ✅ Scaffold + read-only venue adapters + normalization + persistence
-2. ✅ Matching pipeline (lexical pre-filter + local-LLM confirmation + cache)
-3. ✅ Arbitrage detector + DRY_RUN engine
+2. ✅ Matching pipeline (semantic embeddings + local-LLM confirmation + cache)
+3. ✅ Arbitrage detector + DRY_RUN engine + resolution-date settlement guard
 4. ✅ Live read-only DRY_RUN runner (`python -m bot.dryrun`) — paper trading on real prices
-5. ⏳ Live WebSocket ingest + latency-optimized two-leg execution (LIVE_SMALL)
-6. ⏳ Dashboard + LLM-driven directional book (separate capped strategy)
+5. ✅ Two-leg executor (`--live`): FoK legs, auto-unwind on leg failure, halt-on-unknown,
+   risk caps + kill switch. Sandbox-first; bundle + cross-venue.
+6. ⏳ WebSocket streaming for latency-optimized live execution
+7. ⏳ Dashboard + LLM-driven directional book (separate capped strategy)
+
+### Going live (sandbox first)
+
+`--live` places **real orders** on confirmed arbs; without it the runner is read-only.
+
+```bash
+# 1. point base URLs at sandbox/demo + set trading keys in .env, then:
+python -m bot.dryrun --once --limit 1000 --embed --llm --live   # sandbox canary
+```
+Each opportunity is executed as two **fill-or-kill** legs (buy YES / buy NO). If one
+leg fills and the hedge doesn't, the filled leg is **auto-unwound** to stay flat; any
+*ambiguous* state (network error / partial) **halts trading and trips the kill switch**
+for manual reconciliation. Size is capped at `RISK_MAX_ORDER_CONTRACTS`; per-market,
+total-exposure, and daily-loss caps all apply. `--live` refuses to run without trading
+credentials (stays read-only).
 
 ## Legal note
 

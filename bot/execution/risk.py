@@ -19,6 +19,7 @@ class RiskLimits:
     max_total_exposure: float = 5000.0       # $ notional across all markets
     max_daily_loss: float = 500.0            # $ realized loss before kill switch
     min_edge: float = 0.01                   # $ per-contract edge to act on an arb
+    max_order_contracts: float = 2.0         # LIVE_SMALL per-order size cap (contracts)
 
     def __post_init__(self) -> None:
         for name in (

@@ -52,14 +52,16 @@ class CycleResult:
     bundle_opps: list[ArbOpportunity] = field(default_factory=list)
     candidate_pairs: int = 0
     cross: ScanResult = field(default_factory=ScanResult)
+    executions: list = field(default_factory=list)  # ExecutionReport (live mode only)
 
     def summary(self) -> str:
+        executed = sum(1 for e in self.executions if e.status.value in ("SUCCESS", "UNWOUND"))
         return (
             f"markets={self.markets_seen} quotes={self.quotes} "
             f"cross_candidates={self.candidate_pairs} llm_confirms={self.llm_confirms} "
             f"deep_fetches={self.deep_fetches} bundle_arbs={len(self.bundle_opps)} "
             f"cross_detected={len(self.cross.detected)} "
-            f"cross_actionable={len(self.cross.actionable)}"
+            f"cross_actionable={len(self.cross.actionable)} executed={executed}"
         )
 
 
@@ -90,6 +92,7 @@ async def run_cycle(
     embed_fn=None,
     max_confirms: int = 50,
     max_resolve_gap_days: float = 3.0,
+    executor=None,
 ) -> CycleResult:
     result = CycleResult()
 
@@ -222,6 +225,16 @@ async def run_cycle(
         mode=RunMode.DRY_RUN, min_edge=min_edge,
     )
     result.cross = engine.evaluate_pairs(confirmed)
+
+    # ----- Live execution (only when an executor is wired) -----
+    if executor is not None:
+        for opp in [*result.bundle_opps, *result.cross.actionable]:
+            report = await executor.execute(opp)
+            result.executions.append(report)
+            log.info("EXEC %s | %s", opp.event_key, report)
+            if executor.risk.is_killed:
+                log.critical("kill switch tripped — halting execution this cycle")
+                break
     return result
 
 
@@ -253,6 +266,7 @@ async def run(
     min_edge: float | None = None,
     max_confirms: int = 50,
     max_resolve_gap_days: float = 3.0,
+    live: bool = False,
     store: Store | None = None,
 ) -> CycleResult | None:
     settings = settings or load_settings()
@@ -264,6 +278,34 @@ async def run(
     if venues is None:
         venues = _build_venues(settings)
     fee_models = {v.name: v.fee_model for v in venues}
+
+    executor = None
+    if live:
+        not_ready = [
+            v.name for v in venues
+            if not (getattr(v, "is_trading_configured", False) or getattr(v, "authenticated", False))
+        ]
+        if not_ready:
+            log.error(
+                "LIVE requested but trading credentials missing for %s — staying READ-ONLY. "
+                "Set the trading API keys in .env to enable execution.", not_ready,
+            )
+            live = False
+    if live:
+        from bot.execution.executor import Executor
+
+        executor = Executor(
+            {v.name: v for v in venues}, risk,
+            fee_models=fee_models, store=store,
+            max_order_contracts=settings.risk.max_order_contracts,
+        )
+        log.warning(
+            "LIVE EXECUTION ENABLED (mode=%s) — placing REAL orders, max %s contracts/order, "
+            "caps: per-market $%.0f, total $%.0f, daily-loss $%.0f",
+            settings.run_mode.value, settings.risk.max_order_contracts,
+            settings.risk.max_position_per_market, settings.risk.max_total_exposure,
+            settings.risk.max_daily_loss,
+        )
 
     complete_fn = None
     if use_llm:
@@ -285,6 +327,7 @@ async def run(
                 min_edge=min_edge, match_threshold=match_threshold,
                 complete_fn=complete_fn, limit=limit, embed_fn=embed_fn,
                 max_confirms=max_confirms, max_resolve_gap_days=max_resolve_gap_days,
+                executor=executor,
             )
             log.info("cycle: %s", last.summary())
             if once:
@@ -334,6 +377,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--max-resolve-gap-days", type=float, default=3.0,
                    help="reject cross-venue pairs whose resolution dates differ by "
                         "more than this many days (settlement-mismatch guard)")
+    p.add_argument("--live", action="store_true",
+                   help="PLACE REAL ORDERS on confirmed arbs (needs trading creds; "
+                        "point base URLs at the sandbox/demo first). Default: monitor only.")
     args = p.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -349,7 +395,7 @@ def main(argv: list[str] | None = None) -> None:
         once=args.once, interval=args.interval, limit=args.limit,
         use_llm=args.llm, use_embed=args.embed, match_threshold=threshold,
         min_edge=args.min_edge, max_confirms=args.max_confirms,
-        max_resolve_gap_days=args.max_resolve_gap_days,
+        max_resolve_gap_days=args.max_resolve_gap_days, live=args.live,
     ))
 
 

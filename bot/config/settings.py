@@ -118,6 +118,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
             max_total_exposure=_env_float("RISK_MAX_TOTAL_EXPOSURE", 5000.0),
             max_daily_loss=_env_float("RISK_MAX_DAILY_LOSS", 500.0),
             min_edge=_env_float("RISK_MIN_EDGE", 0.01),
+            max_order_contracts=_env_float("RISK_MAX_ORDER_CONTRACTS", 2.0),
         ),
         db_path=env("BOT_DB_PATH", "data/bot.db"),
     )

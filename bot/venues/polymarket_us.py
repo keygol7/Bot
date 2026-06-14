@@ -18,6 +18,7 @@ import base64
 import time
 from typing import Any, AsyncIterator
 
+from bot.execution.orders import OrderResult, OrderStatus
 from bot.fees import ZeroFeeModel
 from bot.models import MarketQuote, Side
 from bot.timeutil import parse_iso8601
@@ -25,6 +26,22 @@ from bot.venues.base import OrderNotPermitted, RawMarket
 from bot.venues.ratelimit import AsyncRateLimiter
 
 VENUE = "polymarket_us"
+
+# (side, action) -> order intent. Price is always quoted on the YES/long side.
+_INTENT = {
+    (Side.YES, "buy"): "ORDER_INTENT_BUY_LONG",
+    (Side.YES, "sell"): "ORDER_INTENT_SELL_LONG",
+    (Side.NO, "buy"): "ORDER_INTENT_BUY_SHORT",
+    (Side.NO, "sell"): "ORDER_INTENT_SELL_SHORT",
+}
+_TIF = {
+    "fill_or_kill": "TIME_IN_FORCE_FILL_OR_KILL",
+    "immediate_or_cancel": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+    "gtc": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+}
+_TERMINAL_FILLED = "ORDER_STATE_FILLED"
+_REJECTED = {"ORDER_STATE_REJECTED"}
+_KILLED = {"ORDER_STATE_CANCELED", "ORDER_STATE_EXPIRED"}
 
 
 def _amount(value: Any) -> float | None:
@@ -230,11 +247,79 @@ class PolymarketUSVenue:
         raise NotImplementedError("QCEX WS streaming is implemented in the live phase")
         yield  # pragma: no cover - makes this an async generator
 
-    async def place_order(self, market_id: str, side: Side, price: float, contracts: float) -> dict:
-        raise OrderNotPermitted("order placement is not enabled in this phase (DRY_RUN)")
+    def _api(self):
+        """HTTP client for the authenticated trading API."""
+        if self._api_client is None:
+            import httpx  # lazy
+
+            self._api_client = httpx.AsyncClient(base_url=self.cfg.api_base, timeout=10.0)
+        return self._api_client
+
+    async def place_order(
+        self, market_id: str, side: Side, action: str, price: float, contracts: float,
+        *, tif: str = "fill_or_kill",
+    ) -> OrderResult:
+        """Place an order via POST /v1/orders (X-PM Ed25519 auth).
+
+        ``price`` is the cost/value of the requested ``side``; the API always wants the
+        YES/long price, so for NO we send ``1 - price``. ``manualOrderIndicator`` is
+        AUTOMATIC (bot, regulatory). NOTE: confirm the create-response fill fields
+        against the sandbox before live use.
+        """
+        if not getattr(self.cfg, "is_trading_configured", False):
+            raise OrderNotPermitted("Polymarket US trading credentials not configured")
+        yes_value = price if side is Side.YES else round(1.0 - price, 6)
+        yes_value = min(max(yes_value, 0.01), 0.99)
+        body = {
+            "marketSlug": market_id,
+            "type": "ORDER_TYPE_LIMIT",
+            "price": {"value": f"{yes_value}", "currency": "USD"},
+            "quantity": contracts,
+            "tif": _TIF.get(tif, "TIME_IN_FORCE_FILL_OR_KILL"),
+            "intent": _INTENT[(side, action)],
+            "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+            "synchronousExecution": True,
+        }
+        await self._limiter.wait()
+        try:
+            resp = await self._api().post(
+                "/v1/orders", json=body, headers=self._auth_headers("POST", "/v1/orders")
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            return OrderResult(VENUE, market_id, side, action, contracts,
+                               status=OrderStatus.ERROR, raw={"error": str(exc)})
+
+        order = data.get("order", data)
+        state = order.get("state") or order.get("orderState") or ""
+        filled = float(order.get("cumQuantity") or order.get("filledQuantity") or 0)
+        avg = order.get("avgPx", {})
+        avg_price = None
+        if isinstance(avg, dict) and avg.get("value") not in (None, ""):
+            avg_price = float(avg["value"])
+        if state == _TERMINAL_FILLED or filled >= contracts - 1e-9:
+            status = OrderStatus.FILLED
+        elif state in _REJECTED:
+            status = OrderStatus.REJECTED
+        elif filled <= 1e-9:
+            status = OrderStatus.KILLED
+        else:
+            status = OrderStatus.PARTIAL
+        return OrderResult(
+            venue=VENUE, market_id=market_id, side=side, action=action,
+            requested=contracts, filled=filled, avg_price=avg_price,
+            order_id=order.get("id") or order.get("orderId"), status=status, raw=order,
+        )
 
     async def cancel_order(self, order_id: str) -> dict:
-        raise OrderNotPermitted("order placement is not enabled in this phase (DRY_RUN)")
+        if not getattr(self.cfg, "is_trading_configured", False):
+            raise OrderNotPermitted("Polymarket US trading credentials not configured")
+        path = f"/v1/order/{order_id}/cancel"
+        await self._limiter.wait()
+        resp = await self._api().post(path, headers=self._auth_headers("POST", path))
+        resp.raise_for_status()
+        return resp.json()
 
     async def get_positions(self) -> dict:
         raise NotImplementedError("positions endpoint lands with the live phase")

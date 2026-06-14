@@ -51,9 +51,12 @@ class Venue(Protocol):
         ...
 
     async def place_order(
-        self, market_id: str, side: Side, price: float, contracts: float
-    ) -> dict:
-        """Place an order. Not used in DRY_RUN; implemented in the live phase."""
+        self, market_id: str, side: Side, action: str, price: float, contracts: float,
+        *, tif: str = "fill_or_kill",
+    ):
+        """Place an order (returns an ``OrderResult``). ``action`` is "buy"/"sell";
+        ``price`` is the cost/value of ``side`` in dollars. Raises until creds + a
+        live run mode are configured."""
         ...
 
     async def cancel_order(self, order_id: str) -> dict:
