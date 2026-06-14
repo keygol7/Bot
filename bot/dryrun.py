@@ -300,7 +300,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--limit", type=int, default=50, help="markets to pull per venue")
     p.add_argument("--match-threshold", type=float, default=None,
                    help="title-match cutoff to shortlist a cross-venue pair "
-                        "(default 0.5 lexical, 0.80 with --embed)")
+                        "(default 0.5 lexical, 0.65 with --embed)")
     p.add_argument("--llm", action="store_true",
                    help="confirm cross-venue matches with the local LLM (default off)")
     p.add_argument("--embed", action="store_true",
@@ -317,7 +317,7 @@ def main(argv: list[str] | None = None) -> None:
 
     threshold = args.match_threshold
     if threshold is None:
-        threshold = 0.80 if args.embed else 0.5
+        threshold = 0.65 if args.embed else 0.5
 
     asyncio.run(run(
         once=args.once, interval=args.interval, limit=args.limit,

@@ -139,6 +139,23 @@ def _cents_to_price(cents: Any) -> float | None:
         return None
 
 
+def build_summary_title(m: dict[str, Any]) -> str:
+    """Outcome-disambiguated title for a Kalshi market.
+
+    Kalshi returns one market per outcome but gives them the same ``title``
+    (e.g. both sides of a game read "X vs Y Winner?"). ``yes_sub_title`` names the
+    YES outcome (the team/side), so append it for matching.
+    """
+    title = m.get("title", "") or ""
+    sub = m.get("yes_sub_title") or m.get("subtitle")
+    suffix = f" - {sub}"
+    # Always append the YES outcome (both sides of "X vs Y" share the title);
+    # only guard against re-appending the exact suffix (idempotent).
+    if sub and not title.endswith(suffix):
+        return title + suffix
+    return title
+
+
 def normalize_summary(m: dict[str, Any], *, event_key: str | None = None) -> MarketQuote:
     """Build a price-only quote from a Kalshi /markets summary row (no per-market call).
 
@@ -149,7 +166,7 @@ def normalize_summary(m: dict[str, Any], *, event_key: str | None = None) -> Mar
     return MarketQuote(
         venue=VENUE,
         market_id=m.get("ticker", ""),
-        title=m.get("title", ""),
+        title=build_summary_title(m),
         event_key=event_key,
         yes_ask=_cents_to_price(m.get("yes_ask")),
         yes_ask_size=0.0,

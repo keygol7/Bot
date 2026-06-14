@@ -85,8 +85,9 @@ def build_market_title(m: dict[str, Any]) -> str:
     """Descriptive, outcome-disambiguated title for matching."""
     question = m.get("question") or m.get("title") or ""
     outcome = _long_side_outcome(m)
-    if outcome and outcome.lower() not in question.lower():
-        return f"{question} - {outcome}"
+    suffix = f" - {outcome}"
+    if outcome and not question.endswith(suffix):
+        return question + suffix
     return question
 
 

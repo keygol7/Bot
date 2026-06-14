@@ -96,13 +96,31 @@ def semantic_candidate_pairs(
         return []
     vecs_a = embed_fn([q.title for q in group_a])
     vecs_b = embed_fn([q.title for q in group_b])
+
+    sim = _similarity_matrix(vecs_a, vecs_b)  # sim[i][j] = cosine(a_i, b_j)
     out: list[Candidate] = []
-    for qa, va in zip(group_a, vecs_a):
-        for qb, vb in zip(group_b, vecs_b):
+    for i, qa in enumerate(group_a):
+        row = sim[i]
+        for j, qb in enumerate(group_b):
             if qa.venue == qb.venue:
                 continue
-            score = cosine(va, vb)
+            score = row[j]
             if score >= threshold:
-                out.append(Candidate(a=qa, b=qb, score=score))
+                out.append(Candidate(a=qa, b=qb, score=float(score)))
     out.sort(key=lambda c: c.score, reverse=True)
     return out
+
+
+def _similarity_matrix(vecs_a, vecs_b):
+    """All-pairs cosine similarity. Uses numpy when available (orders of magnitude
+    faster on large boards), else a pure-Python fallback."""
+    try:
+        import numpy as np
+
+        a = np.asarray(vecs_a, dtype=float)
+        b = np.asarray(vecs_b, dtype=float)
+        a /= np.linalg.norm(a, axis=1, keepdims=True) + 1e-12
+        b /= np.linalg.norm(b, axis=1, keepdims=True) + 1e-12
+        return a @ b.T
+    except ImportError:
+        return [[cosine(va, vb) for vb in vecs_b] for va in vecs_a]

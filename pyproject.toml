@@ -17,6 +17,7 @@ venues = [
     "httpx>=0.27",
     "websockets>=12",
     "cryptography>=42",   # Ed25519 request signing for Polymarket US / QCEX
+    "numpy>=1.26",        # fast all-pairs cosine for semantic matching
 ]
 dev = [
     "pytest>=8",

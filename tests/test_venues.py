@@ -1,6 +1,27 @@
 """Tests for the pure venue normalization functions (no network, no SDKs)."""
 
-from bot.venues.kalshi import is_multivariate, normalize_orderbook, normalize_summary
+from bot.venues.kalshi import (
+    build_summary_title,
+    is_multivariate,
+    normalize_orderbook,
+    normalize_summary,
+)
+
+
+def test_kalshi_title_appends_yes_sub_title():
+    # Both sides of a game share the title; yes_sub_title names the YES outcome.
+    m = {"ticker": "KXMLBGAME-26JUN16-LAA", "title": "Los Angeles A vs Arizona Winner?",
+         "yes_sub_title": "Los Angeles A"}
+    assert build_summary_title(m) == "Los Angeles A vs Arizona Winner? - Los Angeles A"
+
+
+def test_kalshi_title_idempotent_suffix():
+    # Always appends the outcome (disambiguates shared "X vs Y" titles)...
+    m = {"title": "Will the Chargers win?", "yes_sub_title": "Chargers"}
+    once = build_summary_title(m)
+    assert once == "Will the Chargers win? - Chargers"
+    # ...but re-normalizing an already-suffixed title doesn't double up.
+    assert build_summary_title({"title": once, "yes_sub_title": "Chargers"}) == once
 from bot.venues.polymarket_us import build_market_title, normalize_bbo
 
 
@@ -15,10 +36,10 @@ def test_polymarket_title_appends_outcome():
     assert build_market_title(m) == "World Series Champion - New York Yankees"
 
 
-def test_polymarket_title_no_dup_when_outcome_in_question():
+def test_polymarket_title_appends_outcome_even_if_in_question():
     m = {"question": "Will the Chargers win?", "marketSides": [{"long": True, "description": "Chargers"}]}
-    # 'chargers' already in the question -> not appended again
-    assert build_market_title(m) == "Will the Chargers win?"
+    # The outcome disambiguates the YES side, so it's appended.
+    assert build_market_title(m) == "Will the Chargers win? - Chargers"
 
 
 def test_polymarket_title_falls_back_to_question():
