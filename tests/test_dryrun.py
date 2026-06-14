@@ -237,3 +237,41 @@ def test_deep_fetch_failure_does_not_crash():
     result = run_cycle_kw([FlakyDeep("kalshi", {"B1": kb})])
     assert result.deep_fetches == 1       # attempted
     assert result.bundle_opps == []       # but no sized quote -> no recorded arb
+
+
+def test_scanned_set_holds_every_live_market():
+    # ``scanned`` is the (venue, market_id) universe the streaming watchlist
+    # intersects cached pairs against; a cached pair drops off the watchlist iff
+    # one of its legs is absent here. This is the root-cause check for "0 of N live".
+    ka = mq("kalshi", "K1", "A", yes_ask=0.55, yes_ask_size=10, no_ask=0.55, no_ask_size=10)
+    pa = mq("polymarket_us", "P1", "B", yes_ask=0.55, yes_ask_size=10, no_ask=0.55, no_ask_size=10)
+    result = run_cycle_kw([StubVenue("kalshi", {"K1": ka}), StubVenue("polymarket_us", {"P1": pa})])
+    assert result.scanned == {("kalshi", "K1"), ("polymarket_us", "P1")}
+
+
+def test_check_ws_probe_collects_quotes():
+    from bot.dryrun import _probe_stream
+
+    class WSVenue:
+        name = "kalshi"
+
+        async def stream_order_book(self, market_ids):
+            for mid in market_ids:
+                yield mq("kalshi", mid, "t", yes_ask=0.4, no_ask=0.6)
+
+    ok, msg, samples = asyncio.run(_probe_stream(WSVenue(), ["K1", "K2", "K3"], n=2, timeout=5.0))
+    assert ok and len(samples) == 2 and msg == "ok"
+
+
+def test_check_ws_probe_times_out_when_silent():
+    from bot.dryrun import _probe_stream
+
+    class SilentVenue:
+        name = "polymarket_us"
+
+        async def stream_order_book(self, market_ids):
+            await asyncio.sleep(10)
+            yield  # never reached within the timeout
+
+    ok, msg, samples = asyncio.run(_probe_stream(SilentVenue(), ["P1"], n=1, timeout=0.1))
+    assert not ok and samples == [] and "timeout" in msg

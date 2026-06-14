@@ -419,15 +419,45 @@ async def stream(
         # Watchlist = ALL cached confirmed pairs whose BOTH markets are live right now.
         # Durable across embedding/LLM variance — discovery only adds to the cache.
         live = res.scanned
+        cached = store.confirmed_pairs()
         out = []
-        for (va, ma, vb, mb, ek) in store.confirmed_pairs():
-            if (va, ma) in live and (vb, mb) in live:
+        missing_a = missing_b = 0  # legs of cached pairs not present in this scan
+        for (va, ma, vb, mb, ek) in cached:
+            a_live = (va, ma) in live
+            b_live = (vb, mb) in live
+            if a_live and b_live:
                 out.append(ConfirmedPair(
                     event_key=ek or f"{va}:{ma}|{vb}:{mb}",
                     venue_a=va, market_a=ma, venue_b=vb, market_b=mb,
                 ))
-        log.info("watchlist: %d confirmed pairs live (of %d cached)",
-                 len(out), len(store.confirmed_pairs()))
+            else:
+                if not a_live:
+                    missing_a += 1
+                if not b_live:
+                    missing_b += 1
+        log.info("watchlist: %d confirmed pairs live (of %d cached)", len(out), len(cached))
+        if cached and not out:
+            # Diagnose which side dropped out of the scan: per-venue live counts plus
+            # how many cached legs each venue failed to return this cycle.
+            per_venue: dict[str, int] = {}
+            for (vn, _mid) in live:
+                per_venue[vn] = per_venue.get(vn, 0) + 1
+            log.warning(
+                "watchlist EMPTY: scanned %s; cached-pair legs missing from scan: "
+                "side-A=%d side-B=%d. If a venue's count is 0 or its markets rotated "
+                "out, raise --limit or check that venue's base URL (e.g. Kalshi "
+                "demo vs prod must match how the pairs were cached).",
+                per_venue or "{}", missing_a, missing_b,
+            )
+            # Show one concrete cached leg per venue and whether it's live, so the
+            # ticker format / prod-vs-demo mismatch is obvious in the log.
+            seen: set[str] = set()
+            for (va, ma, vb, mb, _ek) in cached:
+                for (vn, mid) in ((va, ma), (vb, mb)):
+                    if vn not in seen:
+                        seen.add(vn)
+                        log.warning("  cached %s market %r live=%s",
+                                    vn, mid, (vn, mid) in live)
         return out
 
     async def feed_private(v):
@@ -457,6 +487,69 @@ async def stream(
                 await aclose()
 
 
+async def _probe_stream(venue, market_ids, *, n: int = 3, timeout: float = 20.0):
+    """Open a venue's market WS, collect up to ``n`` quotes within ``timeout``.
+
+    Returns (ok, message, samples). The stream reconnects internally on error, so a
+    credential/URL problem shows up as a timeout with 0 messages (check logs for why).
+    """
+    got = []
+    agen = venue.stream_order_book(market_ids)
+
+    async def _collect():
+        async for q in agen:
+            got.append(q)
+            if len(got) >= n:
+                break
+
+    try:
+        await asyncio.wait_for(_collect(), timeout)
+        msg = "ok" if got else f"no messages in {timeout:.0f}s (auth/URL? see warnings)"
+        return (len(got) > 0), msg, got
+    except asyncio.TimeoutError:
+        return (len(got) > 0), f"timeout after {timeout:.0f}s, {len(got)} msgs", got
+    except Exception as exc:
+        return False, f"error: {exc}", got
+    finally:
+        aclose = getattr(agen, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+def check_ws(settings: Settings) -> int:
+    """Probe each venue's market WebSocket and print a diagnosis. Returns an exit code."""
+    async def _run() -> int:
+        venues = _build_venues(settings)
+        rc = 0
+        try:
+            for v in venues:
+                try:
+                    qs = await v.scan_quotes(50)
+                    mids = [q.market_id for q in qs][:30]
+                except Exception as exc:
+                    print(f"{v.name} WS: FAIL (couldn't list markets to subscribe: {exc})")
+                    rc = 1
+                    continue
+                ok, msg, samples = await _probe_stream(v, mids)
+                tag = "OK" if ok else "FAIL"
+                extra = ""
+                if samples:
+                    s = samples[0]
+                    extra = f" | sample {s.market_id} yes_ask={s.yes_ask} no_ask={s.no_ask}"
+                print(f"{v.name} market WS: {tag} ({msg}){extra}")
+                if not ok:
+                    rc = 1
+        finally:
+            for v in venues:
+                aclose = getattr(v, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+        print("(private fill streams can only be verified by placing a test order.)")
+        return rc
+
+    return asyncio.run(_run())
+
+
 def check_llm(settings: Settings) -> int:
     """Probe the configured local LLM and print a diagnosis. Returns an exit code."""
     from bot.matching.llm_client import LocalLLMClient
@@ -472,6 +565,8 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Live read-only DRY_RUN arbitrage monitor")
     p.add_argument("--check-llm", action="store_true",
                    help="probe the local LLM (LLM_BASE_URL) and exit")
+    p.add_argument("--check-ws", action="store_true",
+                   help="probe each venue's market WebSocket and exit")
     p.add_argument("--once", action="store_true", help="run a single cycle and exit")
     p.add_argument("--interval", type=float, default=15.0, help="seconds between cycles")
     p.add_argument("--limit", type=int, default=50, help="markets to pull per venue")
@@ -503,6 +598,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.check_llm:
         raise SystemExit(check_llm(load_settings()))
+
+    if args.check_ws:
+        raise SystemExit(check_ws(load_settings()))
 
     threshold = args.match_threshold
     if threshold is None:
