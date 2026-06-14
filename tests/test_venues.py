@@ -5,7 +5,23 @@ from bot.venues.kalshi import (
     is_multivariate,
     normalize_orderbook,
     normalize_summary,
+    parse_ticker,
 )
+
+
+def test_kalshi_ws_ticker_parsing():
+    msg = {"type": "ticker", "msg": {
+        "market_ticker": "KXMLBGAME-X-LAA",
+        "yes_bid_dollars": "0.40", "yes_ask_dollars": "0.43"}}
+    q = parse_ticker(msg)
+    assert q.market_id == "KXMLBGAME-X-LAA"
+    assert q.yes_ask == 0.43
+    assert round(q.no_ask, 4) == 0.60          # 1 - yes_bid
+    assert q.timestamp > 0
+
+
+def test_kalshi_ws_ticker_missing_ticker():
+    assert parse_ticker({"type": "ticker", "msg": {}}) is None
 
 
 def test_kalshi_title_appends_yes_sub_title():

@@ -14,7 +14,9 @@ Kalshi conventions:
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import logging
 import time
 import uuid
 from typing import Any, AsyncIterator
@@ -28,6 +30,7 @@ from bot.venues.base import OrderNotPermitted, RawMarket
 from bot.venues.ratelimit import AsyncRateLimiter
 
 VENUE = "kalshi"
+log = logging.getLogger("bot.venues.kalshi")
 
 # ---------------------------------------------------------------------------
 # Request signing (optional). Kalshi authenticates API-key requests with an
@@ -130,6 +133,32 @@ def is_multivariate(ticker: str) -> bool:
     of legs, so they are neither arbitrageable binaries nor useful for matching.
     """
     return ticker.upper().startswith("KXMVE")
+
+
+def parse_ticker(message: dict[str, Any]) -> MarketQuote | None:
+    """Normalize a Kalshi WS ``ticker`` message into a top-of-book quote.
+
+    ``msg`` carries ``market_ticker`` and ``yes_bid_dollars`` / ``yes_ask_dollars``.
+    ``yes_ask`` is the cost to buy YES; the NO ask is ``1 - yes_bid``. The ticker
+    channel has no depth, so sizes are 0 (depth comes from orderbook_delta or a REST
+    fetch on shortlisted markets).
+    """
+    m = message.get("msg", message)
+    ticker = m.get("market_ticker")
+    if not ticker:
+        return None
+
+    def _px(v: Any) -> float | None:
+        return float(v) if v not in (None, "") else None
+
+    yes_ask = _px(m.get("yes_ask_dollars"))
+    yes_bid = _px(m.get("yes_bid_dollars"))
+    return MarketQuote(
+        venue=VENUE, market_id=ticker, title="",
+        yes_ask=yes_ask, yes_ask_size=0.0,
+        no_ask=round(1.0 - yes_bid, 4) if yes_bid is not None else None,
+        no_ask_size=0.0, timestamp=time.time(),
+    )
 
 
 def _cents_to_price(cents: Any) -> float | None:
@@ -260,10 +289,51 @@ class KalshiVenue:
             if m.get("ticker") and not is_multivariate(m["ticker"])
         ]
 
+    def _ws_auth_headers(self) -> dict[str, str]:
+        """Auth headers for the WS handshake (signs GET + the WS path)."""
+        if not self.authenticated:
+            raise OrderNotPermitted("Kalshi credentials required for the WebSocket")
+        if self._private_key is None:
+            self._private_key = load_private_key(self.cfg.private_key_path)
+        ws_path = urlsplit(self.cfg.ws_base).path or "/trade-api/ws/v2"
+        return build_signature_headers(self.cfg.api_key_id, self._private_key, "GET", ws_path)
+
     async def stream_order_book(self, market_ids: list[str]) -> AsyncIterator[MarketQuote]:
-        # WebSocket streaming lands with the latency hot path; not exercised yet.
-        raise NotImplementedError("Kalshi WS streaming is implemented in the live phase")
-        yield  # pragma: no cover - makes this an async generator
+        """Stream real-time top-of-book quotes via the ``ticker`` channel.
+
+        Reconnects with exponential backoff. Yields a normalized MarketQuote per
+        ticker update. ``market_ids`` filters to specific tickers (omit for all).
+        """
+        import json
+
+        import websockets  # lazy
+
+        backoff = 1.0
+        while True:
+            try:
+                headers = self._ws_auth_headers()
+                async with websockets.connect(
+                    self.cfg.ws_base, additional_headers=headers, open_timeout=10
+                ) as ws:
+                    params: dict[str, Any] = {"channels": ["ticker"]}
+                    if market_ids:
+                        params["market_tickers"] = market_ids
+                    await ws.send(json.dumps({"id": 1, "cmd": "subscribe", "params": params}))
+                    backoff = 1.0  # reset on a healthy connection
+                    async for raw in ws:
+                        data = json.loads(raw)
+                        if data.get("type") == "ticker":
+                            quote = parse_ticker(data)
+                            if quote is not None:
+                                yield quote
+                        elif data.get("type") == "error":
+                            log.warning("kalshi ws error: %s", data.get("msg"))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("kalshi ws disconnected (%s); reconnecting in %.0fs", exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
 
     async def place_order(
         self, market_id: str, side: Side, action: str, price: float, contracts: float,
