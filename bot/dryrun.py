@@ -28,7 +28,7 @@ from bot.data.store import Store
 from bot.engine import Engine, ScanResult
 from bot.execution.risk import RiskManager
 from bot.fees import FeeModel, ZeroFeeModel
-from bot.matching.embed import candidate_pairs
+from bot.matching.embed import candidate_pairs, semantic_candidate_pairs
 from bot.matching.llm_match import MatchVerdict, confirm_match
 from bot.models import MarketQuote
 from bot.modes import RunMode
@@ -96,6 +96,7 @@ async def run_cycle(
     match_threshold: float,
     complete_fn,
     limit: int,
+    embed_fn=None,
 ) -> CycleResult:
     result = CycleResult()
 
@@ -133,14 +134,16 @@ async def run_cycle(
                 deep_needed.add((vname, q.market_id))
 
     # Cross candidates: lexical similarity -> price edge -> LLM confirmation.
+    def shortlist(ga, gb):
+        if embed_fn is not None:
+            return semantic_candidate_pairs(ga, gb, embed_fn, threshold=match_threshold)
+        return candidate_pairs(ga, gb, threshold=match_threshold)
+
     confirmed_lite: list[tuple[MarketQuote, MarketQuote]] = []
     names = list(quotes_by_venue)
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
-            for c in candidate_pairs(
-                quotes_by_venue[names[i]], quotes_by_venue[names[j]],
-                threshold=match_threshold,
-            ):
+            for c in shortlist(quotes_by_venue[names[i]], quotes_by_venue[names[j]]):
                 edge = cross_price_edge(
                     c.a, c.b, fee_models.get(c.a.venue), fee_models.get(c.b.venue)
                 )
@@ -225,6 +228,7 @@ async def run(
     interval: float = 15.0,
     limit: int = 50,
     use_llm: bool = False,
+    use_embed: bool = False,
     match_threshold: float = 0.5,
     min_edge: float | None = None,
     store: Store | None = None,
@@ -245,13 +249,19 @@ async def run(
 
         complete_fn = make_complete_fn(settings.llm)
 
+    embed_fn = None
+    if use_embed:
+        from bot.matching.embed_client import make_embed_fn
+
+        embed_fn = make_embed_fn(settings.llm)
+
     last: CycleResult | None = None
     try:
         while True:
             last = await run_cycle(
                 venues, store=store, risk=risk, fee_models=fee_models,
                 min_edge=min_edge, match_threshold=match_threshold,
-                complete_fn=complete_fn, limit=limit,
+                complete_fn=complete_fn, limit=limit, embed_fn=embed_fn,
             )
             log.info("cycle: %s", last.summary())
             if once:
@@ -285,10 +295,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--once", action="store_true", help="run a single cycle and exit")
     p.add_argument("--interval", type=float, default=15.0, help="seconds between cycles")
     p.add_argument("--limit", type=int, default=50, help="markets to pull per venue")
-    p.add_argument("--match-threshold", type=float, default=0.5,
-                   help="lexical similarity to shortlist a cross-venue pair")
+    p.add_argument("--match-threshold", type=float, default=None,
+                   help="title-match cutoff to shortlist a cross-venue pair "
+                        "(default 0.5 lexical, 0.80 with --embed)")
     p.add_argument("--llm", action="store_true",
                    help="confirm cross-venue matches with the local LLM (default off)")
+    p.add_argument("--embed", action="store_true",
+                   help="match titles semantically via the local embedding model "
+                        "(recommended; far better than lexical for reworded events)")
     p.add_argument("--min-edge", type=float, default=None,
                    help="min per-contract edge to record (default from settings)")
     args = p.parse_args(argv)
@@ -298,9 +312,14 @@ def main(argv: list[str] | None = None) -> None:
     if args.check_llm:
         raise SystemExit(check_llm(load_settings()))
 
+    threshold = args.match_threshold
+    if threshold is None:
+        threshold = 0.80 if args.embed else 0.5
+
     asyncio.run(run(
         once=args.once, interval=args.interval, limit=args.limit,
-        use_llm=args.llm, match_threshold=args.match_threshold, min_edge=args.min_edge,
+        use_llm=args.llm, use_embed=args.embed, match_threshold=threshold,
+        min_edge=args.min_edge,
     ))
 
 

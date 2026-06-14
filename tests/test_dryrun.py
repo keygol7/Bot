@@ -39,12 +39,29 @@ def generous_risk():
     return RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
 
 
-def run_cycle_kw(venues, complete_fn=None, store=None, min_edge=0.01, threshold=0.3):
+def run_cycle_kw(venues, complete_fn=None, store=None, min_edge=0.01, threshold=0.3, embed_fn=None):
     return asyncio.run(run_cycle(
         venues, store=store, risk=generous_risk(),
         fee_models={v.name: ZeroFeeModel() for v in venues},
-        min_edge=min_edge, match_threshold=threshold, complete_fn=complete_fn, limit=50,
+        min_edge=min_edge, match_threshold=threshold, complete_fn=complete_fn,
+        limit=50, embed_fn=embed_fn,
     ))
+
+
+def test_embedding_matcher_pairs_reworded_titles():
+    # Lexically dissimilar titles, but the embedder maps them to the same vector.
+    ka = mq("kalshi", "K1", "Fed lowers its benchmark rate by March", yes_ask=0.40, yes_ask_size=100, no_ask=0.65, no_ask_size=100)
+    pa = mq("polymarket_us", "P1", "March FOMC rate cut", yes_ask=0.62, yes_ask_size=100, no_ask=0.55, no_ask_size=60)
+    vecs = {ka.title: [1.0, 0.0], pa.title: [1.0, 0.0]}
+    embed_fn = lambda texts: [vecs[t] for t in texts]
+    fake = lambda p: '{"same_event": true, "confidence": 0.95}'
+
+    result = run_cycle_kw(
+        [StubVenue("kalshi", {"K1": ka}), StubVenue("polymarket_us", {"P1": pa})],
+        complete_fn=fake, embed_fn=embed_fn, threshold=0.8,
+    )
+    assert result.candidate_pairs >= 1
+    assert len(result.cross.actionable) >= 1
 
 
 def test_bundle_arb_detected_via_two_phase():

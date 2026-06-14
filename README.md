@@ -68,10 +68,16 @@ risk pipeline on real prices, and persists every opportunity to SQLite — placi
 **no orders**.
 
 ```bash
-python -m bot.dryrun --once --limit 25     # one cycle, smoke test
-python -m bot.dryrun --interval 15         # continuous soak (Ctrl-C to stop)
-python -m bot.dryrun --interval 15 --llm   # also confirm cross-venue matches via local LLM
+python -m bot.dryrun --once --limit 500              # one cycle, smoke test
+python -m bot.dryrun --interval 30 --limit 1000      # continuous soak (Ctrl-C to stop)
+python -m bot.dryrun --interval 30 --limit 1000 --embed --llm   # full: semantic match + LLM confirm
 ```
+
+**Matching:** by default cross-venue pairs are shortlisted by lexical title overlap,
+which misses the *same* event worded differently across venues. Add **`--embed`** to
+match **semantically** via the local embedding model (`nomic-embed-text`) — strongly
+recommended. `--llm` then confirms each shortlisted pair resolves identically.
+Kalshi multivariate/parlay markets (`KXMVE…`) are filtered out automatically.
 
 > Running the bot on an Ubuntu VM with the LLM on a separate Windows PC? See
 > **[NETWORK_SETUP.md](NETWORK_SETUP.md)** for the full LAN runbook. Verify the link

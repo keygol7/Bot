@@ -1,7 +1,14 @@
 """Tests for the pure venue normalization functions (no network, no SDKs)."""
 
-from bot.venues.kalshi import normalize_orderbook, normalize_summary
+from bot.venues.kalshi import is_multivariate, normalize_orderbook, normalize_summary
 from bot.venues.polymarket_us import normalize_bbo
+
+
+def test_kalshi_multivariate_detection():
+    assert is_multivariate("KXMVESPORTSMULTIGAMEEXTENDED-S2026E41-DAE")
+    assert is_multivariate("KXMVECROSSCATEGORY-S2026B05-2A9")
+    assert not is_multivariate("KXNBA-25DEC-LAL")   # ordinary single-event market
+    assert not is_multivariate("FED-MAR26")
 
 
 def test_kalshi_summary_price_only():

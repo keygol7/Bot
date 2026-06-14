@@ -120,6 +120,15 @@ def normalize_orderbook(
     )
 
 
+def is_multivariate(ticker: str) -> bool:
+    """True for Kalshi multivariate / parlay markets (ticker prefix ``KXMVE``).
+
+    These combine many legs into one contract; their title is a comma-joined list
+    of legs, so they are neither arbitrageable binaries nor useful for matching.
+    """
+    return ticker.upper().startswith("KXMVE")
+
+
 def _cents_to_price(cents: Any) -> float | None:
     """Convert a Kalshi cents price (1..99) to dollars; 0/None -> None (no quote)."""
     if cents in (None, "", 0, 0.0):
@@ -221,7 +230,12 @@ class KalshiVenue:
         )
         resp.raise_for_status()
         markets = resp.json().get("markets", [])
-        return [normalize_summary(m) for m in markets if m.get("ticker")]
+        # Drop multivariate/parlay markets — not arbitrageable, junk titles.
+        return [
+            normalize_summary(m)
+            for m in markets
+            if m.get("ticker") and not is_multivariate(m["ticker"])
+        ]
 
     async def stream_order_book(self, market_ids: list[str]) -> AsyncIterator[MarketQuote]:
         # WebSocket streaming lands with the latency hot path; not exercised yet.

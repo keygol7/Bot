@@ -11,10 +11,14 @@ by the LLM resolution check before any trade.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
+from typing import Callable
 
 from bot.models import MarketQuote
+
+EmbedFn = Callable[[list[str]], list[list[float]]]
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _STOPWORDS = {
@@ -59,6 +63,45 @@ def candidate_pairs(
             if qa.venue == qb.venue:
                 continue
             score = lexical_similarity(qa.title, qb.title)
+            if score >= threshold:
+                out.append(Candidate(a=qa, b=qb, score=score))
+    out.sort(key=lambda c: c.score, reverse=True)
+    return out
+
+
+def cosine(u: list[float], v: list[float]) -> float:
+    """Cosine similarity of two vectors, in [-1, 1] (0 if either is zero-length)."""
+    dot = sum(a * b for a, b in zip(u, v))
+    nu = math.sqrt(sum(a * a for a in u))
+    nv = math.sqrt(sum(b * b for b in v))
+    if nu == 0 or nv == 0:
+        return 0.0
+    return dot / (nu * nv)
+
+
+def semantic_candidate_pairs(
+    group_a: list[MarketQuote],
+    group_b: list[MarketQuote],
+    embed_fn: EmbedFn,
+    *,
+    threshold: float = 0.8,
+) -> list[Candidate]:
+    """Shortlist cross-venue pairs by embedding **cosine** similarity.
+
+    Far better than lexical overlap at matching the same event worded differently
+    across venues. ``embed_fn`` maps a list of titles to vectors (one batch each
+    side). Returns candidates at/above ``threshold``, highest similarity first.
+    """
+    if not group_a or not group_b:
+        return []
+    vecs_a = embed_fn([q.title for q in group_a])
+    vecs_b = embed_fn([q.title for q in group_b])
+    out: list[Candidate] = []
+    for qa, va in zip(group_a, vecs_a):
+        for qb, vb in zip(group_b, vecs_b):
+            if qa.venue == qb.venue:
+                continue
+            score = cosine(va, vb)
             if score >= threshold:
                 out.append(Candidate(a=qa, b=qb, score=score))
     out.sort(key=lambda c: c.score, reverse=True)
