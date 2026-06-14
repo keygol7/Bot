@@ -1,7 +1,7 @@
 """Tests for the pure venue normalization functions (no network, no SDKs)."""
 
 from bot.venues.kalshi import normalize_orderbook
-from bot.venues.polymarket_us import build_quote, normalize_clob_book
+from bot.venues.polymarket_us import normalize_bbo
 
 
 def test_kalshi_orderbook_normalization():
@@ -22,33 +22,31 @@ def test_kalshi_orderbook_one_sided():
     assert quote.no_ask == 0.58 and quote.no_ask_size == 10
 
 
-def test_clob_book_best_levels():
-    book = {
-        "bids": [{"price": "0.44", "size": "30"}, {"price": "0.43", "size": "10"}],
-        "asks": [{"price": "0.47", "size": "5"}, {"price": "0.46", "size": "50"}],
+def test_polymarket_bbo_normalization():
+    # Polymarket US BBO: bestAsk = YES ask; NO ask = 1 - bestBid. v1Amount objects.
+    md = {
+        "marketSlug": "fed-cuts-march-2026",
+        "bestAsk": {"value": "0.62", "currency": "USD"},
+        "bestBid": {"value": "0.60", "currency": "USD"},
+        "askDepth": 40,
+        "bidDepth": 75,
     }
-    best_bid, best_ask = normalize_clob_book(book)
-    assert best_bid.price == 0.44 and best_bid.size == 30
-    assert best_ask.price == 0.46 and best_ask.size == 50
+    quote = normalize_bbo("fed-cuts-march-2026", "Fed cuts March 2026", md, event_key="E2")
+    assert quote.venue == "polymarket_us" and quote.event_key == "E2"
+    assert quote.yes_ask == 0.62 and quote.yes_ask_size == 40
+    assert round(quote.no_ask, 6) == 0.40 and quote.no_ask_size == 75  # 1 - 0.60
 
 
-def test_clob_skips_zero_size():
-    book = {"bids": [], "asks": [{"price": "0.46", "size": "0"}, {"price": "0.48", "size": "7"}]}
-    _, best_ask = normalize_clob_book(book)
-    assert best_ask.price == 0.48
+def test_polymarket_bbo_handles_missing_sides():
+    md = {"marketSlug": "x", "bestAsk": None, "bestBid": {"value": "0.30"}, "askDepth": 0, "bidDepth": 12}
+    quote = normalize_bbo("x", "x", md)
+    assert quote.yes_ask is None              # no ask -> can't buy YES
+    assert round(quote.no_ask, 6) == 0.70 and quote.no_ask_size == 12
 
 
-def test_build_quote_with_both_token_books():
-    yes_book = {"bids": [{"price": "0.44", "size": "30"}], "asks": [{"price": "0.46", "size": "50"}]}
-    no_book = {"bids": [{"price": "0.50", "size": "20"}], "asks": [{"price": "0.53", "size": "40"}]}
-    quote = build_quote("0xcond", "Some market", yes_book, no_book, event_key="E2")
-    assert quote.yes_ask == 0.46 and quote.yes_ask_size == 50
-    assert quote.no_ask == 0.53 and quote.no_ask_size == 40
-    assert quote.event_key == "E2"
-
-
-def test_build_quote_synthesizes_no_from_yes_bid():
-    yes_book = {"bids": [{"price": "0.44", "size": "30"}], "asks": [{"price": "0.46", "size": "50"}]}
-    quote = build_quote("0xcond", "Some market", yes_book, no_book=None)
-    assert quote.yes_ask == 0.46
-    assert round(quote.no_ask, 6) == 0.56 and quote.no_ask_size == 30  # 1 - 0.44
+def test_polymarket_bbo_accepts_bare_numbers():
+    # Some payloads may carry bare numeric prices instead of v1Amount objects.
+    md = {"bestAsk": 0.55, "bestBid": 0.53, "askDepth": 5, "bidDepth": 8}
+    quote = normalize_bbo("s", "s", md)
+    assert quote.yes_ask == 0.55
+    assert round(quote.no_ask, 6) == 0.47

@@ -1,14 +1,15 @@
-"""Polymarket US / QCEX venue adapter (read-only for this phase).
+"""Polymarket US / QCEX venue adapter.
 
-Polymarket runs a CLOB where each binary market has two outcome tokens (YES and NO),
-each with its own book. To buy YES you take the best ask on the YES token; to buy NO
-you take the best ask on the NO token. Prices are already in dollars (0..1).
+Market data comes from the PUBLIC gateway (`gateway.polymarket.us`) — no auth:
+  - ``GET /v1/markets``            list markets (each carries bestBid/bestAsk)
+  - ``GET /v1/markets/{slug}/bbo`` best bid/offer + depth for one market
 
-Auth for private endpoints uses Ed25519 request signing (``sign_request``), imported
-lazily via ``cryptography`` — read-only public reads don't need it, and the
-normalization helpers stay dependency-free for testing.
+Binary mapping (prices in dollars, 0..1): ``bestAsk`` is the cost to buy YES; the
+NO ask is ``1 - bestBid`` (buying NO == taking the YES bid). Sizes come from
+``askDepth`` / ``bidDepth``. Standard markets are ~zero-fee -> :class:`ZeroFeeModel`.
 
-Standard markets are ~zero-fee -> :class:`ZeroFeeModel`.
+Trading (later) uses the authenticated API (`api.polymarket.us`) with X-PM-* Ed25519
+headers — see :func:`build_auth_headers` / :func:`load_ed25519_key`. Read-only here.
 """
 
 from __future__ import annotations
@@ -17,101 +18,52 @@ import base64
 import time
 from typing import Any, AsyncIterator
 
-import json
-
 from bot.fees import ZeroFeeModel
-from bot.models import MarketQuote, PriceLevel, Side
+from bot.models import MarketQuote, Side
 from bot.venues.base import OrderNotPermitted, RawMarket
 from bot.venues.ratelimit import AsyncRateLimiter
 
 VENUE = "polymarket_us"
 
 
-def extract_token_ids(raw: dict[str, Any]) -> tuple[str | None, str | None]:
-    """Pull the (YES, NO) CLOB token ids out of a market payload.
-
-    Handles both shapes seen in the wild:
-      - ``tokens``: [{"token_id": "...", "outcome": "Yes"}, {...}]
-      - ``clobTokenIds``: a list or JSON-encoded string of two ids ([yes, no]).
-    Returns ``(None, None)`` if neither is present.
-    """
-    tokens = raw.get("tokens")
-    if isinstance(tokens, list) and tokens:
-        yes_id = no_id = None
-        for t in tokens:
-            outcome = str(t.get("outcome", "")).strip().lower()
-            if outcome in ("yes", "true"):
-                yes_id = t.get("token_id") or t.get("tokenId")
-            elif outcome in ("no", "false"):
-                no_id = t.get("token_id") or t.get("tokenId")
-        if yes_id or no_id:
-            return yes_id, no_id
-
-    clob = raw.get("clobTokenIds") or raw.get("clob_token_ids")
-    if isinstance(clob, str):
-        try:
-            clob = json.loads(clob)
-        except (ValueError, TypeError):
-            clob = None
-    if isinstance(clob, (list, tuple)) and len(clob) >= 2:
-        return clob[0], clob[1]
-    return None, None
+def _amount(value: Any) -> float | None:
+    """Parse a price from a v1Amount object ({value,currency}) or a bare number/str."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = value.get("value")
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def normalize_clob_book(book: dict[str, Any]) -> tuple[PriceLevel | None, PriceLevel | None]:
-    """Return ``(best_bid, best_ask)`` for one CLOB token book.
-
-    ``book`` is ``{"bids": [{"price": "0.55", "size": "100"}, ...], "asks": [...]}``.
-    Bids/asks may be unsorted; we pick the best (highest bid, lowest ask).
-    """
-    def lvl(entries: list[dict], *, highest: bool) -> PriceLevel | None:
-        parsed = [
-            PriceLevel(price=float(e["price"]), size=float(e["size"]))
-            for e in (entries or [])
-            if float(e.get("size", 0)) > 0
-        ]
-        if not parsed:
-            return None
-        return max(parsed, key=lambda p: p.price) if highest else min(parsed, key=lambda p: p.price)
-
-    bids = book.get("bids") or []
-    asks = book.get("asks") or []
-    return lvl(bids, highest=True), lvl(asks, highest=False)
-
-
-def build_quote(
-    market_id: str,
-    title: str,
-    yes_book: dict[str, Any],
-    no_book: dict[str, Any] | None = None,
-    *,
-    event_key: str | None = None,
+def normalize_bbo(
+    slug: str, title: str, market_data: dict[str, Any], *, event_key: str | None = None
 ) -> MarketQuote:
-    """Combine the YES (and optional NO) token books into one :class:`MarketQuote`.
+    """Turn a ``v1MarketDataLite`` (BBO) payload into a :class:`MarketQuote`.
 
-    If the NO book is absent, ``no_ask`` is synthesized from the YES bid
-    (``1 - best_yes_bid``) so the detector still has both sides.
+    ``bestAsk`` is the YES ask; the NO ask is synthesized as ``1 - bestBid``. Sizes
+    are taken from ``askDepth`` (YES) and ``bidDepth`` (the YES bid backing the NO).
     """
-    yes_bid, yes_ask = normalize_clob_book(yes_book)
+    best_ask = _amount(market_data.get("bestAsk"))
+    best_bid = _amount(market_data.get("bestBid"))
+    ask_depth = float(market_data.get("askDepth") or 0)
+    bid_depth = float(market_data.get("bidDepth") or 0)
 
-    no_ask_price = no_ask_size = None
-    if no_book is not None:
-        _, no_ask_lvl = normalize_clob_book(no_book)
-        if no_ask_lvl is not None:
-            no_ask_price, no_ask_size = no_ask_lvl.price, no_ask_lvl.size
-    if no_ask_price is None and yes_bid is not None:
-        no_ask_price = round(1.0 - yes_bid.price, 6)
-        no_ask_size = yes_bid.size
+    no_ask = round(1.0 - best_bid, 6) if best_bid is not None else None
 
     return MarketQuote(
         venue=VENUE,
-        market_id=market_id,
+        market_id=slug,
         title=title,
         event_key=event_key,
-        yes_ask=yes_ask.price if yes_ask else None,
-        yes_ask_size=yes_ask.size if yes_ask else 0.0,
-        no_ask=no_ask_price,
-        no_ask_size=no_ask_size or 0.0,
+        yes_ask=best_ask,
+        yes_ask_size=ask_depth,
+        no_ask=no_ask,
+        no_ask_size=bid_depth,
     )
 
 
@@ -155,7 +107,7 @@ def build_auth_headers(
 
 
 class PolymarketUSVenue:
-    """Read-only QCEX / Polymarket US client. ``cfg`` is a ``QcexConfig``."""
+    """Polymarket US client. Reads via the public gateway; trading needs creds."""
 
     name = VENUE
 
@@ -191,41 +143,37 @@ class PolymarketUSVenue:
             )
         return build_auth_headers(self.cfg.api_key_id, self._key, method, path)
 
-    async def _fetch_book(self, token_id: str) -> dict[str, Any]:
-        # NOTE: endpoint path/params pending confirmation from the public Markets
-        # API reference (docs.polymarket.us). Reads hit the public gateway.
+    async def list_markets(self, limit: int = 200) -> list[RawMarket]:
         await self._limiter.wait()
-        resp = await self._gateway().get("/book", params={"token_id": token_id})
+        resp = await self._gateway().get(
+            "/v1/markets", params={"limit": limit, "active": "true", "closed": "false"}
+        )
         resp.raise_for_status()
-        return resp.json()
+        out: list[RawMarket] = []
+        for m in resp.json().get("markets", []):
+            slug = m.get("slug") or m.get("id")
+            if not slug:
+                continue
+            out.append(
+                RawMarket(
+                    market_id=slug,
+                    title=m.get("question") or m.get("title") or "",
+                    raw=m,
+                )
+            )
+        return out
 
     async def fetch_quote(self, market: RawMarket) -> MarketQuote | None:
-        """Fetch and combine the YES/NO token books into one quote.
-
-        Returns ``None`` if the market exposes no usable token ids.
-        """
-        yes_id, no_id = extract_token_ids(market.raw)
-        if not yes_id:
-            return None
-        yes_book = await self._fetch_book(yes_id)
-        no_book = await self._fetch_book(no_id) if no_id else None
-        return build_quote(market.market_id, market.title, yes_book, no_book)
-
-    async def list_markets(self, limit: int = 200) -> list[RawMarket]:
-        # NOTE: path/shape pending confirmation from the public Markets API reference.
+        """Fetch BBO for one market (by slug) and normalize to a quote."""
         await self._limiter.wait()
-        resp = await self._gateway().get("/markets", params={"limit": limit})
+        resp = await self._gateway().get(f"/v1/markets/{market.market_id}/bbo")
+        if resp.status_code == 404:
+            return None
         resp.raise_for_status()
-        data = resp.json()
-        markets = data.get("data", data) if isinstance(data, dict) else data
-        return [
-            RawMarket(
-                market_id=m.get("condition_id") or m.get("id") or m.get("market_id"),
-                title=m.get("question") or m.get("title", ""),
-                raw=m,
-            )
-            for m in markets
-        ]
+        market_data = resp.json().get("marketData", {})
+        if not market_data:
+            return None
+        return normalize_bbo(market.market_id, market.title, market_data)
 
     async def stream_order_book(self, market_ids: list[str]) -> AsyncIterator[MarketQuote]:
         raise NotImplementedError("QCEX WS streaming is implemented in the live phase")
