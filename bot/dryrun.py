@@ -55,6 +55,8 @@ class CycleResult:
     executions: list = field(default_factory=list)  # ExecutionReport (live mode only)
     # Confirmed same-event pairs: (venue_a, market_a, venue_b, market_b, event_key).
     confirmed_pairs: list = field(default_factory=list)
+    # (venue, market_id) seen in this cycle's scan — the currently-live market set.
+    scanned: set = field(default_factory=set)
 
     def summary(self) -> str:
         executed = sum(1 for e in self.executions if e.status.value in ("SUCCESS", "UNWOUND"))
@@ -113,6 +115,7 @@ async def run_cycle(
         quotes_by_venue[v.name] = qs
         result.markets_seen += len(qs)
         result.quotes += len(qs)
+        result.scanned.update((v.name, q.market_id) for q in qs)
         if store is not None:
             store.upsert_markets((v.name, q.market_id, q.title, None) for q in qs)
 
@@ -406,16 +409,26 @@ async def stream(
     embed_fn = make_embed_fn(settings.llm) if use_embed else None
 
     async def refresh_specs():
+        # Discovery cycle: scans markets + confirms/caches new pairs (embeddings/LLM).
         res = await run_cycle(
             venues, store=store, risk=RiskManager(settings.risk), fee_models=fee_models,
             min_edge=min_edge, match_threshold=match_threshold, complete_fn=complete_fn,
             limit=limit, embed_fn=embed_fn, max_confirms=max_confirms,
             max_resolve_gap_days=max_resolve_gap_days, executor=None,
         )
-        return [
-            ConfirmedPair(event_key=ek, venue_a=va, market_a=ma, venue_b=vb, market_b=mb)
-            for (va, ma, vb, mb, ek) in res.confirmed_pairs
-        ]
+        # Watchlist = ALL cached confirmed pairs whose BOTH markets are live right now.
+        # Durable across embedding/LLM variance — discovery only adds to the cache.
+        live = res.scanned
+        out = []
+        for (va, ma, vb, mb, ek) in store.confirmed_pairs():
+            if (va, ma) in live and (vb, mb) in live:
+                out.append(ConfirmedPair(
+                    event_key=ek or f"{va}:{ma}|{vb}:{mb}",
+                    venue_a=va, market_a=ma, venue_b=vb, market_b=mb,
+                ))
+        log.info("watchlist: %d confirmed pairs live (of %d cached)",
+                 len(out), len(store.confirmed_pairs()))
+        return out
 
     async def feed_private(v):
         try:

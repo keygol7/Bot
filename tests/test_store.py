@@ -71,6 +71,18 @@ def test_creates_parent_directory(tmp_path):
     s.close()
 
 
+def test_confirmed_pairs_returns_only_same_event():
+    s = Store(":memory:")
+    s.cache_verdict("kalshi", "K1", "polymarket_us", "P1", same_event=True, confidence=0.95, event_key="E1")
+    s.cache_verdict("kalshi", "K2", "polymarket_us", "P2", same_event=False, confidence=0.1)
+    pairs = s.confirmed_pairs()
+    assert len(pairs) == 1
+    va, ma, vb, mb, ek = pairs[0]
+    assert {(va, ma), (vb, mb)} == {("kalshi", "K1"), ("polymarket_us", "P1")}
+    assert ek == "E1"
+    s.close()
+
+
 def test_audit_log():
     s = Store(":memory:")
     s.audit("startup", {"mode": "DRY_RUN"})

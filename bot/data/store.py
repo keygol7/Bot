@@ -207,6 +207,20 @@ class Store:
         )
         self.conn.commit()
 
+    def confirmed_pairs(self) -> list[tuple]:
+        """All cached same-event pairs: (venue_a, market_a, venue_b, market_b, event_key).
+
+        This is the durable source of truth for the streaming watchlist — independent
+        of per-cycle embedding/LLM variance."""
+        rows = self.conn.execute(
+            "SELECT venue_a, market_a, venue_b, market_b, event_key "
+            "FROM match_verdicts WHERE same_event=1"
+        ).fetchall()
+        return [
+            (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], r["event_key"])
+            for r in rows
+        ]
+
     def get_verdict(self, va: str, ma: str, vb: str, mb: str) -> Optional[sqlite3.Row]:
         a, ma2, b, mb2 = self._pair_key(va, ma, vb, mb)
         return self.conn.execute(
