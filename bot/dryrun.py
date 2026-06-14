@@ -359,6 +359,74 @@ async def run(
     return last
 
 
+async def build_watchlist(cached, scanned, venues):
+    """Confirmed pairs whose BOTH legs are live now -> the streaming watchlist.
+
+    Durable across embedding/LLM variance: discovery only *adds* to the cache. A
+    confirmed pair must NOT drop off the watchlist merely because a leg falls outside
+    the discovery scan's --limit page (e.g. Kalshi returns thousands of markets and
+    the UFC tickers sit past the first 1000). For any cached leg the wide scan didn't
+    surface, do a targeted per-market liveness probe — bounded, since it only touches
+    cached markets (a handful), not the whole board.
+
+    ``cached`` is ``[(venue_a, market_a, venue_b, market_b, event_key), ...]``;
+    ``scanned`` is the set of ``(venue, market_id)`` the wide scan returned this cycle.
+    Returns ``list[ConfirmedPair]``.
+    """
+    from bot.streaming.engine import ConfirmedPair
+
+    live = set(scanned)
+    venue_by_name = {v.name: v for v in venues}
+
+    to_probe = {
+        (vn, mid)
+        for (va, ma, vb, mb, _ek) in cached
+        for (vn, mid) in ((va, ma), (vb, mb))
+        if (vn, mid) not in live
+    }
+    for (vn, mid) in to_probe:
+        v = venue_by_name.get(vn)
+        if v is None:
+            continue
+        try:
+            q = await v.fetch_quote(RawMarket(market_id=mid, title="", raw={}))
+        except Exception as exc:
+            log.info("watchlist probe %s:%s not live (%s)", vn, mid, exc)
+            continue
+        if q is not None:
+            live.add((vn, mid))
+
+    out = []
+    missing_a = missing_b = 0  # legs of cached pairs still not live after probing
+    for (va, ma, vb, mb, ek) in cached:
+        a_live = (va, ma) in live
+        b_live = (vb, mb) in live
+        if a_live and b_live:
+            out.append(ConfirmedPair(
+                event_key=ek or f"{va}:{ma}|{vb}:{mb}",
+                venue_a=va, market_a=ma, venue_b=vb, market_b=mb,
+            ))
+        else:
+            if not a_live:
+                missing_a += 1
+            if not b_live:
+                missing_b += 1
+    log.info("watchlist: %d confirmed pairs live (of %d cached)", len(out), len(cached))
+    if cached and not out:
+        # Both probe and scan failed for every pair — show one concrete cached leg
+        # per venue with its live flag so a closed/renamed market is obvious.
+        log.warning("watchlist EMPTY after probing %d legs: side-A missing=%d "
+                    "side-B missing=%d", len(to_probe), missing_a, missing_b)
+        seen: set[str] = set()
+        for (va, ma, vb, mb, _ek) in cached:
+            for (vn, mid) in ((va, ma), (vb, mb)):
+                if vn not in seen:
+                    seen.add(vn)
+                    log.warning("  cached %s market %r live=%s",
+                                vn, mid, (vn, mid) in live)
+    return out
+
+
 async def stream(
     *,
     settings: Settings | None = None,
@@ -377,7 +445,7 @@ async def stream(
     from bot.execution.executor import Executor
     from bot.matching.embed_client import make_embed_fn
     from bot.matching.llm_client import make_complete_fn
-    from bot.streaming.engine import ConfirmedPair, StreamingEngine
+    from bot.streaming.engine import StreamingEngine
     from bot.streaming.fills import FillTracker
 
     settings = settings or load_settings()
@@ -416,49 +484,7 @@ async def stream(
             limit=limit, embed_fn=embed_fn, max_confirms=max_confirms,
             max_resolve_gap_days=max_resolve_gap_days, executor=None,
         )
-        # Watchlist = ALL cached confirmed pairs whose BOTH markets are live right now.
-        # Durable across embedding/LLM variance — discovery only adds to the cache.
-        live = res.scanned
-        cached = store.confirmed_pairs()
-        out = []
-        missing_a = missing_b = 0  # legs of cached pairs not present in this scan
-        for (va, ma, vb, mb, ek) in cached:
-            a_live = (va, ma) in live
-            b_live = (vb, mb) in live
-            if a_live and b_live:
-                out.append(ConfirmedPair(
-                    event_key=ek or f"{va}:{ma}|{vb}:{mb}",
-                    venue_a=va, market_a=ma, venue_b=vb, market_b=mb,
-                ))
-            else:
-                if not a_live:
-                    missing_a += 1
-                if not b_live:
-                    missing_b += 1
-        log.info("watchlist: %d confirmed pairs live (of %d cached)", len(out), len(cached))
-        if cached and not out:
-            # Diagnose which side dropped out of the scan: per-venue live counts plus
-            # how many cached legs each venue failed to return this cycle.
-            per_venue: dict[str, int] = {}
-            for (vn, _mid) in live:
-                per_venue[vn] = per_venue.get(vn, 0) + 1
-            log.warning(
-                "watchlist EMPTY: scanned %s; cached-pair legs missing from scan: "
-                "side-A=%d side-B=%d. If a venue's count is 0 or its markets rotated "
-                "out, raise --limit or check that venue's base URL (e.g. Kalshi "
-                "demo vs prod must match how the pairs were cached).",
-                per_venue or "{}", missing_a, missing_b,
-            )
-            # Show one concrete cached leg per venue and whether it's live, so the
-            # ticker format / prod-vs-demo mismatch is obvious in the log.
-            seen: set[str] = set()
-            for (va, ma, vb, mb, _ek) in cached:
-                for (vn, mid) in ((va, ma), (vb, mb)):
-                    if vn not in seen:
-                        seen.add(vn)
-                        log.warning("  cached %s market %r live=%s",
-                                    vn, mid, (vn, mid) in live)
-        return out
+        return await build_watchlist(store.confirmed_pairs(), res.scanned, venues)
 
     async def feed_private(v):
         try:

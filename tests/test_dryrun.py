@@ -249,6 +249,54 @@ def test_scanned_set_holds_every_live_market():
     assert result.scanned == {("kalshi", "K1"), ("polymarket_us", "P1")}
 
 
+def test_build_watchlist_keeps_pair_when_both_legs_scanned():
+    from bot.dryrun import build_watchlist
+
+    cached = [("kalshi", "K1", "polymarket_us", "P1", "ufc")]
+    scanned = {("kalshi", "K1"), ("polymarket_us", "P1")}
+    venues = [StubVenue("kalshi", {}), StubVenue("polymarket_us", {})]
+    out = asyncio.run(build_watchlist(cached, scanned, venues))
+    assert len(out) == 1 and out[0].event_key == "ufc"
+
+
+def test_build_watchlist_probes_leg_outside_scan_window():
+    # The exact live bug: the Kalshi leg sits past the discovery --limit, so it's
+    # absent from ``scanned``. A targeted fetch_quote must rescue it onto the watchlist.
+    from bot.dryrun import build_watchlist
+
+    ka = mq("kalshi", "K1", "UFC fight", yes_ask=0.4, yes_ask_size=10, no_ask=0.6, no_ask_size=10)
+    cached = [("kalshi", "K1", "polymarket_us", "P1", "ufc")]
+    scanned = {("polymarket_us", "P1")}                 # Kalshi leg NOT in scan
+    venues = [StubVenue("kalshi", {"K1": ka}), StubVenue("polymarket_us", {})]
+    out = asyncio.run(build_watchlist(cached, scanned, venues))
+    assert len(out) == 1                                # probe rescued the missing leg
+
+
+def test_build_watchlist_drops_pair_when_probe_finds_nothing():
+    # Leg absent from scan AND the probe returns no quote (closed/renamed) -> dropped.
+    from bot.dryrun import build_watchlist
+
+    cached = [("kalshi", "K1", "polymarket_us", "P1", "ufc")]
+    scanned = {("polymarket_us", "P1")}
+    venues = [StubVenue("kalshi", {}), StubVenue("polymarket_us", {})]  # K1 not fetchable
+    out = asyncio.run(build_watchlist(cached, scanned, venues))
+    assert out == []
+
+
+def test_build_watchlist_survives_probe_error():
+    from bot.dryrun import build_watchlist
+
+    class FetchExplodes(StubVenue):
+        async def fetch_quote(self, market):
+            raise RuntimeError("404 not found")
+
+    cached = [("kalshi", "K1", "polymarket_us", "P1", "ufc")]
+    scanned = {("polymarket_us", "P1")}
+    venues = [FetchExplodes("kalshi", {}), StubVenue("polymarket_us", {})]
+    out = asyncio.run(build_watchlist(cached, scanned, venues))
+    assert out == []                                    # error treated as not-live, no crash
+
+
 def test_check_ws_probe_collects_quotes():
     from bot.dryrun import _probe_stream
 
