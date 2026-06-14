@@ -1,0 +1,26 @@
+[Unit]
+Description=Prediction-market arbitrage bot (read-only DRY_RUN soak)
+After=network-online.target
+Wants=network-online.target
+# Don't restart-loop forever if it's crashing hard.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Edit User and the paths below if your username/clone location differ.
+User=keyahn
+WorkingDirectory=/home/keyahn/Bot
+# READ-ONLY monitor — places NO orders. Reads .env from WorkingDirectory.
+# NOTE: do NOT add --live or --stream here for a "demo" run: Polymarket US has no
+# sandbox, so those flags place REAL Polymarket orders even with Kalshi on demo.
+ExecStart=/home/keyahn/Bot/.venv/bin/python -m bot.dryrun --interval 300 --limit 1000 --embed --llm
+Restart=always
+RestartSec=10
+# Send stdout/stderr to journald (view with: journalctl -u arbbot -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arbbot
+
+[Install]
+WantedBy=multi-user.target
