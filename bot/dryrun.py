@@ -147,8 +147,11 @@ async def run_cycle(
                 edge = cross_price_edge(
                     c.a, c.b, fee_models.get(c.a.venue), fee_models.get(c.b.venue)
                 )
-                if edge <= min_edge:
-                    continue  # no price edge -> don't spend an LLM call on it
+                # Skip only when both legs are priced in the scan AND show no edge.
+                # If a leg has no list price (edge == -inf), let it through — the real
+                # price/edge is resolved from the depth fetch after confirmation.
+                if edge != float("-inf") and edge <= min_edge:
+                    continue
                 result.candidate_pairs += 1
                 verdict = await _verdict_for(c.a, c.b, store, complete_fn)
                 if verdict is not None and verdict.tradeable():

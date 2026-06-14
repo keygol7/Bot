@@ -198,7 +198,7 @@ class KalshiVenue:
         await self._limiter.wait()
         resp = await self._http().get(
             "/markets",
-            params={"limit": limit, "status": "open"},
+            params={"limit": limit, "status": "open", "mve_filter": "exclude"},
             headers=self._auth_headers("GET", "/markets"),
         )
         resp.raise_for_status()
@@ -225,7 +225,9 @@ class KalshiVenue:
         await self._limiter.wait()
         resp = await self._http().get(
             "/markets",
-            params={"limit": limit, "status": "open"},
+            # mve_filter=exclude drops multivariate/parlay markets server-side, which
+            # otherwise dominate the open feed. The client-side filter below is a backstop.
+            params={"limit": limit, "status": "open", "mve_filter": "exclude"},
             headers=self._auth_headers("GET", "/markets"),
         )
         resp.raise_for_status()

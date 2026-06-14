@@ -1,7 +1,28 @@
 """Tests for the pure venue normalization functions (no network, no SDKs)."""
 
 from bot.venues.kalshi import is_multivariate, normalize_orderbook, normalize_summary
-from bot.venues.polymarket_us import normalize_bbo
+from bot.venues.polymarket_us import build_market_title, normalize_bbo
+
+
+def test_polymarket_title_appends_outcome():
+    m = {
+        "question": "World Series Champion",
+        "marketSides": [
+            {"long": True, "team": {"name": "New York Yankees"}},
+            {"long": False, "team": {"name": "Los Angeles Dodgers"}},
+        ],
+    }
+    assert build_market_title(m) == "World Series Champion - New York Yankees"
+
+
+def test_polymarket_title_no_dup_when_outcome_in_question():
+    m = {"question": "Will the Chargers win?", "marketSides": [{"long": True, "description": "Chargers"}]}
+    # 'chargers' already in the question -> not appended again
+    assert build_market_title(m) == "Will the Chargers win?"
+
+
+def test_polymarket_title_falls_back_to_question():
+    assert build_market_title({"question": "Plain question"}) == "Plain question"
 
 
 def test_kalshi_multivariate_detection():

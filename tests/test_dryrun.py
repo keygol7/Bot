@@ -127,6 +127,29 @@ def test_no_price_edge_pair_does_not_reach_llm():
     assert called == []                                         # LLM never invoked
 
 
+def test_cross_pair_without_list_prices_still_confirmed():
+    # Polymarket leg has no list price (yes_ask/no_ask None) — the cheap price gate
+    # must NOT drop it; price/edge is resolved from the phase-2 fetch.
+    ka_scan = mq("kalshi", "K1", "Fed cut March", yes_ask=0.40, yes_ask_size=0, no_ask=0.65, no_ask_size=0)
+    pa_scan = mq("polymarket_us", "P1", "Fed cut March", yes_ask=None, no_ask=None)  # no list price
+    # Sized (phase-2) quotes carry the real prices/sizes.
+    ka = mq("kalshi", "K1", "Fed cut March", yes_ask=0.40, yes_ask_size=100, no_ask=0.65, no_ask_size=100)
+    pa = mq("polymarket_us", "P1", "Fed cut March", yes_ask=0.62, yes_ask_size=100, no_ask=0.55, no_ask_size=60)
+
+    class TwoPhaseStub(StubVenue):
+        def __init__(self, name, scan_q, deep_q):
+            super().__init__(name, {deep_q.market_id: deep_q})
+            self._scan = scan_q
+        async def scan_quotes(self, limit=500):
+            return [self._scan]
+
+    venues = [TwoPhaseStub("kalshi", ka_scan, ka), TwoPhaseStub("polymarket_us", pa_scan, pa)]
+    fake = lambda p: '{"same_event": true, "confidence": 0.95}'
+    result = run_cycle_kw(venues, complete_fn=fake)
+    assert result.candidate_pairs >= 1            # reached the LLM despite missing list price
+    assert len(result.cross.actionable) >= 1      # priced + detected from phase-2 fetch
+
+
 def test_scan_failure_isolated_per_venue():
     class DeadVenue(StubVenue):
         async def scan_quotes(self, limit=500):

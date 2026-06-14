@@ -67,6 +67,29 @@ def normalize_bbo(
     )
 
 
+def _long_side_outcome(m: dict[str, Any]) -> str | None:
+    """The YES (``long``) side's outcome label for a Polymarket US market.
+
+    Each market is binary; ``marketSides`` carries the two outcomes. We surface the
+    long side's team name (or its description) to disambiguate otherwise-identical
+    questions (e.g. many "World Series Champion" markets, one per team).
+    """
+    for side in m.get("marketSides") or []:
+        if side.get("long"):
+            team = side.get("team") or {}
+            return team.get("name") or side.get("description")
+    return None
+
+
+def build_market_title(m: dict[str, Any]) -> str:
+    """Descriptive, outcome-disambiguated title for matching."""
+    question = m.get("question") or m.get("title") or ""
+    outcome = _long_side_outcome(m)
+    if outcome and outcome.lower() not in question.lower():
+        return f"{question} - {outcome}"
+    return question
+
+
 def load_ed25519_key(secret_key: str = "", pem_path: str = ""):
     """Load the Ed25519 signing key from a raw base64 secret (preferred) or a PEM.
 
@@ -154,13 +177,7 @@ class PolymarketUSVenue:
             slug = m.get("slug") or m.get("id")
             if not slug:
                 continue
-            out.append(
-                RawMarket(
-                    market_id=slug,
-                    title=m.get("question") or m.get("title") or "",
-                    raw=m,
-                )
-            )
+            out.append(RawMarket(market_id=slug, title=build_market_title(m), raw=m))
         return out
 
     async def scan_quotes(self, limit: int = 500) -> list[MarketQuote]:
@@ -185,7 +202,7 @@ class PolymarketUSVenue:
                 MarketQuote(
                     venue=VENUE,
                     market_id=slug,
-                    title=m.get("question") or m.get("title") or "",
+                    title=build_market_title(m),
                     yes_ask=best_ask,
                     yes_ask_size=0.0,
                     no_ask=round(1.0 - best_bid, 6) if best_bid is not None else None,
