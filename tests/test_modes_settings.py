@@ -39,3 +39,18 @@ def test_load_settings_reads_env(tmp_path, monkeypatch):
     settings = load_settings(dotenv_path=str(tmp_path / "nonexistent.env"))
     assert settings.run_mode is RunMode.LIVE_SMALL
     assert settings.risk.max_daily_loss == 250.0
+
+
+def test_dotenv_strips_inline_comments(tmp_path, monkeypatch):
+    for k in ("RISK_MAX_POSITION_PER_MARKET", "RISK_MIN_EDGE", "QCEX_API_BASE", "BOT_RUN_MODE"):
+        monkeypatch.delenv(k, raising=False)
+    env = tmp_path / ".env"
+    env.write_text(
+        "RISK_MAX_POSITION_PER_MARKET=50     # $ notional per market\n"
+        "RISK_MIN_EDGE=0.02  # min edge\n"
+        'QCEX_API_BASE="https://api.polymarket.us"  # quoted value\n'
+    )
+    settings = load_settings(dotenv_path=str(env))
+    assert settings.risk.max_position_per_market == 50.0   # comment stripped, parses
+    assert settings.risk.min_edge == 0.02
+    assert settings.qcex.api_base == "https://api.polymarket.us"

@@ -25,13 +25,25 @@ def _load_dotenv(path: str = ".env") -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip().strip('"').strip("'")
+        key = key.strip()
+        value = value.strip()
+        if value[:1] in ('"', "'"):
+            # Quoted: take content up to the matching quote, ignore any trailing comment.
+            quote = value[0]
+            end = value.find(quote, 1)
+            value = value[1:end] if end != -1 else value[1:]
+        else:
+            # Unquoted: strip an inline comment (" #...").
+            value = value.split(" #", 1)[0].rstrip()
         os.environ.setdefault(key, value)
 
 
 def _env_float(key: str, default: float) -> float:
     raw = os.environ.get(key)
-    return float(raw) if raw not in (None, "") else default
+    if raw in (None, ""):
+        return default
+    # Tolerate stray trailing text (e.g. an inline comment) on numeric values.
+    return float(str(raw).split()[0])
 
 
 @dataclass
