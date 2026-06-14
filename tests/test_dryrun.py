@@ -39,13 +39,29 @@ def generous_risk():
     return RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
 
 
-def run_cycle_kw(venues, complete_fn=None, store=None, min_edge=0.01, threshold=0.3, embed_fn=None):
+def run_cycle_kw(venues, complete_fn=None, store=None, min_edge=0.01, threshold=0.3,
+                 embed_fn=None, max_confirms=50):
     return asyncio.run(run_cycle(
         venues, store=store, risk=generous_risk(),
         fee_models={v.name: ZeroFeeModel() for v in venues},
         min_edge=min_edge, match_threshold=threshold, complete_fn=complete_fn,
-        limit=50, embed_fn=embed_fn,
+        limit=50, embed_fn=embed_fn, max_confirms=max_confirms,
     ))
+
+
+def test_max_confirms_caps_llm_calls_per_cycle():
+    # Many candidate pairs, all with a price edge; cap LLM confirmations at 2.
+    kalshi = {f"K{i}": mq("kalshi", f"K{i}", f"Team{i} game", yes_ask=0.40, yes_ask_size=100, no_ask=0.65, no_ask_size=100) for i in range(5)}
+    poly = {f"P{i}": mq("polymarket_us", f"P{i}", f"Team{i} game", yes_ask=0.62, yes_ask_size=100, no_ask=0.55, no_ask_size=60) for i in range(5)}
+    calls = []
+    fake = lambda p: (calls.append(1), '{"same_event": false, "confidence": 0.1}')[1]
+
+    result = run_cycle_kw(
+        [StubVenue("kalshi", kalshi), StubVenue("polymarket_us", poly)],
+        complete_fn=fake, store=Store(":memory:"), max_confirms=2,
+    )
+    assert result.llm_confirms == 2          # capped
+    assert len(calls) == 2                    # the model was called exactly twice
 
 
 def test_embedding_matcher_pairs_reworded_titles():

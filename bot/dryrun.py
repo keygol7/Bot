@@ -48,6 +48,7 @@ class CycleResult:
     markets_seen: int = 0
     quotes: int = 0
     deep_fetches: int = 0
+    llm_confirms: int = 0
     bundle_opps: list[ArbOpportunity] = field(default_factory=list)
     candidate_pairs: int = 0
     cross: ScanResult = field(default_factory=ScanResult)
@@ -55,35 +56,25 @@ class CycleResult:
     def summary(self) -> str:
         return (
             f"markets={self.markets_seen} quotes={self.quotes} "
+            f"cross_candidates={self.candidate_pairs} llm_confirms={self.llm_confirms} "
             f"deep_fetches={self.deep_fetches} bundle_arbs={len(self.bundle_opps)} "
-            f"cross_candidates={self.candidate_pairs} "
             f"cross_detected={len(self.cross.detected)} "
             f"cross_actionable={len(self.cross.actionable)}"
         )
 
 
-async def _verdict_for(
-    a: MarketQuote, b: MarketQuote, store: Store | None, complete_fn
-) -> MatchVerdict | None:
-    """Cached, else LLM-confirmed, same-event verdict. ``None`` when unconfirmable."""
-    if store is not None:
-        row = store.get_verdict(a.venue, a.market_id, b.venue, b.market_id)
-        if row is not None:
-            return MatchVerdict(
-                same_event=bool(row["same_event"]),
-                confidence=float(row["confidence"] or 0.0),
-                rationale=row["rationale"] or "",
-            )
-    if complete_fn is None:
-        return None  # no LLM -> cannot confirm -> never tradeable
-    verdict = await asyncio.to_thread(confirm_match, a, b, complete_fn)
-    if store is not None:
-        store.cache_verdict(
-            a.venue, a.market_id, b.venue, b.market_id,
-            same_event=verdict.same_event, confidence=verdict.confidence,
-            rationale=verdict.rationale,
-        )
-    return verdict
+def _cached_verdict(store: Store | None, a: MarketQuote, b: MarketQuote) -> MatchVerdict | None:
+    """Return a previously-cached verdict for this pair, or ``None``."""
+    if store is None:
+        return None
+    row = store.get_verdict(a.venue, a.market_id, b.venue, b.market_id)
+    if row is None:
+        return None
+    return MatchVerdict(
+        same_event=bool(row["same_event"]),
+        confidence=float(row["confidence"] or 0.0),
+        rationale=row["rationale"] or "",
+    )
 
 
 async def run_cycle(
@@ -97,6 +88,7 @@ async def run_cycle(
     complete_fn,
     limit: int,
     embed_fn=None,
+    max_confirms: int = 50,
 ) -> CycleResult:
     result = CycleResult()
 
@@ -153,8 +145,24 @@ async def run_cycle(
                 if edge != float("-inf") and edge <= min_edge:
                     continue
                 result.candidate_pairs += 1
-                verdict = await _verdict_for(c.a, c.b, store, complete_fn)
-                if verdict is not None and verdict.tradeable():
+
+                verdict = _cached_verdict(store, c.a, c.b)
+                if verdict is None:
+                    # Not cached: confirm with the LLM, but bound calls per cycle.
+                    # Candidates are highest-similarity first; the cache fills in the
+                    # rest over subsequent cycles, so each cycle stays bounded.
+                    if complete_fn is None or result.llm_confirms >= max_confirms:
+                        continue
+                    verdict = await asyncio.to_thread(confirm_match, c.a, c.b, complete_fn)
+                    result.llm_confirms += 1
+                    if store is not None:
+                        store.cache_verdict(
+                            c.a.venue, c.a.market_id, c.b.venue, c.b.market_id,
+                            same_event=verdict.same_event, confidence=verdict.confidence,
+                            rationale=verdict.rationale,
+                        )
+
+                if verdict.tradeable():
                     confirmed_lite.append((c.a, c.b))
                     deep_needed.add((c.a.venue, c.a.market_id))
                     deep_needed.add((c.b.venue, c.b.market_id))
@@ -234,6 +242,7 @@ async def run(
     use_embed: bool = False,
     match_threshold: float = 0.5,
     min_edge: float | None = None,
+    max_confirms: int = 50,
     store: Store | None = None,
 ) -> CycleResult | None:
     settings = settings or load_settings()
@@ -265,6 +274,7 @@ async def run(
                 venues, store=store, risk=risk, fee_models=fee_models,
                 min_edge=min_edge, match_threshold=match_threshold,
                 complete_fn=complete_fn, limit=limit, embed_fn=embed_fn,
+                max_confirms=max_confirms,
             )
             log.info("cycle: %s", last.summary())
             if once:
@@ -308,6 +318,9 @@ def main(argv: list[str] | None = None) -> None:
                         "(recommended; far better than lexical for reworded events)")
     p.add_argument("--min-edge", type=float, default=None,
                    help="min per-contract edge to record (default from settings)")
+    p.add_argument("--max-confirms", type=int, default=50,
+                   help="max NEW LLM match-confirmations per cycle (cached pairs are "
+                        "free; the rest are confirmed over later cycles)")
     args = p.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -322,7 +335,7 @@ def main(argv: list[str] | None = None) -> None:
     asyncio.run(run(
         once=args.once, interval=args.interval, limit=args.limit,
         use_llm=args.llm, use_embed=args.embed, match_threshold=threshold,
-        min_edge=args.min_edge,
+        min_edge=args.min_edge, max_confirms=args.max_confirms,
     ))
 
 
