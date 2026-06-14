@@ -59,6 +59,7 @@ class MarketQuote:
     no_ask_size: float = 0.0
     fee_rate: float = 0.0  # carried for reference; FeeModel does the real math
     timestamp: float = 0.0
+    close_time: Optional[float] = None  # epoch seconds when the market resolves/closes
 
     @property
     def label(self) -> str:

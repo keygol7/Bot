@@ -89,6 +89,7 @@ async def run_cycle(
     limit: int,
     embed_fn=None,
     max_confirms: int = 50,
+    max_resolve_gap_days: float = 3.0,
 ) -> CycleResult:
     result = CycleResult()
 
@@ -143,6 +144,14 @@ async def run_cycle(
                 # If a leg has no list price (edge == -inf), let it through — the real
                 # price/edge is resolved from the depth fetch after confirmation.
                 if edge != float("-inf") and edge <= min_edge:
+                    continue
+                # Deterministic settlement guard: markets that resolve far apart in
+                # time cannot be the same event (e.g. a single game vs a season-long
+                # championship). This catches mismatches the LLM gets wrong.
+                if (
+                    c.a.close_time is not None and c.b.close_time is not None
+                    and abs(c.a.close_time - c.b.close_time) > max_resolve_gap_days * 86400
+                ):
                     continue
                 result.candidate_pairs += 1
 
@@ -243,6 +252,7 @@ async def run(
     match_threshold: float = 0.5,
     min_edge: float | None = None,
     max_confirms: int = 50,
+    max_resolve_gap_days: float = 3.0,
     store: Store | None = None,
 ) -> CycleResult | None:
     settings = settings or load_settings()
@@ -274,7 +284,7 @@ async def run(
                 venues, store=store, risk=risk, fee_models=fee_models,
                 min_edge=min_edge, match_threshold=match_threshold,
                 complete_fn=complete_fn, limit=limit, embed_fn=embed_fn,
-                max_confirms=max_confirms,
+                max_confirms=max_confirms, max_resolve_gap_days=max_resolve_gap_days,
             )
             log.info("cycle: %s", last.summary())
             if once:
@@ -321,6 +331,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--max-confirms", type=int, default=50,
                    help="max NEW LLM match-confirmations per cycle (cached pairs are "
                         "free; the rest are confirmed over later cycles)")
+    p.add_argument("--max-resolve-gap-days", type=float, default=3.0,
+                   help="reject cross-venue pairs whose resolution dates differ by "
+                        "more than this many days (settlement-mismatch guard)")
     args = p.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -336,6 +349,7 @@ def main(argv: list[str] | None = None) -> None:
         once=args.once, interval=args.interval, limit=args.limit,
         use_llm=args.llm, use_embed=args.embed, match_threshold=threshold,
         min_edge=args.min_edge, max_confirms=args.max_confirms,
+        max_resolve_gap_days=args.max_resolve_gap_days,
     ))
 
 

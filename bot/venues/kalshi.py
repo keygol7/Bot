@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 from bot.fees import KalshiFeeModel
 from bot.models import MarketQuote, PriceLevel, Side
+from bot.timeutil import parse_iso8601
 from bot.venues.base import OrderNotPermitted, RawMarket
 from bot.venues.ratelimit import AsyncRateLimiter
 
@@ -172,6 +173,7 @@ def normalize_summary(m: dict[str, Any], *, event_key: str | None = None) -> Mar
         yes_ask_size=0.0,
         no_ask=_cents_to_price(m.get("no_ask")),
         no_ask_size=0.0,
+        close_time=parse_iso8601(m.get("close_time") or m.get("expiration_time")),
     )
 
 

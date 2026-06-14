@@ -28,19 +28,32 @@ _PROMPT_TEMPLATE = """\
 You are a careful prediction-market analyst. Two markets from different venues may
 or may not refer to the SAME real-world event with the SAME resolution criteria.
 
-Only answer "same_event": true if BOTH of these hold:
-  1. They resolve on the identical underlying outcome, AND
-  2. Their resolution criteria, cutoff dates, and sources are equivalent — so that
-     exactly one of (YES on A, NO on B) is guaranteed to pay out.
+Only answer "same_event": true if ALL of these hold:
+  1. Same underlying outcome AND the same specific subject (same exact team / player /
+     candidate — "Los Angeles Angels" is NOT "Los Angeles Dodgers").
+  2. Same EVENT TYPE and scope. A single game is NOT a season-long championship; a
+     regular-season matchup is NOT a "win the World Series" futures market; a primary
+     is NOT a general election.
+  3. Same resolution timing/date and sources, so that exactly one of (YES on A, NO on
+     B) is guaranteed to pay out.
 
-If you are unsure, answer false. A wrong "true" causes real financial loss.
+The two resolution dates below must describe the same event. If they differ
+materially, or you are unsure, answer false. A wrong "true" causes real financial loss.
 
-Market A ({venue_a}): "{title_a}"
-Market B ({venue_b}): "{title_b}"
+Market A ({venue_a}): "{title_a}"  [resolves: {date_a}]
+Market B ({venue_b}): "{title_b}"  [resolves: {date_b}]
 
 Respond with ONLY a JSON object:
 {{"same_event": <true|false>, "confidence": <0.0-1.0>, "rationale": "<one sentence>"}}
 """
+
+
+def _fmt_date(ts: float | None) -> str:
+    if ts is None:
+        return "unknown"
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
 @dataclass
@@ -64,7 +77,8 @@ def _extract_json(text: str) -> dict:
 
 def build_prompt(a: MarketQuote, b: MarketQuote) -> str:
     return _PROMPT_TEMPLATE.format(
-        venue_a=a.venue, title_a=a.title, venue_b=b.venue, title_b=b.title
+        venue_a=a.venue, title_a=a.title, date_a=_fmt_date(a.close_time),
+        venue_b=b.venue, title_b=b.title, date_b=_fmt_date(b.close_time),
     )
 
 

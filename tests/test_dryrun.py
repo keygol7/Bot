@@ -166,6 +166,42 @@ def test_cross_pair_without_list_prices_still_confirmed():
     assert len(result.cross.actionable) >= 1      # priced + detected from phase-2 fetch
 
 
+def test_resolution_date_gate_rejects_game_vs_championship():
+    # The exact false positive seen live: a single game (Jun 16) vs a World Series
+    # futures market (Sep 27). Same teams/words, but resolution dates ~100 days apart.
+    JUN = 1781725200.0  # 2026-06-16
+    SEP = 1790683200.0  # 2026-09-27 (~103 days later)
+    ka = mq("kalshi", "K1", "LA Angels vs Arizona Winner? - LA Angels",
+            yes_ask=0.40, yes_ask_size=100, no_ask=0.65, no_ask_size=100, close_time=JUN)
+    pa = mq("polymarket_us", "P1", "MLB Champion - LA Angels",
+            yes_ask=0.62, yes_ask_size=100, no_ask=0.55, no_ask_size=60, close_time=SEP)
+    called = []
+    fake = lambda p: called.append(1) or '{"same_event": true, "confidence": 0.95}'
+
+    result = run_cycle_kw(
+        [StubVenue("kalshi", {"K1": ka}), StubVenue("polymarket_us", {"P1": pa})],
+        complete_fn=fake,
+    )
+    assert result.candidate_pairs == 0     # gated out before the LLM
+    assert called == []                     # LLM never consulted for the mismatch
+    assert result.cross.detected == []
+
+
+def test_resolution_date_gate_allows_same_date():
+    SEP = 1790683200.0
+    ka = mq("kalshi", "K1", "World Series Champion - LA Dodgers",
+            yes_ask=0.40, yes_ask_size=100, no_ask=0.65, no_ask_size=100, close_time=SEP)
+    pa = mq("polymarket_us", "P1", "MLB Champion - LA Dodgers",
+            yes_ask=0.62, yes_ask_size=100, no_ask=0.55, no_ask_size=60, close_time=SEP + 3600)
+    fake = lambda p: '{"same_event": true, "confidence": 0.95}'
+    result = run_cycle_kw(
+        [StubVenue("kalshi", {"K1": ka}), StubVenue("polymarket_us", {"P1": pa})],
+        complete_fn=fake,
+    )
+    assert result.candidate_pairs >= 1
+    assert len(result.cross.actionable) >= 1
+
+
 def test_scan_failure_isolated_per_venue():
     class DeadVenue(StubVenue):
         async def scan_quotes(self, limit=500):

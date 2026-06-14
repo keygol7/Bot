@@ -20,6 +20,7 @@ from typing import Any, AsyncIterator
 
 from bot.fees import ZeroFeeModel
 from bot.models import MarketQuote, Side
+from bot.timeutil import parse_iso8601
 from bot.venues.base import OrderNotPermitted, RawMarket
 from bot.venues.ratelimit import AsyncRateLimiter
 
@@ -208,6 +209,7 @@ class PolymarketUSVenue:
                     yes_ask_size=0.0,
                     no_ask=round(1.0 - best_bid, 6) if best_bid is not None else None,
                     no_ask_size=0.0,
+                    close_time=parse_iso8601(m.get("endDate")),
                 )
             )
         return out
