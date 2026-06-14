@@ -14,7 +14,9 @@ headers — see :func:`build_auth_headers` / :func:`load_ed25519_key`. Read-only
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import logging
 import time
 from typing import Any, AsyncIterator
 
@@ -26,6 +28,23 @@ from bot.venues.base import OrderNotPermitted, RawMarket
 from bot.venues.ratelimit import AsyncRateLimiter
 
 VENUE = "polymarket_us"
+log = logging.getLogger("bot.venues.polymarket_us")
+
+
+def parse_market_data_lite(message: dict[str, Any]) -> MarketQuote | None:
+    """Normalize a ``MARKET_DATA_LITE`` WS message into a top-of-book quote.
+
+    The payload (`marketDataLite`) carries the same bestBid/bestAsk/askDepth/bidDepth
+    shape as the REST BBO, so it reuses :func:`normalize_bbo`.
+    """
+    md = message.get("marketDataLite")
+    if not isinstance(md, dict):
+        return None
+    slug = md.get("marketSlug")
+    if not slug:
+        return None
+    return normalize_bbo(slug, "", md)
+
 
 # (side, action) -> order intent. Price is always quoted on the YES/long side.
 _INTENT = {
@@ -244,8 +263,55 @@ class PolymarketUSVenue:
         return normalize_bbo(market.market_id, market.title, market_data)
 
     async def stream_order_book(self, market_ids: list[str]) -> AsyncIterator[MarketQuote]:
-        raise NotImplementedError("QCEX WS streaming is implemented in the live phase")
-        yield  # pragma: no cover - makes this an async generator
+        """Stream real-time top-of-book via the markets WS (MARKET_DATA_LITE).
+
+        Requires credentials (the markets WS is on the authenticated API, unlike the
+        public REST gateway). Subscribes in batches of 100 slugs; reconnects with
+        exponential backoff; ignores heartbeats.
+        """
+        if not getattr(self.cfg, "is_trading_configured", False):
+            raise OrderNotPermitted("Polymarket US credentials required for the WebSocket")
+        import json
+
+        import websockets  # lazy
+
+        path = "/v1/ws/markets"
+        backoff = 1.0
+        while True:
+            try:
+                headers = self._auth_headers("GET", path)
+                async with websockets.connect(
+                    self.cfg.ws_markets, additional_headers=headers, open_timeout=10
+                ) as ws:
+                    chunks = (
+                        [market_ids[i : i + 100] for i in range(0, len(market_ids), 100)]
+                        if market_ids else [None]
+                    )
+                    for n, chunk in enumerate(chunks):
+                        sub: dict[str, Any] = {
+                            "requestId": f"md-{n}",
+                            "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA_LITE",
+                        }
+                        if chunk:
+                            sub["marketSlugs"] = chunk
+                        await ws.send(json.dumps({"subscribe": sub}))
+                    backoff = 1.0
+                    async for raw in ws:
+                        data = json.loads(raw)
+                        if "heartbeat" in data:
+                            continue
+                        if data.get("error"):
+                            log.warning("polymarket ws error: %s", data["error"])
+                            continue
+                        quote = parse_market_data_lite(data)
+                        if quote is not None:
+                            yield quote
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("polymarket ws disconnected (%s); reconnecting in %.0fs", exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
 
     def _api(self):
         """HTTP client for the authenticated trading API."""

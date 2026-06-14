@@ -38,7 +38,24 @@ def test_kalshi_title_idempotent_suffix():
     assert once == "Will the Chargers win? - Chargers"
     # ...but re-normalizing an already-suffixed title doesn't double up.
     assert build_summary_title({"title": once, "yes_sub_title": "Chargers"}) == once
-from bot.venues.polymarket_us import build_market_title, normalize_bbo
+from bot.venues.polymarket_us import build_market_title, normalize_bbo, parse_market_data_lite
+
+
+def test_polymarket_ws_market_data_lite_parsing():
+    msg = {"subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA_LITE", "marketDataLite": {
+        "marketSlug": "tec-mlb-champ-lad",
+        "bestBid": {"value": "0.54", "currency": "USD"},
+        "bestAsk": {"value": "0.56", "currency": "USD"},
+        "bidDepth": 5, "askDepth": 4}}
+    q = parse_market_data_lite(msg)
+    assert q.venue == "polymarket_us" and q.market_id == "tec-mlb-champ-lad"
+    assert q.yes_ask == 0.56 and q.yes_ask_size == 4
+    assert round(q.no_ask, 4) == 0.46 and q.no_ask_size == 5  # 1 - bestBid
+
+
+def test_polymarket_ws_ignores_non_lite():
+    assert parse_market_data_lite({"heartbeat": {}}) is None
+    assert parse_market_data_lite({"marketDataLite": {}}) is None
 
 
 def test_polymarket_title_appends_outcome():
