@@ -53,6 +53,8 @@ class CycleResult:
     candidate_pairs: int = 0
     cross: ScanResult = field(default_factory=ScanResult)
     executions: list = field(default_factory=list)  # ExecutionReport (live mode only)
+    # Confirmed same-event pairs: (venue_a, market_a, venue_b, market_b, event_key).
+    confirmed_pairs: list = field(default_factory=list)
 
     def summary(self) -> str:
         executed = sum(1 for e in self.executions if e.status.value in ("SUCCESS", "UNWOUND"))
@@ -176,6 +178,10 @@ async def run_cycle(
 
                 if verdict.tradeable():
                     confirmed_lite.append((c.a, c.b))
+                    result.confirmed_pairs.append(
+                        (c.a.venue, c.a.market_id, c.b.venue, c.b.market_id,
+                         f"{c.a.label}|{c.b.label}")
+                    )
                     deep_needed.add((c.a.venue, c.a.market_id))
                     deep_needed.add((c.b.venue, c.b.market_id))
 
@@ -343,6 +349,94 @@ async def run(
     return last
 
 
+async def stream(
+    *,
+    settings: Settings | None = None,
+    refresh_interval: float = 300.0,
+    limit: int = 1000,
+    use_llm: bool = True,
+    use_embed: bool = True,
+    match_threshold: float | None = None,
+    min_edge: float | None = None,
+    max_confirms: int = 50,
+    max_resolve_gap_days: float = 3.0,
+) -> None:
+    """Streaming LIVE execution: slow match loop refreshes confirmed pairs; fast WS
+    loop re-checks edge on every book update and fires the executor instantly.
+    Requires trading credentials (places REAL orders). Validate in demo first."""
+    from bot.execution.executor import Executor
+    from bot.matching.embed_client import make_embed_fn
+    from bot.matching.llm_client import make_complete_fn
+    from bot.streaming.engine import ConfirmedPair, StreamingEngine
+    from bot.streaming.fills import FillTracker
+
+    settings = settings or load_settings()
+    if min_edge is None:
+        min_edge = settings.risk.min_edge
+    if match_threshold is None:
+        match_threshold = 0.65 if use_embed else 0.5
+
+    venues = _build_venues(settings)
+    not_ready = [
+        v.name for v in venues
+        if not (getattr(v, "is_trading_configured", False) or getattr(v, "authenticated", False))
+    ]
+    if not_ready:
+        log.error("streaming requires trading credentials for %s — aborting", not_ready)
+        return
+
+    store = Store(settings.db_path)
+    risk = RiskManager(settings.risk)
+    fee_models = {v.name: v.fee_model for v in venues}
+    tracker = FillTracker()
+    executor = Executor(
+        {v.name: v for v in venues}, risk, fee_models=fee_models, store=store,
+        max_order_contracts=settings.risk.max_order_contracts, fill_confirmer=tracker,
+    )
+    engine = StreamingEngine(executor=executor, fee_models=fee_models, min_edge=min_edge)
+
+    complete_fn = make_complete_fn(settings.llm) if use_llm else None
+    embed_fn = make_embed_fn(settings.llm) if use_embed else None
+
+    async def refresh_specs():
+        res = await run_cycle(
+            venues, store=store, risk=RiskManager(settings.risk), fee_models=fee_models,
+            min_edge=min_edge, match_threshold=match_threshold, complete_fn=complete_fn,
+            limit=limit, embed_fn=embed_fn, max_confirms=max_confirms,
+            max_resolve_gap_days=max_resolve_gap_days, executor=None,
+        )
+        return [
+            ConfirmedPair(event_key=ek, venue_a=va, market_a=ma, venue_b=vb, market_b=mb)
+            for (va, ma, vb, mb, ek) in res.confirmed_pairs
+        ]
+
+    async def feed_private(v):
+        try:
+            async for ev in v.stream_private():
+                await tracker.apply(ev)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("private stream %s ended: %s", v.name, exc)
+
+    private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
+    log.warning("STREAMING LIVE — real orders on confirmed pairs (max %s ct/order, "
+                "caps $%.0f/$%.0f/$%.0f)", settings.risk.max_order_contracts,
+                settings.risk.max_position_per_market, settings.risk.max_total_exposure,
+                settings.risk.max_daily_loss)
+    try:
+        await engine.run(venues, refresh_specs, refresh_interval=refresh_interval)
+    finally:
+        for t in private_tasks:
+            t.cancel()
+        await asyncio.gather(*private_tasks, return_exceptions=True)
+        store.close()
+        for v in venues:
+            aclose = getattr(v, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+
 def check_llm(settings: Settings) -> int:
     """Probe the configured local LLM and print a diagnosis. Returns an exit code."""
     from bot.matching.llm_client import LocalLLMClient
@@ -380,6 +474,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--live", action="store_true",
                    help="PLACE REAL ORDERS on confirmed arbs (needs trading creds; "
                         "point base URLs at the sandbox/demo first). Default: monitor only.")
+    p.add_argument("--stream", action="store_true",
+                   help="STREAMING LIVE: slow match loop + fast WebSocket execution on "
+                        "confirmed pairs (real orders; needs trading creds). Implies --embed/--llm.")
     args = p.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -389,7 +486,16 @@ def main(argv: list[str] | None = None) -> None:
 
     threshold = args.match_threshold
     if threshold is None:
-        threshold = 0.65 if args.embed else 0.5
+        threshold = 0.65 if (args.embed or args.stream) else 0.5
+
+    if args.stream:
+        interval = args.interval if args.interval != 15.0 else 300.0  # streaming default 5m
+        asyncio.run(stream(
+            refresh_interval=interval, limit=args.limit, use_llm=True, use_embed=True,
+            match_threshold=threshold, min_edge=args.min_edge,
+            max_confirms=args.max_confirms, max_resolve_gap_days=args.max_resolve_gap_days,
+        ))
+        return
 
     asyncio.run(run(
         once=args.once, interval=args.interval, limit=args.limit,

@@ -161,6 +161,33 @@ def parse_ticker(message: dict[str, Any]) -> MarketQuote | None:
     )
 
 
+def parse_fill(message: dict[str, Any]):
+    """Normalize a Kalshi private ``fill`` message into a ``FillEvent`` (or None).
+
+    NOTE: the exact fill-message field set should be confirmed against the demo
+    environment; this parses defensively.
+    """
+    from bot.streaming.fills import FillEvent
+
+    m = message.get("msg", message)
+    order_id = m.get("order_id")
+    if not order_id:
+        return None
+    cnt = m.get("count") or m.get("count_fp") or m.get("fill_count_fp")
+    last_shares = float(cnt) if cnt not in (None, "") else 0.0
+    px = None
+    for k in ("yes_price_dollars", "no_price_dollars"):
+        if m.get(k) not in (None, ""):
+            px = float(m[k])
+            break
+    if px is None:
+        for k in ("yes_price", "no_price"):
+            if m.get(k) not in (None, ""):
+                px = float(m[k]) / 100.0
+                break
+    return FillEvent("kalshi", str(order_id), "FILL", last_shares, px)
+
+
 def _cents_to_price(cents: Any) -> float | None:
     """Convert a Kalshi cents price (1..99) to dollars; 0/None -> None (no quote)."""
     if cents in (None, "", 0, 0.0):
@@ -332,6 +359,35 @@ class KalshiVenue:
                 raise
             except Exception as exc:
                 log.warning("kalshi ws disconnected (%s); reconnecting in %.0fs", exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+
+    async def stream_private(self):
+        """Stream private fills (FillEvents) from the ``fill`` channel."""
+        import json
+
+        import websockets  # lazy
+
+        backoff = 1.0
+        while True:
+            try:
+                headers = self._ws_auth_headers()
+                async with websockets.connect(
+                    self.cfg.ws_base, additional_headers=headers, open_timeout=10
+                ) as ws:
+                    await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
+                                              "params": {"channels": ["fill"]}}))
+                    backoff = 1.0
+                    async for raw in ws:
+                        data = json.loads(raw)
+                        if data.get("type") == "fill":
+                            ev = parse_fill(data)
+                            if ev is not None:
+                                yield ev
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("kalshi private ws disconnected (%s); reconnecting in %.0fs", exc, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 

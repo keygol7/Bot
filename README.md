@@ -123,8 +123,21 @@ trading.
 4. ✅ Live read-only DRY_RUN runner (`python -m bot.dryrun`) — paper trading on real prices
 5. ✅ Two-leg executor (`--live`): FoK legs, auto-unwind on leg failure, halt-on-unknown,
    risk caps + kill switch. Sandbox-first; bundle + cross-venue.
-6. ⏳ WebSocket streaming for latency-optimized live execution
+6. ✅ WebSocket streaming engine (`--stream`): slow match loop + fast per-tick execution,
+   real-time private-fill confirmation.
 7. ⏳ Dashboard + LLM-driven directional book (separate capped strategy)
+
+### Streaming execution (`--stream`)
+
+```bash
+python -m bot.dryrun --stream --limit 1000 --interval 300   # 5-min refresh, real-time execution
+```
+A **slow loop** (every `--interval`s) re-runs scan→embed-match→LLM-confirm→date-gate to
+maintain the set of confirmed same-event pairs; a **fast loop** subscribes both venues'
+WebSockets to just those markets and, on every book update, re-checks the edge from live
+top-of-book and fires the executor in milliseconds. Fills are confirmed in real time via
+each venue's **private order stream**. Same caps/kill-switch as `--live`; needs trading
+credentials (validate Kalshi in demo first).
 
 ### Going live (Kalshi demo first; Polymarket US has no sandbox)
 

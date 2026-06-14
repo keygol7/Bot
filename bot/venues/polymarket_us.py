@@ -31,6 +31,26 @@ VENUE = "polymarket_us"
 log = logging.getLogger("bot.venues.polymarket_us")
 
 
+def parse_execution(message: dict[str, Any]):
+    """Normalize a private-WS order update into a ``FillEvent`` (or ``None``)."""
+    from bot.streaming.fills import FillEvent
+
+    upd = message.get("orderSubscriptionUpdate")
+    if not isinstance(upd, dict):
+        return None
+    ex = upd.get("execution") or {}
+    order = ex.get("order") or {}
+    order_id = order.get("id") or ex.get("id")
+    if not order_id:
+        return None
+    etype = str(ex.get("type") or "").replace("EXECUTION_TYPE_", "")
+    px = ex.get("lastPx") or {}
+    last_px = float(px["value"]) if isinstance(px, dict) and px.get("value") not in (None, "") else None
+    ls = ex.get("lastShares")
+    last_shares = float(ls) if ls not in (None, "") else 0.0
+    return FillEvent(VENUE, str(order_id), etype, last_shares, last_px)
+
+
 def parse_market_data_lite(message: dict[str, Any]) -> MarketQuote | None:
     """Normalize a ``MARKET_DATA_LITE`` WS message into a top-of-book quote.
 
@@ -320,6 +340,39 @@ class PolymarketUSVenue:
 
             self._api_client = httpx.AsyncClient(base_url=self.cfg.api_base, timeout=10.0)
         return self._api_client
+
+    async def stream_private(self):
+        """Stream private order executions (FillEvents) from /v1/ws/private."""
+        if not getattr(self.cfg, "is_trading_configured", False):
+            raise OrderNotPermitted("Polymarket US credentials required for the private WS")
+        import json
+
+        import websockets  # lazy
+
+        path = "/v1/ws/private"
+        backoff = 1.0
+        while True:
+            try:
+                headers = self._auth_headers("GET", path)
+                async with websockets.connect(
+                    self.cfg.ws_private, additional_headers=headers, open_timeout=10
+                ) as ws:
+                    await ws.send(json.dumps({"subscribe": {
+                        "requestId": "ord", "subscriptionType": "SUBSCRIPTION_TYPE_ORDER"}}))
+                    backoff = 1.0
+                    async for raw in ws:
+                        data = json.loads(raw)
+                        if "heartbeat" in data:
+                            continue
+                        ev = parse_execution(data)
+                        if ev is not None:
+                            yield ev
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("polymarket private ws disconnected (%s); reconnecting in %.0fs", exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
 
     async def place_order(
         self, market_id: str, side: Side, action: str, price: float, contracts: float,

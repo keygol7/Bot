@@ -133,6 +133,39 @@ def test_size_capped_by_max_order_contracts():
     assert yes.calls[0][4] == 2                       # requested contracts capped at 2
 
 
+def test_fill_confirmer_overrides_rest_result():
+    # REST says KILLED, but the private fill stream confirms a FILL -> executor uses WS.
+    class Confirmer:
+        async def confirm(self, venue, order_id, requested, timeout):
+            return OrderStatus.FILLED, requested, 0.40
+
+    yes = FakeVenue("kalshi", [
+        res("kalshi", Side.YES, OrderStatus.KILLED, 0, None)  # REST under-reports
+    ])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
+    ex, _ = make_exec([yes, no])
+    ex.fill_confirmer = Confirmer()
+    # leg1 REST=KILLED but confirmer flips it to FILLED, so the arb proceeds.
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.SUCCESS
+
+
+def test_fill_confirmer_needs_order_id():
+    # No order_id -> confirmer is skipped, REST result stands.
+    class Confirmer:
+        async def confirm(self, *a, **k):
+            raise AssertionError("should not be called without order_id")
+
+    leg = res("kalshi", Side.YES, OrderStatus.KILLED, 0, None)
+    leg.order_id = None
+    yes = FakeVenue("kalshi", [leg])
+    no = FakeVenue("poly", [])
+    ex, _ = make_exec([yes, no])
+    ex.fill_confirmer = Confirmer()
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.SKIPPED   # leg1 killed, no order id -> skip
+
+
 def test_risk_cap_skips():
     yes = FakeVenue("kalshi", [])
     no = FakeVenue("poly", [])

@@ -65,6 +65,8 @@ class Executor:
         store: Store | None = None,
         max_order_contracts: float = 2.0,
         unwind_slippage: float = 0.05,
+        fill_confirmer=None,
+        confirm_timeout: float = 5.0,
     ) -> None:
         self.venues = venues
         self.risk = risk
@@ -72,6 +74,8 @@ class Executor:
         self.store = store
         self.max_order_contracts = max_order_contracts
         self.unwind_slippage = unwind_slippage
+        self.fill_confirmer = fill_confirmer       # optional FillTracker (private WS)
+        self.confirm_timeout = confirm_timeout
 
     def _fee(self, venue: str) -> FeeModel:
         return self.fee_models.get(venue, ZeroFeeModel())
@@ -80,12 +84,25 @@ class Executor:
         """Place an order, converting any raised exception into an ERROR result so a
         venue error never crashes the loop (it routes to the halt path instead)."""
         try:
-            return await venue.place_order(market_id, side, action, price, contracts, tif=tif)
+            result = await venue.place_order(market_id, side, action, price, contracts, tif=tif)
         except Exception as exc:
             return OrderResult(
                 getattr(venue, "name", "?"), market_id, side, action, contracts,
                 status=OrderStatus.ERROR, raw={"error": str(exc)},
             )
+        # Authoritative fill confirmation from the private WS, when available — avoids
+        # depending on the synchronous REST response shape.
+        if self.fill_confirmer is not None and result.order_id and result.status is not OrderStatus.ERROR:
+            try:
+                status, filled, avg = await self.fill_confirmer.confirm(
+                    result.venue, result.order_id, contracts, self.confirm_timeout
+                )
+                result.status, result.filled = status, filled
+                if avg is not None:
+                    result.avg_price = avg
+            except Exception as exc:  # confirmer failure -> keep REST result
+                log.warning("fill confirm failed for %s: %s", result.order_id, exc)
+        return result
 
     def _size(self, opp: ArbOpportunity) -> int:
         return int(math.floor(min(self.max_order_contracts, opp.max_contracts)))
