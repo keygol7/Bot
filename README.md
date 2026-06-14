@@ -126,20 +126,25 @@ trading.
 6. ⏳ WebSocket streaming for latency-optimized live execution
 7. ⏳ Dashboard + LLM-driven directional book (separate capped strategy)
 
-### Going live (sandbox first)
+### Going live (Kalshi demo first; Polymarket US has no sandbox)
 
 `--live` places **real orders** on confirmed arbs; without it the runner is read-only.
 
+- **Kalshi** has a paper-money **demo** — validate the full order flow there first
+  (`KALSHI_API_BASE=https://demo-api.kalshi.co/trade-api/v2` + a demo API key).
+- **Polymarket US has no sandbox** (prod-only, KYC). Auth + market-data reads can be
+  validated on prod for free, but testing real order placement needs a tiny
+  real-money trade. So: prove the **single-venue Kalshi bundle** path in demo, then do
+  a minimal real-money canary for the cross-venue (Polymarket) leg.
+
 ```bash
-# 1. point base URLs at sandbox/demo + set trading keys in .env, then:
-python -m bot.dryrun --once --limit 1000 --embed --llm --live   # sandbox canary
+python -m bot.dryrun --once --limit 1000 --embed --llm --live   # canary
 ```
-Each opportunity is executed as two **fill-or-kill** legs (buy YES / buy NO). If one
-leg fills and the hedge doesn't, the filled leg is **auto-unwound** to stay flat; any
-*ambiguous* state (network error / partial) **halts trading and trips the kill switch**
-for manual reconciliation. Size is capped at `RISK_MAX_ORDER_CONTRACTS`; per-market,
-total-exposure, and daily-loss caps all apply. `--live` refuses to run without trading
-credentials (stays read-only).
+Each opportunity executes as two **fill-or-kill** legs (buy YES / buy NO). If one leg
+fills and the hedge doesn't, the filled leg is **auto-unwound** to stay flat; any
+*ambiguous* state (network error / partial) **halts trading and trips the kill switch**.
+Size is capped at `RISK_MAX_ORDER_CONTRACTS`; per-market, total-exposure, and
+daily-loss caps all apply. `--live` refuses to run without trading credentials.
 
 ## Legal note
 
