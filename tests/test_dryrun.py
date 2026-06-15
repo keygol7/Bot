@@ -325,6 +325,23 @@ def test_inspect_matches_lists_confirmed_with_titles(capsys):
     s.close()
 
 
+def test_count_markets_reports_per_venue_and_total(capsys, monkeypatch):
+    import bot.dryrun as dr
+    from bot.dryrun import count_markets
+
+    venues = [
+        StubVenue("kalshi", {f"K{i}": mq("kalshi", f"K{i}", f"m{i}") for i in range(3)}),
+        StubVenue("polymarket_us", {"P1": mq("polymarket_us", "P1", "m")}),
+    ]
+    monkeypatch.setattr(dr, "_build_venues", lambda settings: venues)
+    rc = count_markets(Settings())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "kalshi: 3 open markets" in out
+    assert "polymarket_us: 1 open markets" in out
+    assert "total across 2 venues: 4 markets" in out
+
+
 def test_check_ws_probe_collects_quotes():
     from bot.dryrun import _probe_stream
 

@@ -587,6 +587,35 @@ def check_ws(settings: Settings) -> int:
     return asyncio.run(_run())
 
 
+def count_markets(settings: Settings, *, limit: int = 50000) -> int:
+    """Pull every open market from each venue (no matching) and print the counts.
+
+    Answers "how many markets will a seed run pull?" cheaply and repeatably — it runs
+    the same paginated scan_quotes the discovery cycle uses, then exits."""
+    async def _run() -> int:
+        venues = _build_venues(settings)
+        total = 0
+        try:
+            for v in venues:
+                try:
+                    qs = await v.scan_quotes(limit)
+                except Exception as exc:
+                    print(f"{v.name}: scan failed ({exc})")
+                    continue
+                total += len(qs)
+                print(f"{v.name}: {len(qs)} open markets")
+            print(f"total across {len(venues)} venues: {total} markets "
+                  f"(a seed run pulls these, then matches across venues)")
+        finally:
+            for v in venues:
+                aclose = getattr(v, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+        return 0
+
+    return asyncio.run(_run())
+
+
 def check_llm(settings: Settings) -> int:
     """Probe the configured local LLM and print a diagnosis. Returns an exit code."""
     from bot.matching.llm_client import LocalLLMClient
@@ -654,6 +683,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--inspect-matches", action="store_true",
                    help="print cached match verdicts (with titles) to audit the "
                         "matcher, then exit")
+    p.add_argument("--count-markets", action="store_true",
+                   help="pull every open market from each venue, print the counts, "
+                        "and exit (no matching)")
     p.add_argument("--show-rejected", action="store_true",
                    help="with --inspect-matches, also list rejected (non-match) pairs")
     p.add_argument("--once", action="store_true", help="run a single cycle and exit")
@@ -695,6 +727,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.inspect_matches:
         raise SystemExit(inspect_matches(load_settings(), show_rejected=args.show_rejected))
+
+    if args.count_markets:
+        raise SystemExit(count_markets(load_settings()))
 
     threshold = args.match_threshold
     if threshold is None:
