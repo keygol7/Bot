@@ -627,16 +627,26 @@ def check_llm(settings: Settings) -> int:
     return 0 if ok else 1
 
 
-def inspect_matches(settings: Settings, *, show_rejected: bool = False, limit: int = 50) -> int:
+def inspect_matches(
+    settings: Settings, *, show_rejected: bool = False, tradeable_only: bool = False,
+    limit: int = 50,
+) -> int:
     """Print the cached match verdicts with both market titles so a human can audit
     whether the matcher pairs the *same* event/resolution. Read-only.
 
     Confirmed pairs (same_event=1) are the ones that can be traded, so a false
     positive here is the dangerous case — eyeball that the two titles really are the
     same event with the same resolution. ``--show-rejected`` also lists rejected pairs
-    to catch false negatives (missed matches)."""
+    to catch false negatives (missed matches). ``--tradeable-only`` lists EXACTLY the
+    post-filter set the streamer will trade (confidence floor + fan-out guard)."""
     store = Store(settings.db_path)
     try:
+        def title_of(venue: str, mid: str) -> str:
+            row = store.conn.execute(
+                "SELECT title FROM markets WHERE venue=? AND market_id=?", (venue, mid)
+            ).fetchone()
+            return (row["title"] if row and row["title"] else mid)
+
         def rows(same_event: int):
             return store.conn.execute(
                 """SELECT v.confidence AS conf, v.rationale AS why,
@@ -651,16 +661,28 @@ def inspect_matches(settings: Settings, *, show_rejected: bool = False, limit: i
                 (same_event, limit),
             ).fetchall()
 
+        tradeable_pairs = store.confirmed_pairs()
+        if tradeable_only:
+            # Exactly what the streamer will trade — audit this before going live.
+            print(f"{len(tradeable_pairs)} TRADEABLE pairs (confidence+fan-out filtered):\n")
+            for (va, ma, vb, mb, _ek) in tradeable_pairs[:limit]:
+                print(f"  ✓ [{va}] {title_of(va, ma)}")
+                print(f"      [{vb}] {title_of(vb, mb)}")
+            if len(tradeable_pairs) > limit:
+                print(f"\n  … {len(tradeable_pairs) - limit} more (raise --limit to see all)")
+            return 0
+
         total = store.conn.execute("SELECT COUNT(*) c FROM match_verdicts").fetchone()["c"]
         raw_confirmed = store.conn.execute(
             "SELECT COUNT(*) c FROM match_verdicts WHERE same_event=1"
         ).fetchone()["c"]
         # What the streamer will ACTUALLY trade: confidence floor + fan-out guard.
-        tradeable = len(store.confirmed_pairs())
+        tradeable = len(tradeable_pairs)
         confirmed = rows(1)
         print(f"match cache: {total} verdicts total, {raw_confirmed} marked same-event, "
               f"{tradeable} TRADEABLE after confidence+fan-out filters "
-              f"(showing up to {limit} same-event below)\n")
+              f"(showing up to {limit} same-event below; use --tradeable-only to audit "
+              f"the exact trade set)\n")
         if not confirmed:
             print("  (no confirmed pairs yet — discovery hasn't matched anything; "
                   "check --check-llm and that --embed/--llm are on)")
@@ -694,6 +716,9 @@ def main(argv: list[str] | None = None) -> None:
                         "and exit (no matching)")
     p.add_argument("--show-rejected", action="store_true",
                    help="with --inspect-matches, also list rejected (non-match) pairs")
+    p.add_argument("--tradeable-only", action="store_true",
+                   help="with --inspect-matches, list ONLY the post-filter set the "
+                        "streamer will trade (confidence floor + fan-out guard)")
     p.add_argument("--once", action="store_true", help="run a single cycle and exit")
     p.add_argument("--interval", type=float, default=15.0, help="seconds between cycles")
     p.add_argument("--limit", type=int, default=50,
@@ -732,7 +757,10 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(check_ws(load_settings()))
 
     if args.inspect_matches:
-        raise SystemExit(inspect_matches(load_settings(), show_rejected=args.show_rejected))
+        raise SystemExit(inspect_matches(
+            load_settings(), show_rejected=args.show_rejected,
+            tradeable_only=args.tradeable_only, limit=args.limit,
+        ))
 
     if args.count_markets:
         raise SystemExit(count_markets(load_settings()))

@@ -326,6 +326,32 @@ def test_inspect_matches_lists_confirmed_with_titles(capsys):
     s.close()
 
 
+def test_inspect_matches_tradeable_only_lists_exact_trade_set(capsys):
+    from bot.dryrun import inspect_matches
+
+    s = Store(":memory:")
+    s.upsert_market("kalshi", "K1", "Gane by KO")
+    s.upsert_market("polymarket_us", "P1", "Gane by KO")
+    s.cache_verdict("kalshi", "K1", "polymarket_us", "P1", same_event=True, confidence=1.0)
+    # A fan-out market that must NOT appear in the tradeable-only view.
+    for p in ("PA", "PB"):
+        s.cache_verdict("kalshi", "Kfield", "polymarket_us", p, same_event=True, confidence=1.0)
+
+    import bot.dryrun as dr
+    orig = dr.Store
+    dr.Store = lambda path: s          # type: ignore[assignment]
+    try:
+        rc = inspect_matches(Settings(), tradeable_only=True)
+    finally:
+        dr.Store = orig
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "1 TRADEABLE pairs" in out      # only the clean 1:1, fan-out excluded
+    assert "Gane by KO" in out
+    assert "Kfield" not in out
+    s.close()
+
+
 def test_count_markets_reports_per_venue_and_total(capsys, monkeypatch):
     import bot.dryrun as dr
     from bot.dryrun import count_markets
