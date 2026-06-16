@@ -95,6 +95,39 @@ def test_confirmed_pairs_applies_confidence_floor():
     s.close()
 
 
+def test_confirmed_pairs_drops_fanout_clusters():
+    # The PGA trap: one Polymarket market "confirmed" against many distinct Kalshi
+    # markets (and vice versa) is a multi-outcome cross-product, not 1:1 arb. All of
+    # those pairs must be dropped; a clean 1:1 pair survives.
+    s = Store(":memory:")
+    # Fan-out cluster: K_a matches P1,P2,P3 — all high confidence.
+    for p in ("P1", "P2", "P3"):
+        s.cache_verdict("kalshi", "Kfield", "polymarket_us", p, same_event=True, confidence=1.0)
+    # Clean 1:1 pair elsewhere.
+    s.cache_verdict("kalshi", "Ksolo", "polymarket_us", "Psolo", same_event=True, confidence=1.0)
+
+    pairs = s.confirmed_pairs()                       # default max_fanout=1
+    assert {(p[0], p[1], p[2], p[3]) for p in pairs} == {
+        ("kalshi", "Ksolo", "polymarket_us", "Psolo")
+    }
+    # Disabling the fan-out gate keeps everything (4 pairs).
+    assert len(s.confirmed_pairs(max_fanout=None)) == 4
+    s.close()
+
+
+def test_drop_fanout_pairs_pure():
+    from bot.data.store import drop_fanout_pairs
+
+    pairs = [
+        ("k", "A", "p", "1", "e"),   # A->1 only (clean)
+        ("k", "B", "p", "2", "e"),   # B->2,3 (fan-out)
+        ("k", "B", "p", "3", "e"),
+    ]
+    kept = drop_fanout_pairs(pairs, max_fanout=1)
+    assert kept == [("k", "A", "p", "1", "e")]
+    assert len(drop_fanout_pairs(pairs, max_fanout=5)) == 3   # tolerant threshold keeps all
+
+
 def test_audit_log():
     s = Store(":memory:")
     s.audit("startup", {"mode": "DRY_RUN"})

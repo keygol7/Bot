@@ -652,9 +652,15 @@ def inspect_matches(settings: Settings, *, show_rejected: bool = False, limit: i
             ).fetchall()
 
         total = store.conn.execute("SELECT COUNT(*) c FROM match_verdicts").fetchone()["c"]
+        raw_confirmed = store.conn.execute(
+            "SELECT COUNT(*) c FROM match_verdicts WHERE same_event=1"
+        ).fetchone()["c"]
+        # What the streamer will ACTUALLY trade: confidence floor + fan-out guard.
+        tradeable = len(store.confirmed_pairs())
         confirmed = rows(1)
-        print(f"match cache: {total} verdicts total, {len(confirmed)} confirmed "
-              f"same-event (showing up to {limit})\n")
+        print(f"match cache: {total} verdicts total, {raw_confirmed} marked same-event, "
+              f"{tradeable} TRADEABLE after confidence+fan-out filters "
+              f"(showing up to {limit} same-event below)\n")
         if not confirmed:
             print("  (no confirmed pairs yet — discovery hasn't matched anything; "
                   "check --check-llm and that --embed/--llm are on)")

@@ -318,7 +318,8 @@ def test_inspect_matches_lists_confirmed_with_titles(capsys):
         dr.Store = orig
     out = capsys.readouterr().out
     assert rc == 0
-    assert "1 confirmed same-event" in out
+    assert "1 marked same-event" in out
+    assert "TRADEABLE" in out
     assert "Lima vs Borshchev" in out
     assert "same fight" in out
     assert "rejected (not same event)" in out     # rejected section shown

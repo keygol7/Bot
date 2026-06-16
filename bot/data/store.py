@@ -12,8 +12,30 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
+
+
+def drop_fanout_pairs(pairs: list[tuple], max_fanout: int = 1) -> list[tuple]:
+    """Keep only ~1:1 same-event pairs; drop multi-outcome cross-products.
+
+    ``pairs`` is ``[(venue_a, market_a, venue_b, market_b, event_key), ...]``. A pair
+    survives only if BOTH of its markets appear in at most ``max_fanout`` pairs. A
+    market matched to many distinct counterparties is a "which of N" multi-outcome
+    event (a golf field, a "who wins" market) exploded into many near-identical binary
+    titles — it can be the *same event* as at most one counterparty, so when it maps to
+    several the matcher can't tell which, and ALL its pairs are unsafe to trade.
+
+    This is the deterministic backstop for an LLM that rubber-stamps "same event" on
+    same-tournament/different-subject titles. ``max_fanout=1`` is strictest (true 1:1).
+    """
+    deg_a = Counter((va, ma) for (va, ma, vb, mb, ek) in pairs)
+    deg_b = Counter((vb, mb) for (va, ma, vb, mb, ek) in pairs)
+    return [
+        p for p in pairs
+        if deg_a[(p[0], p[1])] <= max_fanout and deg_b[(p[2], p[3])] <= max_fanout
+    ]
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets (
@@ -207,23 +229,33 @@ class Store:
         )
         self.conn.commit()
 
-    def confirmed_pairs(self, min_confidence: float = 0.85) -> list[tuple]:
-        """All cached tradeable pairs: (venue_a, market_a, venue_b, market_b, event_key).
+    def confirmed_pairs(
+        self, min_confidence: float = 0.85, max_fanout: Optional[int] = 1
+    ) -> list[tuple]:
+        """Cached tradeable pairs: (venue_a, market_a, venue_b, market_b, event_key).
 
-        This is the durable source of truth for the streaming watchlist — independent
-        of per-cycle embedding/LLM variance. It applies the SAME gate as
-        ``MatchVerdict.tradeable``: confirmed same-event AND confident enough. Without
-        the confidence floor the streamer would trade every low-confidence "true" the
-        model ever emitted."""
+        The durable source of truth for the streaming watchlist — independent of
+        per-cycle embedding/LLM variance. Two gates are applied:
+
+        1. The SAME confidence gate as ``MatchVerdict.tradeable`` (confirmed same-event
+           AND ``confidence >= min_confidence``). Without it the streamer would trade
+           every low-confidence "true" the model emitted.
+        2. A fan-out gate (``max_fanout``): drop multi-outcome cross-products where a
+           market maps to many counterparties (see :func:`drop_fanout_pairs`). Pass
+           ``None`` to disable.
+        """
         rows = self.conn.execute(
             "SELECT venue_a, market_a, venue_b, market_b, event_key "
             "FROM match_verdicts WHERE same_event=1 AND confidence >= ?",
             (min_confidence,),
         ).fetchall()
-        return [
+        pairs = [
             (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], r["event_key"])
             for r in rows
         ]
+        if max_fanout is not None:
+            pairs = drop_fanout_pairs(pairs, max_fanout=max_fanout)
+        return pairs
 
     def get_verdict(self, va: str, ma: str, vb: str, mb: str) -> Optional[sqlite3.Row]:
         a, ma2, b, mb2 = self._pair_key(va, ma, vb, mb)
