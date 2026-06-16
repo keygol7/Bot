@@ -66,6 +66,7 @@ class StreamingEngine:
         self._pairs: dict[tuple, ConfirmedPair] = {}
         self._index: dict[tuple[str, str], set] = {}   # (venue,market) -> set of pair keys
         self._last_acted: dict[tuple, float] = {}
+        self._ws_counts: dict[str, int] = {}   # venue -> quotes seen since last refresh
 
     def _fee(self, venue: str) -> FeeModel:
         return self.fee_models.get(venue, ZeroFeeModel())
@@ -143,6 +144,7 @@ class StreamingEngine:
         if mids is None:
             return  # nothing confirmed for this venue this cycle
         async for q in venue.stream_order_book(mids):
+            self._ws_counts[venue.name] = self._ws_counts.get(venue.name, 0) + 1
             await self.on_quote(q)
 
     async def run(self, venues: list, refresh_specs, *, refresh_interval: float = 300.0) -> None:
@@ -166,6 +168,7 @@ class StreamingEngine:
                 log.info("refresh returned 0 pairs; keeping %d existing", len(self._pairs))
             log.info("streaming %d confirmed pairs across %d venues",
                      len(self._pairs), len(self.market_ids))
+            self._ws_counts = {}
             consumers = [asyncio.create_task(self._consume(v)) for v in venues]
             try:
                 await asyncio.sleep(refresh_interval)
@@ -173,3 +176,11 @@ class StreamingEngine:
                 for c in consumers:
                     c.cancel()
                 await asyncio.gather(*consumers, return_exceptions=True)
+            # WS health: how many live ticks each venue delivered this interval. A
+            # venue at 0 means its market WebSocket isn't feeding the fast path.
+            counts = {v.name: self._ws_counts.get(v.name, 0) for v in venues}
+            dead = [name for name, n in counts.items() if n == 0]
+            if dead:
+                log.warning("WS health: %s — NO quotes this interval from %s", counts, dead)
+            else:
+                log.info("WS health: %s quotes this interval", counts)

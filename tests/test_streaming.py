@@ -113,3 +113,19 @@ def test_run_consumes_streams_and_stops(monkeypatch):
 
     asyncio.run(driver())
     assert len(fe.calls) >= 1
+
+
+def test_consume_counts_ws_quotes_for_health():
+    # The WS-health heartbeat: _consume must count each tick per venue so the run
+    # loop can report whether a venue's WebSocket is actually delivering data.
+    eng = make_engine(FakeExec())
+
+    class V:
+        name = "kalshi"
+
+        async def stream_order_book(self, mids):
+            yield q("kalshi", "K1", yes_ask=0.4, ya=10, no_ask=0.6, na=10)
+            yield q("kalshi", "K1", yes_ask=0.4, ya=10, no_ask=0.6, na=10)
+
+    asyncio.run(eng._consume(V()))
+    assert eng._ws_counts["kalshi"] == 2
