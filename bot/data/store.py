@@ -207,14 +207,18 @@ class Store:
         )
         self.conn.commit()
 
-    def confirmed_pairs(self) -> list[tuple]:
-        """All cached same-event pairs: (venue_a, market_a, venue_b, market_b, event_key).
+    def confirmed_pairs(self, min_confidence: float = 0.85) -> list[tuple]:
+        """All cached tradeable pairs: (venue_a, market_a, venue_b, market_b, event_key).
 
         This is the durable source of truth for the streaming watchlist — independent
-        of per-cycle embedding/LLM variance."""
+        of per-cycle embedding/LLM variance. It applies the SAME gate as
+        ``MatchVerdict.tradeable``: confirmed same-event AND confident enough. Without
+        the confidence floor the streamer would trade every low-confidence "true" the
+        model ever emitted."""
         rows = self.conn.execute(
             "SELECT venue_a, market_a, venue_b, market_b, event_key "
-            "FROM match_verdicts WHERE same_event=1"
+            "FROM match_verdicts WHERE same_event=1 AND confidence >= ?",
+            (min_confidence,),
         ).fetchall()
         return [
             (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], r["event_key"])

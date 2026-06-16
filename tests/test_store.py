@@ -83,6 +83,18 @@ def test_confirmed_pairs_returns_only_same_event():
     s.close()
 
 
+def test_confirmed_pairs_applies_confidence_floor():
+    # A same_event=True but LOW-confidence verdict must NOT reach the watchlist —
+    # it isn't tradeable, so the streamer must never see it.
+    s = Store(":memory:")
+    s.cache_verdict("kalshi", "K1", "polymarket_us", "P1", same_event=True, confidence=0.95)
+    s.cache_verdict("kalshi", "K2", "polymarket_us", "P2", same_event=True, confidence=0.60)
+    pairs = s.confirmed_pairs()                       # default floor 0.85
+    assert {(p[0], p[1]) for p in pairs} == {("kalshi", "K1")}
+    assert len(s.confirmed_pairs(min_confidence=0.5)) == 2   # floor can be relaxed
+    s.close()
+
+
 def test_audit_log():
     s = Store(":memory:")
     s.audit("startup", {"mode": "DRY_RUN"})
