@@ -408,6 +408,30 @@ def test_inspect_matches_tradeable_only_lists_exact_trade_set(capsys):
     s.close()
 
 
+def test_show_book_prints_quote(capsys, monkeypatch):
+    import bot.dryrun as dr
+    from bot.dryrun import show_book
+
+    ka = mq("kalshi", "K1", "m", yes_ask=0.4, yes_ask_size=30, no_ask=0.62, no_ask_size=20)
+    venues = [StubVenue("kalshi", {"K1": ka})]
+    monkeypatch.setattr(dr, "_build_venues", lambda s: venues)
+    rc = show_book(Settings(), "kalshi:K1")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "yes_ask=0.4@30" in out and "no_ask=0.62@20" in out
+
+
+def test_show_book_flags_empty(capsys, monkeypatch):
+    import bot.dryrun as dr
+    from bot.dryrun import show_book
+
+    empty = mq("kalshi", "K1", "m", yes_ask=None, no_ask=None)
+    monkeypatch.setattr(dr, "_build_venues", lambda s: [StubVenue("kalshi", {"K1": empty})])
+    rc = show_book(Settings(), "kalshi:K1")
+    out = capsys.readouterr().out
+    assert rc == 0 and "EMPTY book" in out
+
+
 def test_count_markets_reports_per_venue_and_total(capsys, monkeypatch):
     import bot.dryrun as dr
     from bot.dryrun import count_markets

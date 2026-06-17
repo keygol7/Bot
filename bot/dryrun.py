@@ -622,6 +622,43 @@ def check_ws(settings: Settings) -> int:
     return asyncio.run(_run())
 
 
+def show_book(settings: Settings, spec: str) -> int:
+    """Fetch and print one market's real order book (sized quote) from its venue.
+    ``spec`` is ``venue:market_id``. Read-only — diagnoses whether a market actually
+    has depth (vs an empty book behind an indicative ticker price)."""
+    venue_name, _, market = spec.partition(":")
+    if not market:
+        print("usage: --show-book VENUE:MARKET_ID")
+        return 2
+
+    async def _run() -> int:
+        venues = {v.name: v for v in _build_venues(settings)}
+        v = venues.get(venue_name)
+        if v is None:
+            print(f"unknown venue {venue_name!r}; known: {sorted(venues)}")
+            return 2
+        try:
+            q = await v.fetch_quote(RawMarket(market_id=market, title="", raw={}))
+        except Exception as exc:
+            print(f"{venue_name}:{market} -> fetch failed: {exc}")
+            return 1
+        finally:
+            aclose = getattr(v, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        if q is None:
+            print(f"{venue_name}:{market} -> no quote (market not found / 404)")
+            return 0
+        ya = f"{q.yes_ask}@{q.yes_ask_size:g}" if q.yes_ask is not None else "None@0"
+        na = f"{q.no_ask}@{q.no_ask_size:g}" if q.no_ask is not None else "None@0"
+        print(f"{venue_name}:{market}  yes_ask={ya}  no_ask={na}")
+        if q.yes_ask is None and q.no_ask is None:
+            print("  -> EMPTY book (no resting orders to buy against) — not tradeable")
+        return 0
+
+    return asyncio.run(_run())
+
+
 def count_markets(settings: Settings, *, limit: int = 50000) -> int:
     """Pull every open market from each venue (no matching) and print the counts.
 
@@ -890,6 +927,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--count-markets", action="store_true",
                    help="pull every open market from each venue, print the counts, "
                         "and exit (no matching)")
+    p.add_argument("--show-book", metavar="VENUE:MARKET", default=None,
+                   help="fetch and print one market's real order book (sized quote)")
     p.add_argument("--test-order", metavar="VENUE:MARKET", default=None,
                    help="place ONE test order to verify the live buying path; default "
                         "is a no-fill canary ($0 spent). Add --fill for a real buy.")
@@ -952,6 +991,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.count_markets:
         raise SystemExit(count_markets(load_settings()))
+
+    if args.show_book:
+        raise SystemExit(show_book(load_settings(), args.show_book))
 
     if args.recheck_matches:
         raise SystemExit(recheck_matches(load_settings(), limit=args.limit))
