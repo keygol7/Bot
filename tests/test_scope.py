@@ -152,3 +152,8 @@ def test_market_type_whitelist():
     assert not ok("Will Suzan Lamens win set 2? - Suzan Lamens")
     assert not ok("Will the final score be Sweden wins 2-0? - Sweden wins 2-0")
     assert not ok("Will the fight go the distance? - Yes")
+    # Futures/outright markets resolve over a whole tournament, not one match.
+    assert not ok("Will Cape Verde be undefeated in the group stage? - Cape Verde")
+    assert not ok("Will Brazil win the group? - Brazil")
+    # ...but a single World Cup match winner is still allowed.
+    assert ok("Will Portugal win against Congo DR in the World Cup match? - Portugal")

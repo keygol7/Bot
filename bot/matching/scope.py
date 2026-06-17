@@ -49,6 +49,11 @@ _SCOPE_PATTERNS: dict[str, str] = {
     "margin": r"\bwins?\s+by\s+(over\s+|under\s+|more\s+than\s+)?\d|\bgoal\s+(margin|spread)\b",
     # fight goes the distance (duration) — NOT "win the fight" (winner).
     "distance": r"\bgo(es)?\s+the\s+distance\b",
+    # tournament/outright FUTURES (resolve over a whole event) — NOT a single match.
+    # e.g. "undefeated in the group stage" vs "win the match".
+    "futures": r"\bundefeated\b|\btop\s+scorer\b|\bgolden\s+boot\b|\bgroup\s+winner\b|"
+               r"\bwin\s+the\s+group\b|\bto\s+reach\s+the\b|"
+               r"\bto\s+win\s+the\s+(world\s+cup|tournament|title|trophy|cup)\b",
 }
 
 # The stat a player-prop market resolves on. Mutually exclusive, checked in order so
@@ -111,7 +116,7 @@ def scope_mismatch(title_a: str, title_b: str) -> bool:
 _EXOTIC_SCOPE = frozenset({
     "first_half", "second_half", "halftime", "first_period", "advance", "extra_time",
     "penalties", "regulation", "clean_sheet", "both_score", "exact_score", "to_nil",
-    "handicap", "set_winner", "margin", "distance",
+    "handicap", "set_winner", "margin", "distance", "futures",
 })
 # A market resolving on a clear winner/draw outcome (vs a novelty like "what will the
 # announcers say", which matches none of these and is therefore excluded).
