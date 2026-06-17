@@ -725,8 +725,10 @@ def inspect_matches(
             # Exactly what the streamer will trade — audit this before going live.
             print(f"{len(tradeable_pairs)} TRADEABLE pairs (confidence+fan-out filtered):\n")
             for (va, ma, vb, mb, _ek) in tradeable_pairs[:limit]:
-                print(f"  ✓ [{va}] {title_of(va, ma)}")
-                print(f"      [{vb}] {title_of(vb, mb)}")
+                # Show the market id alongside the title so it can be copied straight
+                # into --test-order VENUE:MARKET.
+                print(f"  ✓ [{va}] {ma}  {title_of(va, ma)}")
+                print(f"      [{vb}] {mb}  {title_of(vb, mb)}")
             if len(tradeable_pairs) > limit:
                 print(f"\n  … {len(tradeable_pairs) - limit} more (raise --limit to see all)")
             return 0
