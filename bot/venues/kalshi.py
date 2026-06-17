@@ -290,8 +290,14 @@ class KalshiVenue:
         endpoint = f"/markets/{ticker}/orderbook"
         resp = await self._http().get(endpoint, headers=self._auth_headers("GET", endpoint))
         resp.raise_for_status()
-        ob = resp.json().get("orderbook", {})
-        return normalize_orderbook(ticker, title, ob)
+        body = resp.json()
+        ob = body.get("orderbook", {})
+        q = normalize_orderbook(ticker, title, ob)
+        if q.yes_ask is None and q.no_ask is None:
+            # Diagnostic: an empty parse may mean a genuinely empty book OR a response
+            # shape we're not reading. Log the raw payload (truncated) to tell them apart.
+            log.warning("kalshi orderbook %s parsed empty; raw=%s", ticker, str(body)[:400])
+        return q
 
     async def fetch_quote(self, market: RawMarket) -> MarketQuote:
         """Deep (sized) quote for one market — used in phase 2 for shortlisted markets."""
