@@ -369,6 +369,42 @@ def test_count_markets_reports_per_venue_and_total(capsys, monkeypatch):
     assert "total across 2 venues: 4 markets" in out
 
 
+def test_test_order_canary_places_nofill(capsys, monkeypatch):
+    import bot.dryrun as dr
+    from bot.dryrun import test_order
+    from bot.execution.orders import OrderResult, OrderStatus
+    from bot.models import Side
+
+    captured = {}
+
+    class TradeVenue:
+        name = "kalshi"
+        is_trading_configured = True
+
+        async def place_order(self, market, side, action, price, contracts):
+            captured.update(market=market, side=side, action=action, price=price, contracts=contracts)
+            return OrderResult(venue="kalshi", market_id=market, side=side, action=action,
+                               requested=contracts, filled=0.0, status=OrderStatus.KILLED)
+
+    monkeypatch.setattr(dr, "_build_venues", lambda s: [TradeVenue()])
+    rc = test_order(Settings(), "kalshi:KXTICK")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert captured == {"market": "KXTICK", "side": Side.YES, "action": "buy",
+                        "price": 0.01, "contracts": 1}
+    assert "order path works" in out
+
+
+def test_test_order_unknown_venue(capsys, monkeypatch):
+    import bot.dryrun as dr
+    from bot.dryrun import test_order
+
+    monkeypatch.setattr(dr, "_build_venues", lambda s: [])
+    rc = test_order(Settings(), "nope:X")
+    assert rc == 2
+    assert "unknown venue" in capsys.readouterr().out
+
+
 def test_check_ws_probe_collects_quotes():
     from bot.dryrun import _probe_stream
 

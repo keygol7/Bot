@@ -616,6 +616,65 @@ def count_markets(settings: Settings, *, limit: int = 50000) -> int:
     return asyncio.run(_run())
 
 
+def test_order(settings: Settings, spec: str, *, do_fill: bool = False) -> int:
+    """Place ONE test order to verify the live buying path (auth, signing, submission,
+    response parsing) on a real venue. ``spec`` is ``venue:market_id``.
+
+    Default = a CANARY: a 1-contract fill-or-kill BUY YES at $0.01 that cannot match,
+    so it is KILLED immediately — proving the order path works while spending $0 and
+    taking NO position. ``--fill`` instead buys 1 contract at the current ask (REAL
+    money, REAL naked position you must close yourself)."""
+    from bot.models import Side
+
+    venue_name, _, market = spec.partition(":")
+    if not market:
+        print("usage: --test-order VENUE:MARKET_ID  (e.g. kalshi:KXSOMETICKER)")
+        return 2
+
+    async def _run() -> int:
+        venues = {v.name: v for v in _build_venues(settings)}
+        v = venues.get(venue_name)
+        if v is None:
+            print(f"unknown venue {venue_name!r}; known: {sorted(venues)}")
+            return 2
+        if not (getattr(v, "is_trading_configured", False) or getattr(v, "authenticated", False)):
+            print(f"{venue_name}: no trading credentials configured — cannot place orders")
+            return 1
+        try:
+            if do_fill:
+                q = await v.fetch_quote(RawMarket(market_id=market, title="", raw={}))
+                if q is None or q.yes_ask is None:
+                    print(f"{venue_name}:{market}: no ask available to fill against")
+                    return 1
+                price, label = q.yes_ask, "REAL FILL"
+                log.warning("placing a REAL 1-contract BUY YES @ %.2f on %s:%s — this is "
+                            "a live naked position you must close manually", price, venue_name, market)
+            else:
+                price, label = 0.01, "canary (no-fill)"
+            res = await v.place_order(market, Side.YES, "buy", price, 1)
+            print(f"{label}: {venue_name}:{market} -> {res}")
+            if do_fill:
+                if res.left_a_position:
+                    print("  ✅ buying works — order FILLED. Close this position manually.")
+                else:
+                    print("  order accepted but not filled (ask moved?); path works, no position.")
+            else:
+                if res.status.value == "KILLED" or not res.left_a_position:
+                    print("  ✅ order path works (accepted + processed); no fill, $0 spent.")
+                else:
+                    print("  ⚠️ canary unexpectedly filled (ask was $0.01?); you hold 1 contract.")
+            return 0
+        except Exception as exc:
+            print(f"  ❌ order path FAILED: {exc}")
+            return 1
+        finally:
+            aclose = getattr(v, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    return asyncio.run(_run())
+
+
 def check_llm(settings: Settings) -> int:
     """Probe the configured local LLM and print a diagnosis. Returns an exit code."""
     from bot.matching.llm_client import LocalLLMClient
@@ -714,6 +773,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--count-markets", action="store_true",
                    help="pull every open market from each venue, print the counts, "
                         "and exit (no matching)")
+    p.add_argument("--test-order", metavar="VENUE:MARKET", default=None,
+                   help="place ONE test order to verify the live buying path; default "
+                        "is a no-fill canary ($0 spent). Add --fill for a real buy.")
+    p.add_argument("--fill", action="store_true",
+                   help="with --test-order, actually buy 1 contract at the ask "
+                        "(REAL money, REAL position you must close manually)")
     p.add_argument("--show-rejected", action="store_true",
                    help="with --inspect-matches, also list rejected (non-match) pairs")
     p.add_argument("--tradeable-only", action="store_true",
@@ -764,6 +829,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.count_markets:
         raise SystemExit(count_markets(load_settings()))
+
+    if args.test_order:
+        raise SystemExit(test_order(load_settings(), args.test_order, do_fill=args.fill))
 
     threshold = args.match_threshold
     if threshold is None:
