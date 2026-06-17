@@ -66,6 +66,16 @@ def _metric_tag(t: str) -> str | None:
     return None
 
 
+# A scoreline like "2-1", "2 - 0", "3-2" — marks an exact-score market. 1-2 digits so
+# years ("2026") can't match. Encoded WITH its value so different scores also mismatch.
+_SCORELINE_RE = re.compile(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\b")
+
+
+def _scoreline_tag(t: str) -> str | None:
+    m = _SCORELINE_RE.search(t)
+    return f"score:{m.group(1)}-{m.group(2)}" if m else None
+
+
 def scope_tags(title: str) -> frozenset[str]:
     """The set of scope/metric qualifiers present in ``title`` (lowercased match)."""
     if not title:
@@ -75,6 +85,9 @@ def scope_tags(title: str) -> frozenset[str]:
     metric = _metric_tag(t)
     if metric:
         tags.add(metric)
+    scoreline = _scoreline_tag(t)
+    if scoreline:
+        tags.add(scoreline)
     return frozenset(tags)
 
 

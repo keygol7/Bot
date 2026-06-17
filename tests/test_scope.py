@@ -1,4 +1,4 @@
-from bot.matching.scope import scope_mismatch, scope_tags
+from bot.matching.scope import _scoreline_tag, scope_mismatch, scope_tags
 
 
 def test_second_half_vs_full_match_is_mismatch():
@@ -88,3 +88,33 @@ def test_fight_win_vs_win_by_submission_is_mismatch():
 
 def test_total_goals_metric_detected():
     assert "metric:goals" in scope_tags("Over 2.5 goals in the match?")
+
+
+def test_exact_set_score_vs_match_winner_is_mismatch():
+    # The live +43% false positive: Kalshi exact set score vs Polymarket match winner.
+    assert scope_mismatch(
+        "Will Brandon Nakashima win 2-1 in sets vs Buse? - Nakashima 2-1",
+        "Brandon Nakashima vs. Ignacio Buse - Brandon Nakashima",
+    )
+
+
+def test_same_scoreline_is_not_mismatch():
+    assert not scope_mismatch(
+        "Will the final score be Sweden wins 2-0? - Sweden wins 2-0",
+        "Will SWE vs TUN finish 2-0? - Yes",
+    )
+
+
+def test_different_scoreline_is_mismatch():
+    assert scope_mismatch("Will SWE vs TUN finish 2-0? - Yes",
+                          "Will SWE vs TUN finish 3-1? - Yes")
+
+
+def test_year_in_title_is_not_a_scoreline():
+    # 4-digit years must not be read as a scoreline.
+    assert _scoreline_tag("World Cup match in 2026") is None
+
+
+def test_scoreline_helper_imported():
+    from bot.matching.scope import _scoreline_tag as _s
+    assert _s("win 2-1 in sets") == "score:2-1"
