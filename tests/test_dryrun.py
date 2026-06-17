@@ -405,6 +405,31 @@ def test_test_order_unknown_venue(capsys, monkeypatch):
     assert "unknown venue" in capsys.readouterr().out
 
 
+def test_recheck_matches_reports_model_rejections(capsys, monkeypatch):
+    import bot.dryrun as dr
+    import bot.matching.llm_client as llm_client
+    from bot.dryrun import recheck_matches
+
+    s = Store(":memory:")
+    s.upsert_market("kalshi", "K1", "Will the final score be Draw 0-0? - Draw 0-0")
+    s.upsert_market("polymarket_us", "P1", "Will SCO vs MAR finish Draw 0-0? - Yes")
+    s.cache_verdict("kalshi", "K1", "polymarket_us", "P1", same_event=True, confidence=1.0)
+
+    monkeypatch.setattr(dr, "Store", lambda path: s)
+    # Current model + new prompt now correctly rejects the cross-match exact score.
+    monkeypatch.setattr(
+        llm_client, "make_complete_fn",
+        lambda cfg: (lambda prompt: '{"same_event": false, "confidence": 0.97, '
+                     '"rationale": "different match"}'),
+    )
+    rc = recheck_matches(Settings(), limit=50)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "WOULD DROP" in out
+    assert "would REJECT 1 of 1" in out
+    s.close()
+
+
 def test_check_ws_probe_collects_quotes():
     from bot.dryrun import _probe_stream
 

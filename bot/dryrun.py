@@ -680,6 +680,50 @@ def test_order(settings: Settings, spec: str, *, do_fill: bool = False) -> int:
     return asyncio.run(_run())
 
 
+def recheck_matches(settings: Settings, *, limit: int = 100) -> int:
+    """Re-judge the CURRENT tradeable set with the live prompt + model, WITHOUT writing
+    to the cache. A cheap way to test whether the prompt rewrite + your current model
+    are good enough before committing to a full re-seed.
+
+    Only the post-guard tradeable pairs are rechecked (a few hundred at most), so the
+    model is tested on exactly the subject/contest cases the deterministic guards can't
+    resolve. Prints which pairs the model would now reject (good if they were false
+    positives)."""
+    from bot.matching.llm_client import make_complete_fn
+
+    store = Store(settings.db_path)
+    complete_fn = make_complete_fn(settings.llm)
+    try:
+        def title_of(v: str, mid: str) -> str:
+            r = store.conn.execute(
+                "SELECT title FROM markets WHERE venue=? AND market_id=?", (v, mid)
+            ).fetchone()
+            return (r["title"] if r and r["title"] else mid)
+
+        pairs = store.confirmed_pairs()
+        sample = pairs[:limit]
+        print(f"rechecking {len(sample)} of {len(pairs)} tradeable pairs with model "
+              f"{settings.llm.reasoning_model!r} (no cache writes)...\n")
+        flips = 0
+        for (va, ma, vb, mb, _ek) in sample:
+            a = MarketQuote(venue=va, market_id=ma, title=title_of(va, ma))
+            b = MarketQuote(venue=vb, market_id=mb, title=title_of(vb, mb))
+            v = confirm_match(a, b, complete_fn)
+            if not (v.same_event and v.tradeable()):
+                flips += 1
+                print(f"  WOULD DROP (conf {v.confidence:.2f}): {a.title}")
+                print(f"                          || {b.title}")
+                if v.rationale:
+                    print(f"                          -> {v.rationale}")
+        kept = len(sample) - flips
+        print(f"\nresult: model KEEPS {kept}, would REJECT {flips} of {len(sample)}. "
+              f"Rejections are good if they were false positives; spot-check the KEEPS "
+              f"for any remaining wrong-subject/wrong-contest pairs.")
+        return 0
+    finally:
+        store.close()
+
+
 def check_llm(settings: Settings) -> int:
     """Probe the configured local LLM and print a diagnosis. Returns an exit code."""
     from bot.matching.llm_client import LocalLLMClient
@@ -791,6 +835,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--tradeable-only", action="store_true",
                    help="with --inspect-matches, list ONLY the post-filter set the "
                         "streamer will trade (confidence floor + fan-out guard)")
+    p.add_argument("--recheck-matches", action="store_true",
+                   help="re-judge the current tradeable set with the live prompt+model "
+                        "(no cache writes); test the matcher before a full re-seed")
     p.add_argument("--once", action="store_true", help="run a single cycle and exit")
     p.add_argument("--interval", type=float, default=15.0, help="seconds between cycles")
     p.add_argument("--limit", type=int, default=50,
@@ -836,6 +883,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.count_markets:
         raise SystemExit(count_markets(load_settings()))
+
+    if args.recheck_matches:
+        raise SystemExit(recheck_matches(load_settings(), limit=args.limit))
 
     if args.test_order:
         raise SystemExit(test_order(load_settings(), args.test_order, do_fill=args.fill))
