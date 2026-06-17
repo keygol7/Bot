@@ -184,3 +184,35 @@ class StreamingEngine:
                 log.warning("WS health: %s — NO quotes this interval from %s", counts, dead)
             else:
                 log.info("WS health: %s quotes this interval", counts)
+            self.log_edge_snapshot()
+
+    def edge_snapshot(self, top: int = 5) -> list[tuple]:
+        """Current best edge per pair, computed from the live WS book.
+
+        Returns ``[(edge, pair, yes_quote, no_quote, size), ...]`` sorted best-first,
+        only for pairs that have a two-sided quote (both legs present in the book).
+        This is proof that WS prices are matched to the right events: an entry can only
+        exist if both of a pair's markets have a current quote in the livebook."""
+        rows = []
+        for p in self._pairs.values():
+            ev = self._best_direction(p)
+            if ev is None:
+                continue
+            edge, yq, nq, size = ev
+            rows.append((edge, p, yq, nq, size))
+        rows.sort(key=lambda r: r[0], reverse=True)
+        return rows[:top]
+
+    def log_edge_snapshot(self, top: int = 5) -> None:
+        snap = self.edge_snapshot(top)
+        priced = sum(1 for p in self._pairs.values() if self._best_direction(p) is not None)
+        if not snap:
+            log.info("edge snapshot: 0/%d pairs have two-sided WS quotes yet "
+                     "(book still warming up?)", len(self._pairs))
+            return
+        log.info("edge snapshot (live WS book): %d/%d pairs two-sided, top %d:",
+                 priced, len(self._pairs), len(snap))
+        for edge, p, yq, nq, size in snap:
+            log.info("  %s | %s yes=%.2f + %s no=%.2f = %.2f | edge=%+.3f sz=%g",
+                     p.event_key, yq.venue, yq.yes_ask, nq.venue, nq.no_ask,
+                     yq.yes_ask + nq.no_ask, edge, size)

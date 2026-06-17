@@ -115,6 +115,29 @@ def test_run_consumes_streams_and_stops(monkeypatch):
     assert len(fe.calls) >= 1
 
 
+def test_edge_snapshot_only_includes_two_sided_pairs(caplog):
+    import logging
+    # The snapshot proves WS prices are matched to events: a pair appears only when
+    # BOTH legs have a live quote in the book.
+    eng = make_engine(FakeExec())
+    eng.set_pairs([
+        ConfirmedPair("E1", "kalshi", "K1", "poly", "P1"),
+        ConfirmedPair("E2", "kalshi", "K2", "poly", "P2"),
+    ])
+    # Only E1 gets both legs; E2 gets one leg -> excluded from the snapshot.
+    asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)))
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)))
+    asyncio.run(eng.on_quote(q("kalshi", "K2", yes_ask=0.50, ya=100, no_ask=0.55, na=100)))
+
+    snap = eng.edge_snapshot()
+    assert [r[1].event_key for r in snap] == ["E1"]      # only the two-sided pair
+    edge, p, yq, nq, size = snap[0]
+    assert round(yq.yes_ask + nq.no_ask, 2) == 0.95 and round(edge, 2) == 0.05
+    with caplog.at_level(logging.INFO, logger="bot.streaming"):
+        eng.log_edge_snapshot()
+    assert "1/2 pairs two-sided" in caplog.text
+
+
 def test_consume_counts_ws_quotes_for_health():
     # The WS-health heartbeat: _consume must count each tick per venue so the run
     # loop can report whether a venue's WebSocket is actually delivering data.
