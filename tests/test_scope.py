@@ -159,6 +159,33 @@ def test_market_type_whitelist():
     assert ok("Will Portugal win against Congo DR in the World Cup match? - Portugal")
 
 
+def test_threshold_mismatch_is_mismatch():
+    # Same player, same metric, DIFFERENT count -> different market.
+    assert scope_mismatch(
+        "Lyle Foster: 1+ assists? - Lyle Foster: 1+",
+        "Will Lyle Foster record at least 2 assists in CZE vs RSA? - Yes",
+    )
+    # "score or assist" (=1) vs "at least 3 goals+assists".
+    assert scope_mismatch(
+        "Patrik Schick: score or assist? - Patrik Schick",
+        "Will Patrik Schick record at least 3 goals+assists in CZE vs RSA? - Yes",
+    )
+
+
+def test_same_threshold_is_not_mismatch():
+    assert not scope_mismatch(
+        "Cyle Larin: 2+ assists? - Cyle Larin: 2+",
+        "Will Cyle Larin record at least 2 assists in CAN vs QAT? - Yes",
+    )
+
+
+def test_win_fight_vs_win_in_round_is_mismatch():
+    assert scope_mismatch(
+        "Will Ion Cutelaba win the fight? - Ion Cutelaba",
+        "Will Ion Cutelaba win in Round 3? - Yes",
+    )
+
+
 def test_kalshi_series_allowlist():
     from bot.matching.scope import is_allowed_kalshi_series as ok
 

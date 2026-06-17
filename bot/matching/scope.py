@@ -54,6 +54,9 @@ _SCOPE_PATTERNS: dict[str, str] = {
     "futures": r"\bundefeated\b|\btop\s+scorer\b|\bgolden\s+boot\b|\bgroup\s+winner\b|"
                r"\bwin\s+the\s+group\b|\bto\s+reach\s+the\b|"
                r"\bto\s+win\s+the\s+(world\s+cup|tournament|title|trophy|cup)\b",
+    # round-specific fight market ("win in Round 3") — NOT "win the fight".
+    "round": r"\bin\s+round\s+\d\b|\bround\s+of\s+victory\b|\bby\s+round\s+\d\b|"
+             r"\bwins?\s+in\s+round\b",
 }
 
 # The stat a player-prop market resolves on. Mutually exclusive, checked in order so
@@ -86,6 +89,15 @@ def _scoreline_tag(t: str) -> str | None:
     return f"score:{m.group(1)}-{m.group(2)}" if m else None
 
 
+def _threshold_tag(t: str) -> str | None:
+    """The required count for a player prop: "2+ goals"/"at least 2"/"3+" -> thr:2/3;
+    "score or assist" implies thr:1. Distinguishes "1+ assists" from "2+ assists"."""
+    if re.search(r"\bscore\s+or\s+assist\b", t):
+        return "thr:1"
+    m = re.search(r"\b(\d+)\s*\+", t) or re.search(r"\bat\s+least\s+(\d+)\b", t)
+    return f"thr:{int(m.group(1))}" if m else None
+
+
 def scope_tags(title: str) -> frozenset[str]:
     """The set of scope/metric qualifiers present in ``title`` (lowercased match)."""
     if not title:
@@ -98,6 +110,9 @@ def scope_tags(title: str) -> frozenset[str]:
     scoreline = _scoreline_tag(t)
     if scoreline:
         tags.add(scoreline)
+    threshold = _threshold_tag(t)
+    if threshold:
+        tags.add(threshold)
     return frozenset(tags)
 
 
@@ -116,7 +131,7 @@ def scope_mismatch(title_a: str, title_b: str) -> bool:
 _EXOTIC_SCOPE = frozenset({
     "first_half", "second_half", "halftime", "first_period", "advance", "extra_time",
     "penalties", "regulation", "clean_sheet", "both_score", "exact_score", "to_nil",
-    "handicap", "set_winner", "margin", "distance", "futures",
+    "handicap", "set_winner", "margin", "distance", "futures", "round",
 })
 # A market resolving on a clear winner/draw outcome (vs a novelty like "what will the
 # announcers say", which matches none of these and is therefore excluded).
