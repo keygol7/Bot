@@ -15,6 +15,13 @@ from bot.strategies.arbitrage import ArbOpportunity
 log = logging.getLogger("bot.streaming")
 
 
+def _fmt_q(q) -> str:
+    """Compact yes_ask/no_ask + sizes for a quote, for diagnostic logs."""
+    if q is None:
+        return "None"
+    return (f"yes={q.yes_ask}@{q.yes_ask_size:g} no={q.no_ask}@{q.no_ask_size:g}")
+
+
 @dataclass(frozen=True)
 class ConfirmedPair:
     """A same-event pair confirmed by the slow matcher. Direction is decided live."""
@@ -124,7 +131,13 @@ class StreamingEngine:
         except Exception as exc:
             log.warning("depth fetch failed for %s: %s", p.event_key, exc)
             return None
-        return self._eval_direction(da, db)
+        ev = self._eval_direction(da, db)
+        if ev is None:
+            # A leg had no usable two-sided quote (illiquid / one-sided book). Show
+            # what came back so a "price edge but never trades" pair is explainable.
+            log.info("STREAM %s: depth not two-sided — %s=%s %s=%s",
+                     p.event_key, p.venue_a, _fmt_q(da), p.venue_b, _fmt_q(db))
+        return ev
 
     def _build_opp(self, p, edge, yq, nq, size) -> ArbOpportunity:
         gross = yq.yes_ask + nq.no_ask
@@ -156,6 +169,7 @@ class StreamingEngine:
             if self.clock() - self._last_acted.get(key, -1e9) < self.cooldown:
                 continue
             self._last_acted[key] = self.clock()  # cooldown set now to avoid REST storms
+            log.info("STREAM %s: WS price edge %.4f -> confirming real depth", p.event_key, edge)
             # WS ticker has no depth (size 0): confirm real size + fresh price via a
             # REST order-book fetch before firing. Only when the live book already
             # shows tradeable size do we skip the extra hop.
