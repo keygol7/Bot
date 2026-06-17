@@ -465,16 +465,18 @@ def test_recheck_matches_reports_model_rejections(capsys, monkeypatch):
     from bot.dryrun import recheck_matches
 
     s = Store(":memory:")
-    s.upsert_market("kalshi", "K1", "Will the final score be Draw 0-0? - Draw 0-0")
-    s.upsert_market("polymarket_us", "P1", "Will SCO vs MAR finish Draw 0-0? - Yes")
+    # Safe winner-type pair (passes the whitelist) that the model now rejects on the
+    # subject (opposite teams) — the kind of catch recheck is meant to surface.
+    s.upsert_market("kalshi", "K1", "Will Haiti win against Brazil? - Haiti")
+    s.upsert_market("polymarket_us", "P1", "Will Brazil win against Haiti? - Brazil")
     s.cache_verdict("kalshi", "K1", "polymarket_us", "P1", same_event=True, confidence=1.0)
 
     monkeypatch.setattr(dr, "Store", lambda path: s)
-    # Current model + new prompt now correctly rejects the cross-match exact score.
+    # Model now correctly rejects (YES pays for different teams).
     monkeypatch.setattr(
         llm_client, "make_complete_fn",
         lambda cfg: (lambda prompt: '{"same_event": false, "confidence": 0.97, '
-                     '"rationale": "different match"}'),
+                     '"rationale": "different teams"}'),
     )
     rc = recheck_matches(Settings(), limit=50)
     out = capsys.readouterr().out

@@ -16,7 +16,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 
-from bot.matching.scope import scope_mismatch
+from bot.matching.scope import is_tradeable_market_type, scope_mismatch
 
 
 def drop_fanout_pairs(pairs: list[tuple], max_fanout: int = 1) -> list[tuple]:
@@ -233,12 +233,12 @@ class Store:
 
     def confirmed_pairs(
         self, min_confidence: float = 0.85, max_fanout: Optional[int] = 1,
-        drop_scope_mismatch: bool = True,
+        drop_scope_mismatch: bool = True, safe_types_only: bool = True,
     ) -> list[tuple]:
         """Cached tradeable pairs: (venue_a, market_a, venue_b, market_b, event_key).
 
         The durable source of truth for the streaming watchlist — independent of
-        per-cycle embedding/LLM variance. Three gates are applied:
+        per-cycle embedding/LLM variance. Four gates are applied:
 
         1. The SAME confidence gate as ``MatchVerdict.tradeable`` (confirmed same-event
            AND ``confidence >= min_confidence``). Without it the streamer would trade
@@ -246,7 +246,12 @@ class Store:
         2. A scope/period gate (``drop_scope_mismatch``): drop pairs whose titles
            resolve on different scopes ("win 2nd half" vs "win the match"). Cleans
            existing cache entries the LLM rubber-stamped, with no re-seed needed.
-        3. A fan-out gate (``max_fanout``): drop multi-outcome cross-products where a
+        3. A market-type whitelist (``safe_types_only``): keep only the types the
+           matcher handles reliably (moneyline/draw winners, same-metric player props,
+           fight method-of-victory). Excludes halves, spreads, set winners, exact
+           scores, go-the-distance, announcer novelties, etc. — the classes that have
+           produced false positives.
+        4. A fan-out gate (``max_fanout``): drop multi-outcome cross-products where a
            market maps to many counterparties (see :func:`drop_fanout_pairs`). Pass
            ``None`` to disable.
         """
@@ -261,7 +266,12 @@ class Store:
         ).fetchall()
         pairs = []
         for r in rows:
-            if drop_scope_mismatch and scope_mismatch(r["title_a"] or "", r["title_b"] or ""):
+            ta, tb = r["title_a"] or "", r["title_b"] or ""
+            if drop_scope_mismatch and scope_mismatch(ta, tb):
+                continue
+            if safe_types_only and not (
+                is_tradeable_market_type(ta) and is_tradeable_market_type(tb)
+            ):
                 continue
             pairs.append(
                 (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], r["event_key"])

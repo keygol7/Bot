@@ -150,6 +150,39 @@ class StreamingEngine:
             max_contracts=size, total_fees=0.0, total_profit=edge * size, notional=gross * size,
         )
 
+    async def _act_on_pair(self, key):
+        """Edge-check one confirmed pair from the live book; execute if it clears the
+        threshold, cooldown, and a depth re-validation. Returns a report or None."""
+        p = self._pairs.get(key)
+        if p is None:
+            return None
+        ev = self._best_direction(p)
+        if ev is None:
+            return None
+        edge, yq, nq, size = ev
+        if edge <= self.min_edge:                # price-edge gate (size checked below)
+            return None
+        if self.clock() - self._last_acted.get(key, -1e9) < self.cooldown:
+            return None
+        self._last_acted[key] = self.clock()      # cooldown set now to avoid REST storms
+        log.info("STREAM %s: price edge %.4f -> confirming real depth", p.event_key, edge)
+        # WS ticker has no depth (size 0): confirm real size + fresh price via a REST
+        # order-book fetch before firing. Skip the hop only if the book already shows size.
+        if size < 1 and self.depth_fetch is not None:
+            ev = await self._confirm_depth(p)
+            if ev is None:
+                return None
+            edge, yq, nq, size = ev
+        if edge <= self.min_edge or size < 1:
+            log.info("STREAM edge gone after depth check on %s (edge %.4f sz %g)",
+                     p.event_key, edge, size)
+            return None
+        opp = self._build_opp(p, edge, yq, nq, size)
+        log.info("STREAM edge %.4f sz %g on %s -> executing", edge, size, p.event_key)
+        report = await self.executor.execute(opp)
+        log.info("STREAM exec %s | %s", p.event_key, report)
+        return report
+
     async def on_quote(self, q: MarketQuote):
         """Process one live quote: update the book, then act on any pair it touches.
 
@@ -159,34 +192,31 @@ class StreamingEngine:
         self.livebook.update(q)
         report = None
         for key in self._index.get((q.venue, q.market_id), ()):
-            p = self._pairs[key]
-            ev = self._best_direction(p)
-            if ev is None:
-                continue
-            edge, yq, nq, size = ev
-            if edge <= self.min_edge:            # price-edge gate (size checked below)
-                continue
-            if self.clock() - self._last_acted.get(key, -1e9) < self.cooldown:
-                continue
-            self._last_acted[key] = self.clock()  # cooldown set now to avoid REST storms
-            log.info("STREAM %s: WS price edge %.4f -> confirming real depth", p.event_key, edge)
-            # WS ticker has no depth (size 0): confirm real size + fresh price via a
-            # REST order-book fetch before firing. Only when the live book already
-            # shows tradeable size do we skip the extra hop.
-            if size < 1 and self.depth_fetch is not None:
-                ev = await self._confirm_depth(p)
-                if ev is None:
-                    continue
-                edge, yq, nq, size = ev
-            if edge <= self.min_edge or size < 1:
-                log.info("STREAM edge gone after depth check on %s (edge %.4f sz %g)",
-                         p.event_key, edge, size)
-                continue
-            opp = self._build_opp(p, edge, yq, nq, size)
-            log.info("STREAM edge %.4f sz %g on %s -> executing", edge, size, p.event_key)
-            report = await self.executor.execute(opp)
-            log.info("STREAM exec %s | %s", p.event_key, report)
+            r = await self._act_on_pair(key)
+            if r is not None:
+                report = r
         return report
+
+    async def prime_and_sweep(self):
+        """Seed the live book with a REST snapshot of every watchlist market, then
+        edge-check every pair once. Closes the gap where a venue's WS (Kalshi ticker)
+        only emits on price *change*, so a stable-priced leg would otherwise never
+        enter the book — leaving real edges undetected until the price happened to move.
+        """
+        if self.depth_fetch is None:
+            return
+        primed = 0
+        for (venue, market) in list(self._index):
+            try:
+                q = await self.depth_fetch(venue, market)
+            except Exception:
+                continue
+            if q is not None:
+                self.livebook.update(q)
+                primed += 1
+        log.info("primed live book with %d/%d market snapshots", primed, len(self._index))
+        for key in list(self._pairs):
+            await self._act_on_pair(key)
 
     async def _consume(self, venue) -> None:
         mids = self.market_ids.get(venue.name) or None
@@ -218,6 +248,9 @@ class StreamingEngine:
             log.info("streaming %d confirmed pairs across %d venues",
                      len(self._pairs), len(self.market_ids))
             self._ws_counts = {}
+            # Seed the book with REST snapshots so a quiet (non-ticking) leg doesn't
+            # leave pairs blind, and catch any edge already present at refresh time.
+            await self.prime_and_sweep()
             consumers = [asyncio.create_task(self._consume(v)) for v in venues]
             try:
                 await asyncio.sleep(refresh_interval)

@@ -75,7 +75,7 @@ def test_confirmed_pairs_returns_only_same_event():
     s = Store(":memory:")
     s.cache_verdict("kalshi", "K1", "polymarket_us", "P1", same_event=True, confidence=0.95, event_key="E1")
     s.cache_verdict("kalshi", "K2", "polymarket_us", "P2", same_event=False, confidence=0.1)
-    pairs = s.confirmed_pairs()
+    pairs = s.confirmed_pairs(safe_types_only=False)
     assert len(pairs) == 1
     va, ma, vb, mb, ek = pairs[0]
     assert {(va, ma), (vb, mb)} == {("kalshi", "K1"), ("polymarket_us", "P1")}
@@ -89,9 +89,9 @@ def test_confirmed_pairs_applies_confidence_floor():
     s = Store(":memory:")
     s.cache_verdict("kalshi", "K1", "polymarket_us", "P1", same_event=True, confidence=0.95)
     s.cache_verdict("kalshi", "K2", "polymarket_us", "P2", same_event=True, confidence=0.60)
-    pairs = s.confirmed_pairs()                       # default floor 0.85
+    pairs = s.confirmed_pairs(safe_types_only=False)  # default floor 0.85
     assert {(p[0], p[1]) for p in pairs} == {("kalshi", "K1")}
-    assert len(s.confirmed_pairs(min_confidence=0.5)) == 2   # floor can be relaxed
+    assert len(s.confirmed_pairs(min_confidence=0.5, safe_types_only=False)) == 2  # floor relaxed
     s.close()
 
 
@@ -106,12 +106,12 @@ def test_confirmed_pairs_drops_fanout_clusters():
     # Clean 1:1 pair elsewhere.
     s.cache_verdict("kalshi", "Ksolo", "polymarket_us", "Psolo", same_event=True, confidence=1.0)
 
-    pairs = s.confirmed_pairs()                       # default max_fanout=1
+    pairs = s.confirmed_pairs(safe_types_only=False)  # default max_fanout=1
     assert {(p[0], p[1], p[2], p[3]) for p in pairs} == {
         ("kalshi", "Ksolo", "polymarket_us", "Psolo")
     }
     # Disabling the fan-out gate keeps everything (4 pairs).
-    assert len(s.confirmed_pairs(max_fanout=None)) == 4
+    assert len(s.confirmed_pairs(max_fanout=None, safe_types_only=False)) == 4
     s.close()
 
 
@@ -127,10 +127,27 @@ def test_confirmed_pairs_drops_scope_mismatch():
     s.upsert_market("polymarket_us", "P2", "Will France win against Iraq? - France")
     s.cache_verdict("kalshi", "K2", "polymarket_us", "P2", same_event=True, confidence=1.0)
 
-    pairs = s.confirmed_pairs()
+    pairs = s.confirmed_pairs(safe_types_only=False)
     assert {(p[0], p[1]) for p in pairs} == {("kalshi", "K2")}
     # The gate can be disabled.
-    assert len(s.confirmed_pairs(drop_scope_mismatch=False)) == 2
+    assert len(s.confirmed_pairs(drop_scope_mismatch=False, safe_types_only=False)) == 2
+    s.close()
+
+
+def test_confirmed_pairs_safe_types_only():
+    # A novelty market (announcer mention) must be excluded by the whitelist even
+    # though it's same_event=1 and 1:1; a plain winner pair survives.
+    s = Store(":memory:")
+    s.upsert_market("kalshi", "Km", "What will the announcers say during Brazil vs Haiti? - LFF")
+    s.upsert_market("polymarket_us", "Pm", "Will Haiti win against Brazil? - Haiti")
+    s.cache_verdict("kalshi", "Km", "polymarket_us", "Pm", same_event=True, confidence=1.0)
+    s.upsert_market("kalshi", "Kw", "Will Haiti win against Brazil? - Haiti")
+    s.upsert_market("polymarket_us", "Pw", "Who will win Brazil vs Haiti? - Haiti")
+    s.cache_verdict("kalshi", "Kw", "polymarket_us", "Pw", same_event=True, confidence=1.0)
+
+    pairs = s.confirmed_pairs()                      # safe_types_only=True default
+    assert {(p[0], p[1]) for p in pairs} == {("kalshi", "Kw")}
+    assert len(s.confirmed_pairs(safe_types_only=False)) == 2   # gate can be relaxed
     s.close()
 
 

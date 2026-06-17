@@ -180,6 +180,27 @@ def test_depth_fetch_says_edge_gone_no_execute():
     assert fe.calls == []                            # depth fetch vetoed the stale edge
 
 
+def test_prime_and_sweep_seeds_book_and_executes():
+    # Neither leg has ticked over WS, but a REST snapshot prime should populate both
+    # legs and fire the edge — closing the quiet-leg gap.
+    fe = FakeExec()
+    deep = {
+        ("kalshi", "K1"): q("kalshi", "K1", yes_ask=0.40, ya=50, no_ask=0.65, na=50),
+        ("poly", "P1"): q("poly", "P1", yes_ask=0.62, ya=50, no_ask=0.55, na=50),
+    }
+
+    async def depth_fetch(venue, mid):
+        return deep.get((venue, mid))
+
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, depth_fetch=depth_fetch,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    asyncio.run(eng.prime_and_sweep())               # no WS quotes were fed at all
+    assert len(fe.calls) == 1                          # edge found purely from the prime
+
+
 def test_consume_counts_ws_quotes_for_health():
     # The WS-health heartbeat: _consume must count each tick per venue so the run
     # loop can report whether a venue's WebSocket is actually delivering data.

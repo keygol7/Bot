@@ -133,3 +133,22 @@ def test_win_fight_vs_go_the_distance_is_mismatch():
         "Will Melsik Baghdasaryan win the fight? - Melsik Baghdasaryan",
         "Will the fight go the distance in Melsik Baghdasaryan vs Murtazali Magomedov - Yes",
     )
+
+
+def test_market_type_whitelist():
+    from bot.matching.scope import is_tradeable_market_type as ok
+
+    # Allowed: moneyline/draw winners, player props, fight method.
+    assert ok("Will Haiti win against Brazil in the World Cup match? - Haiti")
+    assert ok("Who will win in the upcoming esports event Spirit vs G2? - Spirit")
+    assert ok("Cyle Larin: 2+ assists? - Cyle Larin: 2+")
+    assert ok("Will Ciryl Gane win by KO/TKO/DQ? - Ciryl Gane by KO/TKO/DQ")
+    assert ok("Will the fight end in a draw or no contest? - Draw/No Contest")
+
+    # Excluded: novelty, halves, spread/margin, set, exact score, go-the-distance.
+    assert not ok("What will the announcers say during Brazil vs Haiti? - Lincoln Financial Field")
+    assert not ok("Will England win the 2nd Half? - England")
+    assert not ok("Mexico wins by over 1.5 goals in the 1st Half? - Mexico")
+    assert not ok("Will Suzan Lamens win set 2? - Suzan Lamens")
+    assert not ok("Will the final score be Sweden wins 2-0? - Sweden wins 2-0")
+    assert not ok("Will the fight go the distance? - Yes")

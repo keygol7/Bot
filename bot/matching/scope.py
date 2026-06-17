@@ -104,3 +104,37 @@ def scope_mismatch(title_a: str, title_b: str) -> bool:
     "goals+assists" or "by submission", the other plain — is rejected.
     """
     return scope_tags(title_a) != scope_tags(title_b)
+
+
+# Scope tags that mark an "exotic" market the matcher has repeatedly mishandled. Even
+# when both sides agree, we exclude these from the safe tradeable set by default.
+_EXOTIC_SCOPE = frozenset({
+    "first_half", "second_half", "halftime", "first_period", "advance", "extra_time",
+    "penalties", "regulation", "clean_sheet", "both_score", "exact_score", "to_nil",
+    "handicap", "set_winner", "margin", "distance",
+})
+# A market resolving on a clear winner/draw outcome (vs a novelty like "what will the
+# announcers say", which matches none of these and is therefore excluded).
+_WINNER_RE = re.compile(
+    r"\bwins?\b|\bbeat\b|\bdefeat|\bwinner\b|who will win|\bto win\b|\bdraw\b|\bno contest\b"
+)
+
+
+def is_tradeable_market_type(title: str) -> bool:
+    """Whitelist of market types the matcher handles reliably: plain moneyline
+    winners (incl. draw/no-contest), same-metric player props (goals/assists/points/
+    saves/shots), and fight method-of-victory. Everything else — halves, spreads/
+    margins, set winners, exact scores, go-the-distance, announcer novelties, etc. —
+    is excluded. This is a positive allowlist: an unrecognized type fails by default.
+    """
+    if not title:
+        return False
+    tags = scope_tags(title)
+    if any(t in _EXOTIC_SCOPE for t in tags) or any(t.startswith("score:") for t in tags):
+        return False
+    if any(t.startswith("metric:") for t in tags):
+        return True  # player prop with a stat metric (goals/assists/points/...)
+    if any(t in {"method_ko", "method_sub", "method_decision"} for t in tags):
+        return True  # fight method-of-victory (validated as reliable)
+    return bool(_WINNER_RE.search(title.lower()))  # plain winner; novelties fail this
+
