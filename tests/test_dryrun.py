@@ -443,6 +443,29 @@ def test_recheck_matches_reports_model_rejections(capsys, monkeypatch):
     s.close()
 
 
+def test_show_watchlist_prints_live_pairs(capsys, monkeypatch):
+    import bot.dryrun as dr
+    from bot.dryrun import show_watchlist
+
+    s = Store(":memory:")
+    s.upsert_market("kalshi", "K1", "Gane by KO")
+    s.upsert_market("polymarket_us", "P1", "Gane by KO")
+    s.cache_verdict("kalshi", "K1", "polymarket_us", "P1", same_event=True, confidence=1.0)
+
+    ka = mq("kalshi", "K1", "Gane by KO", yes_ask=0.4, no_ask=0.6)
+    pa = mq("polymarket_us", "P1", "Gane by KO", yes_ask=0.62, no_ask=0.55)
+    venues = [StubVenue("kalshi", {"K1": ka}), StubVenue("polymarket_us", {"P1": pa})]
+    monkeypatch.setattr(dr, "_build_venues", lambda s: venues)
+    monkeypatch.setattr(dr, "Store", lambda path: s)
+
+    rc = show_watchlist(Settings())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "1 live watchlist pairs" in out
+    assert "Gane by KO" in out
+    s.close()
+
+
 def test_check_ws_probe_collects_quotes():
     from bot.dryrun import _probe_stream
 

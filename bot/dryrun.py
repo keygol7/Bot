@@ -639,6 +639,42 @@ def count_markets(settings: Settings, *, limit: int = 50000) -> int:
     return asyncio.run(_run())
 
 
+def show_watchlist(settings: Settings, *, limit: int = 500) -> int:
+    """Print the LIVE streaming watchlist: cached tradeable pairs whose both legs are
+    currently quotable. Probes each leg the way the streamer does (drops settled/empty
+    books), so this is exactly what would be traded right now — not just the cache."""
+    store = Store(settings.db_path)
+    venues = _build_venues(settings)
+
+    async def _run() -> int:
+        try:
+            cached = store.confirmed_pairs()
+            # No wide scan needed: build_watchlist probes each cached leg directly.
+            live = await build_watchlist(cached, set(), venues)
+
+            def title_of(v: str, mid: str) -> str:
+                r = store.conn.execute(
+                    "SELECT title FROM markets WHERE venue=? AND market_id=?", (v, mid)
+                ).fetchone()
+                return (r["title"] if r and r["title"] else mid)
+
+            print(f"{len(live)} live watchlist pairs (of {len(cached)} cached tradeable):\n")
+            for p in live[:limit]:
+                print(f"  • [{p.venue_a}] {p.market_a}  {title_of(p.venue_a, p.market_a)}")
+                print(f"    [{p.venue_b}] {p.market_b}  {title_of(p.venue_b, p.market_b)}")
+            if len(live) > limit:
+                print(f"\n  … {len(live) - limit} more (raise --limit)")
+            return 0
+        finally:
+            for v in venues:
+                aclose = getattr(v, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+            store.close()
+
+    return asyncio.run(_run())
+
+
 def test_order(settings: Settings, spec: str, *, do_fill: bool = False) -> int:
     """Place ONE test order to verify the live buying path (auth, signing, submission,
     response parsing) on a real venue. ``spec`` is ``venue:market_id``.
@@ -856,6 +892,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--recheck-matches", action="store_true",
                    help="re-judge the current tradeable set with the live prompt+model "
                         "(no cache writes); test the matcher before a full re-seed")
+    p.add_argument("--watchlist", action="store_true",
+                   help="print the LIVE streaming watchlist (cached pairs whose both "
+                        "legs are quotable right now) and exit")
     p.add_argument("--once", action="store_true", help="run a single cycle and exit")
     p.add_argument("--interval", type=float, default=15.0, help="seconds between cycles")
     p.add_argument("--limit", type=int, default=50,
@@ -904,6 +943,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.recheck_matches:
         raise SystemExit(recheck_matches(load_settings(), limit=args.limit))
+
+    if args.watchlist:
+        raise SystemExit(show_watchlist(load_settings()))
 
     if args.test_order:
         raise SystemExit(test_order(load_settings(), args.test_order, do_fill=args.fill))
