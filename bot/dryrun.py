@@ -409,8 +409,13 @@ async def build_watchlist(cached, scanned, venues):
         except Exception as exc:
             log.info("watchlist probe %s:%s not live (%s)", vn, mid, exc)
             continue
-        if q is not None:
+        # A settled/closed market still returns a quote, but with an empty book (no
+        # asks). Treat "no usable ask" as not-live so dead markets drop off the
+        # watchlist instead of being re-fetched on every stale ticker tick.
+        if q is not None and (q.yes_ask is not None or q.no_ask is not None):
             live.add((vn, mid))
+        elif q is not None:
+            log.info("watchlist drop %s:%s — empty book (settled/closed)", vn, mid)
 
     out = []
     missing_a = missing_b = 0  # legs of cached pairs still not live after probing
