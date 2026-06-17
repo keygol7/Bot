@@ -134,7 +134,7 @@ def test_edge_snapshot_only_includes_two_sided_pairs(caplog):
     edge, p, yq, nq, size = snap[0]
     assert round(yq.yes_ask + nq.no_ask, 2) == 0.95 and round(edge, 2) == 0.05
     with caplog.at_level(logging.INFO, logger="bot.streaming"):
-        eng.log_edge_snapshot()
+        asyncio.run(eng.log_edge_snapshot())   # no depth_fetch -> uses live-book values
     assert "1/2 pairs two-sided" in caplog.text
 
 

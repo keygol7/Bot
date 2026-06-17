@@ -266,7 +266,7 @@ class StreamingEngine:
                 log.warning("WS health: %s — NO quotes this interval from %s", counts, dead)
             else:
                 log.info("WS health: %s quotes this interval", counts)
-            self.log_edge_snapshot()
+            await self.log_edge_snapshot()
 
     def edge_snapshot(self, top: int = 5) -> list[tuple]:
         """Current best edge per pair, computed from the live WS book.
@@ -285,16 +285,23 @@ class StreamingEngine:
         rows.sort(key=lambda r: r[0], reverse=True)
         return rows[:top]
 
-    def log_edge_snapshot(self, top: int = 5) -> None:
+    async def log_edge_snapshot(self, top: int = 5) -> None:
         snap = self.edge_snapshot(top)
         priced = sum(1 for p in self._pairs.values() if self._best_direction(p) is not None)
         if not snap:
             log.info("edge snapshot: 0/%d pairs have two-sided WS quotes yet "
                      "(book still warming up?)", len(self._pairs))
             return
-        log.info("edge snapshot (live WS book): %d/%d pairs two-sided, top %d:",
-                 priced, len(self._pairs), len(snap))
+        # The live WS book has no Kalshi size (ticker is sizeless), so re-fetch the real
+        # order book for the shown rows — the displayed price/size/edge then reflect
+        # actual depth, not the sizeless WS quote. (Bounded: only the top rows.)
+        rows = []
         for edge, p, yq, nq, size in snap:
-            log.info("  %s | %s yes=%.2f + %s no=%.2f = %.2f | edge=%+.3f sz=%g",
-                     p.event_key, yq.venue, yq.yes_ask, nq.venue, nq.no_ask,
+            ev = await self._confirm_depth(p)
+            rows.append(ev if ev is not None else (edge, yq, nq, size))
+        log.info("edge snapshot (real book): %d/%d pairs two-sided, top %d:",
+                 priced, len(self._pairs), len(snap))
+        for edge, yq, nq, size in rows:
+            log.info("  %s yes=%.2f + %s no=%.2f = %.2f | edge=%+.3f sz=%g",
+                     yq.venue, yq.yes_ask, nq.venue, nq.no_ask,
                      yq.yes_ask + nq.no_ask, edge, size)
