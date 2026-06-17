@@ -56,6 +56,7 @@ class StreamingEngine:
         cooldown: float = 5.0,
         livebook: LiveBook | None = None,
         clock=time.monotonic,
+        depth_fetch=None,
     ) -> None:
         self.executor = executor
         self.fee_models = fee_models or {}
@@ -63,6 +64,10 @@ class StreamingEngine:
         self.cooldown = cooldown
         self.livebook = livebook or LiveBook()
         self.clock = clock
+        # Async callable depth_fetch(venue, market_id) -> sized MarketQuote | None.
+        # WS ticker feeds carry no size (Kalshi), so before firing on a price edge we
+        # re-fetch real order-book depth (which also re-validates the price).
+        self.depth_fetch = depth_fetch
         self._pairs: dict[tuple, ConfirmedPair] = {}
         self._index: dict[tuple[str, str], set] = {}   # (venue,market) -> set of pair keys
         self._last_acted: dict[tuple, float] = {}
@@ -86,10 +91,8 @@ class StreamingEngine:
             out.setdefault(venue, []).append(market)
         return out
 
-    def _best_direction(self, p: ConfirmedPair):
+    def _eval_direction(self, a: MarketQuote | None, b: MarketQuote | None):
         """Best (edge, yes_quote, no_quote, size) over both arb directions, or None."""
-        a = self.livebook.get(p.venue_a, p.market_a)
-        b = self.livebook.get(p.venue_b, p.market_b)
         if a is None or b is None:
             return None
         best = None
@@ -102,6 +105,26 @@ class StreamingEngine:
             if best is None or edge > best[0]:
                 best = (edge, yq, nq, size)
         return best
+
+    def _best_direction(self, p: ConfirmedPair):
+        """Best arb direction from the live WS book (prices; sizes may be 0)."""
+        return self._eval_direction(
+            self.livebook.get(p.venue_a, p.market_a),
+            self.livebook.get(p.venue_b, p.market_b),
+        )
+
+    async def _confirm_depth(self, p: ConfirmedPair):
+        """Re-fetch real order-book depth for both legs and recompute the best
+        direction with true sizes + fresh prices. Returns the eval tuple or None."""
+        if self.depth_fetch is None:
+            return None
+        try:
+            da = await self.depth_fetch(p.venue_a, p.market_a)
+            db = await self.depth_fetch(p.venue_b, p.market_b)
+        except Exception as exc:
+            log.warning("depth fetch failed for %s: %s", p.event_key, exc)
+            return None
+        return self._eval_direction(da, db)
 
     def _build_opp(self, p, edge, yq, nq, size) -> ArbOpportunity:
         gross = yq.yes_ask + nq.no_ask
@@ -128,13 +151,25 @@ class StreamingEngine:
             if ev is None:
                 continue
             edge, yq, nq, size = ev
-            if edge <= self.min_edge or size < 1:
+            if edge <= self.min_edge:            # price-edge gate (size checked below)
                 continue
             if self.clock() - self._last_acted.get(key, -1e9) < self.cooldown:
                 continue
-            self._last_acted[key] = self.clock()
+            self._last_acted[key] = self.clock()  # cooldown set now to avoid REST storms
+            # WS ticker has no depth (size 0): confirm real size + fresh price via a
+            # REST order-book fetch before firing. Only when the live book already
+            # shows tradeable size do we skip the extra hop.
+            if size < 1 and self.depth_fetch is not None:
+                ev = await self._confirm_depth(p)
+                if ev is None:
+                    continue
+                edge, yq, nq, size = ev
+            if edge <= self.min_edge or size < 1:
+                log.info("STREAM edge gone after depth check on %s (edge %.4f sz %g)",
+                         p.event_key, edge, size)
+                continue
             opp = self._build_opp(p, edge, yq, nq, size)
-            log.info("STREAM edge %.4f on %s -> executing", edge, p.event_key)
+            log.info("STREAM edge %.4f sz %g on %s -> executing", edge, size, p.event_key)
             report = await self.executor.execute(opp)
             log.info("STREAM exec %s | %s", p.event_key, report)
         return report

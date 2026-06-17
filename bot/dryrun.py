@@ -487,7 +487,20 @@ async def stream(
         {v.name: v for v in venues}, risk, fee_models=fee_models, store=store,
         max_order_contracts=settings.risk.max_order_contracts, fill_confirmer=tracker,
     )
-    engine = StreamingEngine(executor=executor, fee_models=fee_models, min_edge=min_edge)
+
+    venue_by_name = {v.name: v for v in venues}
+
+    async def depth_fetch(venue_name: str, market_id: str):
+        # Sized order-book quote for one market — used to confirm real depth + fresh
+        # price the instant a WS price edge appears (WS ticker carries no size).
+        v = venue_by_name.get(venue_name)
+        if v is None:
+            return None
+        return await v.fetch_quote(RawMarket(market_id=market_id, title="", raw={}))
+
+    engine = StreamingEngine(
+        executor=executor, fee_models=fee_models, min_edge=min_edge, depth_fetch=depth_fetch,
+    )
 
     complete_fn = make_complete_fn(settings.llm) if use_llm else None
     embed_fn = make_embed_fn(settings.llm) if use_embed else None

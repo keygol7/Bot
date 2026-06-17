@@ -138,6 +138,48 @@ def test_edge_snapshot_only_includes_two_sided_pairs(caplog):
     assert "1/2 pairs two-sided" in caplog.text
 
 
+def test_sizeless_ws_quote_triggers_depth_fetch_then_executes():
+    # Kalshi-style: WS quotes have a price edge but size 0. The engine must depth-fetch
+    # real sizes before firing, then execute.
+    fe = FakeExec()
+    deep = {
+        ("kalshi", "K1"): q("kalshi", "K1", yes_ask=0.40, ya=50, no_ask=0.65, na=50),
+        ("poly", "P1"): q("poly", "P1", yes_ask=0.62, ya=50, no_ask=0.55, na=50),
+    }
+
+    async def depth_fetch(venue, mid):
+        return deep.get((venue, mid))
+
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, depth_fetch=depth_fetch,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    # Sizeless WS ticks (size 0) — would be skipped without the depth fetch.
+    asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=0, no_ask=0.65, na=0)))
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=0, no_ask=0.55, na=0)))
+    assert len(fe.calls) == 1
+    assert fe.calls[0].max_contracts == 50          # real size came from the depth fetch
+
+
+def test_depth_fetch_says_edge_gone_no_execute():
+    # Price edge on the WS book, but the depth fetch shows the edge has evaporated.
+    fe = FakeExec()
+
+    async def depth_fetch(venue, mid):
+        # Both legs now priced so the pair sums > 1 (no edge).
+        return q(venue, mid, yes_ask=0.60, ya=50, no_ask=0.60, na=50)
+
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, depth_fetch=depth_fetch,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=0, no_ask=0.65, na=0)))
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=0, no_ask=0.55, na=0)))
+    assert fe.calls == []                            # depth fetch vetoed the stale edge
+
+
 def test_consume_counts_ws_quotes_for_health():
     # The WS-health heartbeat: _consume must count each tick per venue so the run
     # loop can report whether a venue's WebSocket is actually delivering data.
