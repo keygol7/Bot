@@ -168,6 +168,32 @@ def test_polymarket_scan_quotes_stops_when_offset_ignored():
     assert len(quotes) == 500                      # only the unique first page kept
 
 
+def test_kalshi_is_open_status():
+    def handler(req):
+        if "SETTLED" in str(req.url):
+            return httpx.Response(200, json={"market": {"status": "settled"}})
+        return httpx.Response(200, json={"market": {"status": "open"}})
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    assert asyncio.run(v.is_open("KOPEN")) is True
+    assert asyncio.run(v.is_open("KSETTLED")) is False
+
+
+def test_polymarket_is_open_status():
+    def handler(req):
+        if "closedslug" in str(req.url):
+            return httpx.Response(200, json={"active": False, "closed": True})
+        return httpx.Response(200, json={"active": True, "closed": False})
+
+    cfg = QcexConfig()
+    v = PolymarketUSVenue(cfg)
+    v._gateway_client = _client(handler, cfg.gateway_base)
+    assert asyncio.run(v.is_open("openslug")) is True
+    assert asyncio.run(v.is_open("closedslug")) is False
+
+
 def test_place_order_requires_credentials():
     from bot.venues.base import OrderNotPermitted
 

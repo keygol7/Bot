@@ -404,18 +404,30 @@ async def build_watchlist(cached, scanned, venues):
         v = venue_by_name.get(vn)
         if v is None:
             continue
-        try:
-            q = await v.fetch_quote(RawMarket(market_id=mid, title="", raw={}))
-        except Exception as exc:
-            log.info("watchlist probe %s:%s not live (%s)", vn, mid, exc)
-            continue
-        # Keep any market that still answers a quote — including open-but-illiquid
-        # pre-match markets whose book is momentarily empty (no resting bids yet).
-        # We must NOT treat an empty book as "settled": these go two-sided closer to
-        # game time, and execution's depth-check already declines an empty book safely.
-        # (Truly settled markets fall out via the open-status scan, not here.)
-        if q is not None:
+        is_open = getattr(v, "is_open", None)
+        if is_open is not None:
+            # Liveness by market STATUS, not book depth: keep open-but-illiquid
+            # pre-match markets (empty book now, two-sided near game time) and drop
+            # only CONFIRMED closed/settled ones. Unknown status -> keep (don't repeat
+            # the regression of dropping live markets on uncertainty).
+            try:
+                ok = await is_open(mid)
+            except Exception as exc:
+                log.info("watchlist status probe %s:%s failed (%s)", vn, mid, exc)
+                ok = None
+            if ok is False:
+                log.info("watchlist drop %s:%s — market closed/settled", vn, mid)
+                continue
             live.add((vn, mid))
+        else:
+            # Fallback (venues without is_open): any answered quote counts as live.
+            try:
+                q = await v.fetch_quote(RawMarket(market_id=mid, title="", raw={}))
+            except Exception as exc:
+                log.info("watchlist probe %s:%s not live (%s)", vn, mid, exc)
+                continue
+            if q is not None:
+                live.add((vn, mid))
 
     out = []
     missing_a = missing_b = 0  # legs of cached pairs still not live after probing

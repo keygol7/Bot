@@ -19,7 +19,7 @@ import base64
 import logging
 import time
 import uuid
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Optional
 from urllib.parse import urlsplit
 
 from bot.execution.orders import OrderResult, OrderStatus
@@ -296,6 +296,28 @@ class KalshiVenue:
     async def fetch_quote(self, market: RawMarket) -> MarketQuote:
         """Deep (sized) quote for one market — used in phase 2 for shortlisted markets."""
         return await self.fetch_orderbook(market.market_id, market.title)
+
+    async def is_open(self, market_id: str) -> Optional[bool]:
+        """Whether the market is still open for trading (vs closed/settled).
+
+        Used by the streaming watchlist to keep open-but-illiquid markets while
+        shedding settled ones — independent of current book depth. Returns ``None`` if
+        the status can't be determined (caller keeps the market on uncertainty).
+        """
+        await self._limiter.wait()
+        endpoint = f"/markets/{market_id}"
+        try:
+            resp = await self._http().get(endpoint, headers=self._auth_headers("GET", endpoint))
+            resp.raise_for_status()
+        except Exception:
+            return None
+        status = (resp.json().get("market") or {}).get("status")
+        if not status:
+            return None
+        # Treat anything terminal as closed; everything else (open/active/...) as live.
+        return status.lower() not in {
+            "closed", "settled", "determined", "finalized", "cancelled", "expired",
+        }
 
     async def scan_quotes(self, limit: int = 500) -> list[MarketQuote]:
         """Phase 1: price-only quotes for open markets, up to ``limit`` markets total.

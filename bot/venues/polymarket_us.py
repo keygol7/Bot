@@ -302,6 +302,23 @@ class PolymarketUSVenue:
             return None
         return normalize_bbo(market.market_id, market.title, market_data)
 
+    async def is_open(self, market_id: str):
+        """Whether the market is still open for trading (vs closed). Returns ``None`` if
+        the status can't be determined (caller keeps the market on uncertainty)."""
+        await self._limiter.wait()
+        try:
+            resp = await self._gateway().get(f"/v1/markets/{market_id}")
+            if resp.status_code == 404:
+                return False
+            resp.raise_for_status()
+        except Exception:
+            return None
+        body = resp.json() or {}
+        m = body.get("market", body)  # gateway may wrap the market or return it directly
+        if not isinstance(m, dict) or not ("active" in m or "closed" in m):
+            return None
+        return bool(m.get("active", True)) and not bool(m.get("closed", False))
+
     async def stream_order_book(self, market_ids: list[str]) -> AsyncIterator[MarketQuote]:
         """Stream real-time top-of-book via the markets WS (MARKET_DATA_LITE).
 

@@ -283,6 +283,46 @@ def test_build_watchlist_drops_pair_when_probe_finds_nothing():
     assert out == []
 
 
+def test_build_watchlist_uses_status_keeps_open_drops_closed():
+    # With is_open() available: an OPEN market with an empty book is kept; a CLOSED
+    # market is dropped — independent of book depth.
+    from bot.dryrun import build_watchlist
+
+    class StatusVenue(StubVenue):
+        def __init__(self, name, open_map):
+            super().__init__(name, {})
+            self._open = open_map
+
+        async def is_open(self, mid):
+            return self._open.get(mid)
+
+    cached = [
+        ("kalshi", "Kopen", "polymarket_us", "P1", "e1"),   # open both -> kept
+        ("kalshi", "Kclosed", "polymarket_us", "P2", "e2"),  # kalshi closed -> dropped
+    ]
+    venues = [
+        StatusVenue("kalshi", {"Kopen": True, "Kclosed": False}),
+        StatusVenue("polymarket_us", {"P1": True, "P2": True}),
+    ]
+    out = asyncio.run(build_watchlist(cached, set(), venues))
+    assert {p.market_a for p in out} == {"Kopen"}
+
+
+def test_build_watchlist_keeps_market_when_status_unknown():
+    # is_open() -> None (can't tell) must KEEP the market (no regression to dropping
+    # live markets on uncertainty).
+    from bot.dryrun import build_watchlist
+
+    class UnknownVenue(StubVenue):
+        async def is_open(self, mid):
+            return None
+
+    cached = [("kalshi", "K1", "polymarket_us", "P1", "e1")]
+    venues = [UnknownVenue("kalshi", {}), UnknownVenue("polymarket_us", {})]
+    out = asyncio.run(build_watchlist(cached, set(), venues))
+    assert len(out) == 1
+
+
 def test_build_watchlist_keeps_open_but_illiquid_market():
     # An open-but-illiquid market answers a quote with no asks yet (empty book). It
     # must STAY on the watchlist — it goes two-sided closer to game time, and execution
