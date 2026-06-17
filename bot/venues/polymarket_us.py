@@ -303,21 +303,19 @@ class PolymarketUSVenue:
         return normalize_bbo(market.market_id, market.title, market_data)
 
     async def is_open(self, market_id: str):
-        """Whether the market is still open for trading (vs closed). Returns ``None`` if
-        the status can't be determined (caller keeps the market on uncertainty)."""
+        """Whether the market is still quotable. The gateway has no bare
+        ``/v1/markets/{slug}`` detail endpoint (it 404s), so we use the ``/bbo``
+        subpath that does exist: a 200 means the market is live (even if the book is
+        momentarily empty). We NEVER return False here — only ``True`` (live) or
+        ``None`` (unknown -> caller keeps it), so a gateway quirk can't wrongly drop a
+        live market. Settled pairs are shed via the Kalshi leg's real status instead.
+        """
         await self._limiter.wait()
         try:
-            resp = await self._gateway().get(f"/v1/markets/{market_id}")
-            if resp.status_code == 404:
-                return False
-            resp.raise_for_status()
+            resp = await self._gateway().get(f"/v1/markets/{market_id}/bbo")
         except Exception:
             return None
-        body = resp.json() or {}
-        m = body.get("market", body)  # gateway may wrap the market or return it directly
-        if not isinstance(m, dict) or not ("active" in m or "closed" in m):
-            return None
-        return bool(m.get("active", True)) and not bool(m.get("closed", False))
+        return True if resp.status_code == 200 else None
 
     async def stream_order_book(self, market_ids: list[str]) -> AsyncIterator[MarketQuote]:
         """Stream real-time top-of-book via the markets WS (MARKET_DATA_LITE).

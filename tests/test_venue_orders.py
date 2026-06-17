@@ -181,17 +181,19 @@ def test_kalshi_is_open_status():
     assert asyncio.run(v.is_open("KSETTLED")) is False
 
 
-def test_polymarket_is_open_status():
+def test_polymarket_is_open_uses_bbo_never_false():
+    # The gateway 404s the bare /v1/markets/{slug}; is_open must use /bbo and never
+    # return False (a quirky 404 must not drop a live market -> None = keep).
     def handler(req):
-        if "closedslug" in str(req.url):
-            return httpx.Response(200, json={"active": False, "closed": True})
-        return httpx.Response(200, json={"active": True, "closed": False})
+        if "goneslug" in str(req.url):
+            return httpx.Response(404, json={})
+        return httpx.Response(200, json={"marketData": {"bestAsk": "0.4"}})
 
     cfg = QcexConfig()
     v = PolymarketUSVenue(cfg)
     v._gateway_client = _client(handler, cfg.gateway_base)
-    assert asyncio.run(v.is_open("openslug")) is True
-    assert asyncio.run(v.is_open("closedslug")) is False
+    assert asyncio.run(v.is_open("liveslug")) is True
+    assert asyncio.run(v.is_open("goneslug")) is None     # unknown -> keep, never False
 
 
 def test_place_order_requires_credentials():
