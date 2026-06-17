@@ -87,31 +87,42 @@ def _best(levels: list[list[Any]]) -> tuple[float, float] | None:
     return float(best[0]), float(best[1])
 
 
+def _bid_levels_dollars(orderbook: dict[str, Any], side: str) -> list[tuple[float, float]]:
+    """Bid levels for ``side`` ('yes'/'no') as ``[(price_dollars, size), ...]``.
+
+    Handles both Kalshi shapes: the current ``orderbook_fp`` with ``yes_dollars`` /
+    ``no_dollars`` (dollar-string prices, fractional sizes) and the legacy
+    ``{"yes": [[price_cents, size], ...]}``.
+    """
+    fp = orderbook.get(f"{side}_dollars")
+    if fp is not None:
+        return [(float(p), float(s)) for p, s in fp]
+    return [(float(c) / 100.0, float(s)) for c, s in (orderbook.get(side) or [])]
+
+
 def normalize_orderbook(
     ticker: str, title: str, orderbook: dict[str, Any], *, event_key: str | None = None
 ) -> MarketQuote:
-    """Normalize a Kalshi ``orderbook`` dict into a :class:`MarketQuote`.
+    """Normalize a Kalshi orderbook dict into a :class:`MarketQuote`.
 
-    ``orderbook`` is ``{"yes": [[price_cents, size], ...], "no": [...]}`` (either may
-    be missing/empty). ``yes_ask`` is derived by crossing the best NO bid and vice
-    versa, per Kalshi's book semantics.
+    Accepts the current ``orderbook_fp`` shape (``yes_dollars``/``no_dollars``, dollar
+    prices) and the legacy cents shape. ``yes_ask`` is derived by crossing the best NO
+    bid (cost to buy YES = 1 - best NO bid) and vice versa, per Kalshi's book semantics.
     """
-    yes_bids = orderbook.get("yes") or []
-    no_bids = orderbook.get("no") or []
+    yes_bids = _bid_levels_dollars(orderbook, "yes")
+    no_bids = _bid_levels_dollars(orderbook, "no")
 
     yes_ask = no_ask = None
     yes_ask_size = no_ask_size = 0.0
 
-    best_no = _best(no_bids)
-    if best_no is not None:
-        price_cents, size = best_no
-        yes_ask = round((100.0 - price_cents) / 100.0, 4)
+    if no_bids:
+        price, size = max(no_bids, key=lambda lvl: lvl[0])
+        yes_ask = round(1.0 - price, 4)
         yes_ask_size = size
 
-    best_yes = _best(yes_bids)
-    if best_yes is not None:
-        price_cents, size = best_yes
-        no_ask = round((100.0 - price_cents) / 100.0, 4)
+    if yes_bids:
+        price, size = max(yes_bids, key=lambda lvl: lvl[0])
+        no_ask = round(1.0 - price, 4)
         no_ask_size = size
 
     return MarketQuote(
@@ -291,13 +302,10 @@ class KalshiVenue:
         resp = await self._http().get(endpoint, headers=self._auth_headers("GET", endpoint))
         resp.raise_for_status()
         body = resp.json()
-        ob = body.get("orderbook", {})
-        q = normalize_orderbook(ticker, title, ob)
-        if q.yes_ask is None and q.no_ask is None:
-            # Diagnostic: an empty parse may mean a genuinely empty book OR a response
-            # shape we're not reading. Log the raw payload (truncated) to tell them apart.
-            log.warning("kalshi orderbook %s parsed empty; raw=%s", ticker, str(body)[:400])
-        return q
+        # Current API returns "orderbook_fp" (dollar prices, fractional sizes); fall
+        # back to the legacy "orderbook" (cents) if present.
+        ob = body.get("orderbook_fp") or body.get("orderbook") or {}
+        return normalize_orderbook(ticker, title, ob)
 
     async def fetch_quote(self, market: RawMarket) -> MarketQuote:
         """Deep (sized) quote for one market — used in phase 2 for shortlisted markets."""

@@ -120,6 +120,18 @@ def test_kalshi_orderbook_one_sided():
     assert quote.no_ask == 0.58 and quote.no_ask_size == 10
 
 
+def test_kalshi_orderbook_fp_dollars_format():
+    # The current Kalshi shape: orderbook_fp with dollar-string prices + fractional
+    # sizes. (yes_dollars / no_dollars are bid levels.)
+    ob = {
+        "yes_dollars": [["0.40", "100.5"], ["0.39", "50"]],
+        "no_dollars": [["0.55", "80.25"], ["0.54", "20"]],
+    }
+    quote = normalize_orderbook("WSHCONN-WSH", "WNBA", ob)
+    assert quote.yes_ask == 0.45 and quote.yes_ask_size == 80.25   # 1 - best no bid 0.55
+    assert quote.no_ask == 0.60 and quote.no_ask_size == 100.5     # 1 - best yes bid 0.40
+
+
 def test_polymarket_bbo_normalization():
     # Polymarket US BBO: bestAsk = YES ask; NO ask = 1 - bestBid. v1Amount objects.
     md = {
