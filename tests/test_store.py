@@ -135,19 +135,26 @@ def test_confirmed_pairs_drops_scope_mismatch():
 
 
 def test_confirmed_pairs_safe_types_only():
-    # A novelty market (announcer mention) must be excluded by the whitelist even
-    # though it's same_event=1 and 1:1; a plain winner pair survives.
+    # Exotic Kalshi series (announcer mention, group-stage undefeated) must be excluded
+    # by the series allowlist even though they're same_event=1, 1:1, and the title reads
+    # like a winner. A vetted game-winner series survives.
     s = Store(":memory:")
-    s.upsert_market("kalshi", "Km", "What will the announcers say during Brazil vs Haiti? - LFF")
+    Km = "KXWCMENTION-26JUN19BRAHTI-LFFL"
+    s.upsert_market("kalshi", Km, "What will the announcers say during Brazil vs Haiti? - LFF")
     s.upsert_market("polymarket_us", "Pm", "Will Haiti win against Brazil? - Haiti")
-    s.cache_verdict("kalshi", "Km", "polymarket_us", "Pm", same_event=True, confidence=1.0)
-    s.upsert_market("kalshi", "Kw", "Will Haiti win against Brazil? - Haiti")
-    s.upsert_market("polymarket_us", "Pw", "Who will win Brazil vs Haiti? - Haiti")
-    s.cache_verdict("kalshi", "Kw", "polymarket_us", "Pw", same_event=True, confidence=1.0)
+    s.cache_verdict("kalshi", Km, "polymarket_us", "Pm", same_event=True, confidence=1.0)
+    Ku = "KXWCGSUNDEFEATED-26-CPV"
+    s.upsert_market("kalshi", Ku, "Will Cape Verde win all 3 of their group matches? - Cape Verde")
+    s.upsert_market("polymarket_us", "Pu", "Will Cape Verde win vs Uruguay? - Cape Verde")
+    s.cache_verdict("kalshi", Ku, "polymarket_us", "Pu", same_event=True, confidence=1.0)
+    Kw = "KXWNBAGAME-26JUN17DALGS-DAL"
+    s.upsert_market("kalshi", Kw, "Dallas vs Golden State winner? - Dallas")
+    s.upsert_market("polymarket_us", "Pw", "Who will win Dallas vs Golden State? - Dallas")
+    s.cache_verdict("kalshi", Kw, "polymarket_us", "Pw", same_event=True, confidence=1.0)
 
     pairs = s.confirmed_pairs()                      # safe_types_only=True default
-    assert {(p[0], p[1]) for p in pairs} == {("kalshi", "Kw")}
-    assert len(s.confirmed_pairs(safe_types_only=False)) == 2   # gate can be relaxed
+    assert {(p[0], p[1]) for p in pairs} == {("kalshi", Kw)}
+    assert len(s.confirmed_pairs(safe_types_only=False)) == 3   # gate can be relaxed
     s.close()
 
 

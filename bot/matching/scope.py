@@ -143,3 +143,30 @@ def is_tradeable_market_type(title: str) -> bool:
         return True  # fight method-of-victory (validated as reliable)
     return bool(_WINNER_RE.search(title.lower()))  # plain winner; novelties fail this
 
+
+# Kalshi encodes the market TYPE in the ticker series (the token after "KX", before the
+# first "-"). This is far more reliable than parsing free-text titles, which keep
+# leaking exotic types ("win all 3 ... group stage" reads as a winner). Allow ONLY the
+# series we've validated; an unknown series is excluded by default.
+_ALLOWED_KALSHI_SERIES = re.compile(
+    r"^(?:"
+    r"(?:ATP|WTA|ITF|ITFW)(?:CHALLENGER)?MATCH"             # tennis match winners
+    r"|[A-Z0-9]*GAME"                                       # game winners (esports, WNBA, ...)
+    r"|UFCFIGHT"                                            # MMA fight winners
+    r"|[A-Z0-9]*(?:GOALS?|ASTS?|ASSISTS?|PTS|POINTS?|SOA)"  # player props
+    r")$"
+)
+
+
+def kalshi_series(ticker: str) -> str:
+    """The Kalshi series token, e.g. 'KXWCGOAL-26JUN17...' -> 'WCGOAL'."""
+    t = ticker[2:] if ticker.startswith("KX") else ticker
+    return t.split("-", 1)[0]
+
+
+def is_allowed_kalshi_series(ticker: str) -> bool:
+    """True only for vetted Kalshi series (match/game/fight winners, player props).
+    Excludes exotic series — MENTION, GSUNDEFEATED, 2H, 1HSPREAD, SCORE, EXACTMATCH,
+    SETWINNER, GSPREAD, … — regardless of how their title reads."""
+    return bool(_ALLOWED_KALSHI_SERIES.match(kalshi_series(ticker)))
+

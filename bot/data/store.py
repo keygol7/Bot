@@ -16,7 +16,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 
-from bot.matching.scope import is_tradeable_market_type, scope_mismatch
+from bot.matching.scope import (
+    is_allowed_kalshi_series,
+    is_tradeable_market_type,
+    scope_mismatch,
+)
 
 
 def drop_fanout_pairs(pairs: list[tuple], max_fanout: int = 1) -> list[tuple]:
@@ -269,10 +273,17 @@ class Store:
             ta, tb = r["title_a"] or "", r["title_b"] or ""
             if drop_scope_mismatch and scope_mismatch(ta, tb):
                 continue
-            if safe_types_only and not (
-                is_tradeable_market_type(ta) and is_tradeable_market_type(tb)
-            ):
-                continue
+            if safe_types_only:
+                if not (is_tradeable_market_type(ta) and is_tradeable_market_type(tb)):
+                    continue
+                # Kalshi series allowlist (more reliable than titles). The kalshi leg
+                # must be a vetted series; unknown/exotic series are excluded.
+                kalshi_mkt = (
+                    r["market_a"] if r["venue_a"] == "kalshi"
+                    else r["market_b"] if r["venue_b"] == "kalshi" else None
+                )
+                if kalshi_mkt is not None and not is_allowed_kalshi_series(kalshi_mkt):
+                    continue
             pairs.append(
                 (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], r["event_key"])
             )

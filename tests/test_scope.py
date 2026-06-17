@@ -157,3 +157,28 @@ def test_market_type_whitelist():
     assert not ok("Will Brazil win the group? - Brazil")
     # ...but a single World Cup match winner is still allowed.
     assert ok("Will Portugal win against Congo DR in the World Cup match? - Portugal")
+
+
+def test_kalshi_series_allowlist():
+    from bot.matching.scope import is_allowed_kalshi_series as ok
+
+    # Vetted series: match/game/fight winners and player props.
+    assert ok("KXATPMATCH-26JUN17DIMGAN-DIM")
+    assert ok("KXATPCHALLENGERMATCH-26JUN17ROTJAC-ROT")
+    assert ok("KXDOTA2GAME-26JUN171900PLATNEM-NEM")
+    assert ok("KXWNBAGAME-26JUN17DALGS-DAL")
+    assert ok("KXUFCFIGHT-26JUN20BAGMAG-BAG")
+    assert ok("KXWCGOAL-26JUN17PORCOD-CODCBAKAM11-1")
+    assert ok("KXWCAST-26JUN17ENGCRO-ENGDRICE41-2")
+    assert ok("KXNHLPTS-26JUN14CARVGK-VGKJEICHEL9-3")
+    assert ok("KXWCSOA-26JUN17ENGCRO-ENGJBELLI5")
+
+    # Exotic series excluded regardless of title wording.
+    assert not ok("KXWCGSUNDEFEATED-26-CPV")
+    assert not ok("KXWCMENTION-26JUN19TURPAR-HIST")
+    assert not ok("KXWC2H-26JUN17ENGCRO-ENG")
+    assert not ok("KXWC1HSPREAD-26JUN18MEXKOR-MEX2")
+    assert not ok("KXWCSCORE-26JUN15IRINZL-IRI0NZL2")
+    assert not ok("KXATPEXACTMATCH-26JUN17NAKBUS-NAK21")
+    assert not ok("KXWTASETWINNER-26JUN15ZHESAK-1-ZHE")
+    assert not ok("KXATPGSPREAD-26JUN14FONHAN-FON6")

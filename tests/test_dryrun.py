@@ -384,12 +384,14 @@ def test_inspect_matches_tradeable_only_lists_exact_trade_set(capsys):
     from bot.dryrun import inspect_matches
 
     s = Store(":memory:")
-    s.upsert_market("kalshi", "K1", "Gane by KO")
+    s.upsert_market("kalshi", "KXUFCFIGHT-26JUN20GANE-GANE", "Gane by KO")
     s.upsert_market("polymarket_us", "P1", "Gane by KO")
-    s.cache_verdict("kalshi", "K1", "polymarket_us", "P1", same_event=True, confidence=1.0)
+    s.cache_verdict("kalshi", "KXUFCFIGHT-26JUN20GANE-GANE", "polymarket_us", "P1",
+                    same_event=True, confidence=1.0)
     # A fan-out market that must NOT appear in the tradeable-only view.
     for p in ("PA", "PB"):
-        s.cache_verdict("kalshi", "Kfield", "polymarket_us", p, same_event=True, confidence=1.0)
+        s.cache_verdict("kalshi", "KXUFCFIGHT-26JUN20FIELD-X", "polymarket_us", p,
+                        same_event=True, confidence=1.0)
 
     import bot.dryrun as dr
     orig = dr.Store
@@ -467,9 +469,10 @@ def test_recheck_matches_reports_model_rejections(capsys, monkeypatch):
     s = Store(":memory:")
     # Safe winner-type pair (passes the whitelist) that the model now rejects on the
     # subject (opposite teams) — the kind of catch recheck is meant to surface.
-    s.upsert_market("kalshi", "K1", "Will Haiti win against Brazil? - Haiti")
+    s.upsert_market("kalshi", "KXWNBAGAME-26JUN17BRAHTI-HAI", "Will Haiti win against Brazil? - Haiti")
     s.upsert_market("polymarket_us", "P1", "Will Brazil win against Haiti? - Brazil")
-    s.cache_verdict("kalshi", "K1", "polymarket_us", "P1", same_event=True, confidence=1.0)
+    s.cache_verdict("kalshi", "KXWNBAGAME-26JUN17BRAHTI-HAI", "polymarket_us", "P1",
+                    same_event=True, confidence=1.0)
 
     monkeypatch.setattr(dr, "Store", lambda path: s)
     # Model now correctly rejects (YES pays for different teams).
@@ -491,13 +494,14 @@ def test_show_watchlist_prints_live_pairs(capsys, monkeypatch):
     from bot.dryrun import show_watchlist
 
     s = Store(":memory:")
-    s.upsert_market("kalshi", "K1", "Gane by KO")
+    K = "KXUFCFIGHT-26JUN20GANE-GANE"
+    s.upsert_market("kalshi", K, "Gane by KO")
     s.upsert_market("polymarket_us", "P1", "Gane by KO")
-    s.cache_verdict("kalshi", "K1", "polymarket_us", "P1", same_event=True, confidence=1.0)
+    s.cache_verdict("kalshi", K, "polymarket_us", "P1", same_event=True, confidence=1.0)
 
-    ka = mq("kalshi", "K1", "Gane by KO", yes_ask=0.4, no_ask=0.6)
+    ka = mq("kalshi", K, "Gane by KO", yes_ask=0.4, no_ask=0.6)
     pa = mq("polymarket_us", "P1", "Gane by KO", yes_ask=0.62, no_ask=0.55)
-    venues = [StubVenue("kalshi", {"K1": ka}), StubVenue("polymarket_us", {"P1": pa})]
+    venues = [StubVenue("kalshi", {K: ka}), StubVenue("polymarket_us", {"P1": pa})]
     monkeypatch.setattr(dr, "_build_venues", lambda s: venues)
     monkeypatch.setattr(dr, "Store", lambda path: s)
 
