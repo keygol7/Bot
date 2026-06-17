@@ -283,17 +283,18 @@ def test_build_watchlist_drops_pair_when_probe_finds_nothing():
     assert out == []
 
 
-def test_build_watchlist_drops_settled_empty_book():
-    # A settled market returns a quote with NO asks (empty book) -> treated as not-live
-    # so the dead pair drops off the watchlist instead of being re-fetched forever.
+def test_build_watchlist_keeps_open_but_illiquid_market():
+    # An open-but-illiquid market answers a quote with no asks yet (empty book). It
+    # must STAY on the watchlist — it goes two-sided closer to game time, and execution
+    # declines an empty book safely. (Conflating this with "settled" nuked the list.)
     from bot.dryrun import build_watchlist
 
-    empty = mq("kalshi", "K1", "settled game", yes_ask=None, no_ask=None)
+    empty = mq("kalshi", "K1", "pre-match market", yes_ask=None, no_ask=None)
     cached = [("kalshi", "K1", "polymarket_us", "P1", "ufc")]
     scanned = {("polymarket_us", "P1")}
     venues = [StubVenue("kalshi", {"K1": empty}), StubVenue("polymarket_us", {})]
     out = asyncio.run(build_watchlist(cached, scanned, venues))
-    assert out == []
+    assert len(out) == 1
 
 
 def test_build_watchlist_survives_probe_error():
