@@ -115,6 +115,25 @@ def test_confirmed_pairs_drops_fanout_clusters():
     s.close()
 
 
+def test_confirmed_pairs_drops_scope_mismatch():
+    # A same_event=True 1:1 pair whose titles resolve on different scopes ("2nd half"
+    # vs full match) must be dropped from the watchlist — fan-out can't catch a 1:1.
+    s = Store(":memory:")
+    s.upsert_market("kalshi", "K1", "Will Portugal win the 2nd Half? - Portugal")
+    s.upsert_market("polymarket_us", "P1", "Will Portugal win the World Cup match? - Portugal")
+    s.cache_verdict("kalshi", "K1", "polymarket_us", "P1", same_event=True, confidence=1.0)
+    # A clean full-match pair survives.
+    s.upsert_market("kalshi", "K2", "Will France win the match? - France")
+    s.upsert_market("polymarket_us", "P2", "Will France win against Iraq? - France")
+    s.cache_verdict("kalshi", "K2", "polymarket_us", "P2", same_event=True, confidence=1.0)
+
+    pairs = s.confirmed_pairs()
+    assert {(p[0], p[1]) for p in pairs} == {("kalshi", "K2")}
+    # The gate can be disabled.
+    assert len(s.confirmed_pairs(drop_scope_mismatch=False)) == 2
+    s.close()
+
+
 def test_drop_fanout_pairs_pure():
     from bot.data.store import drop_fanout_pairs
 

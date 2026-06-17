@@ -30,6 +30,7 @@ from bot.execution.risk import RiskManager
 from bot.fees import FeeModel, ZeroFeeModel
 from bot.matching.embed import candidate_pairs, semantic_candidate_pairs
 from bot.matching.llm_match import MatchVerdict, confirm_match
+from bot.matching.scope import scope_mismatch
 from bot.models import MarketQuote
 from bot.modes import RunMode
 from bot.strategies.arbitrage import (
@@ -161,6 +162,10 @@ async def run_cycle(
                     c.a.close_time is not None and c.b.close_time is not None
                     and abs(c.a.close_time - c.b.close_time) > max_resolve_gap_days * 86400
                 ):
+                    continue
+                # Scope/period guard: same teams/date but different resolution scope
+                # (e.g. "win 2nd half" vs "win the match") is not the same market.
+                if scope_mismatch(c.a.title, c.b.title):
                     continue
                 result.candidate_pairs += 1
 

@@ -16,6 +16,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 
+from bot.matching.scope import scope_mismatch
+
 
 def drop_fanout_pairs(pairs: list[tuple], max_fanout: int = 1) -> list[tuple]:
     """Keep only ~1:1 same-event pairs; drop multi-outcome cross-products.
@@ -230,29 +232,40 @@ class Store:
         self.conn.commit()
 
     def confirmed_pairs(
-        self, min_confidence: float = 0.85, max_fanout: Optional[int] = 1
+        self, min_confidence: float = 0.85, max_fanout: Optional[int] = 1,
+        drop_scope_mismatch: bool = True,
     ) -> list[tuple]:
         """Cached tradeable pairs: (venue_a, market_a, venue_b, market_b, event_key).
 
         The durable source of truth for the streaming watchlist — independent of
-        per-cycle embedding/LLM variance. Two gates are applied:
+        per-cycle embedding/LLM variance. Three gates are applied:
 
         1. The SAME confidence gate as ``MatchVerdict.tradeable`` (confirmed same-event
            AND ``confidence >= min_confidence``). Without it the streamer would trade
            every low-confidence "true" the model emitted.
-        2. A fan-out gate (``max_fanout``): drop multi-outcome cross-products where a
+        2. A scope/period gate (``drop_scope_mismatch``): drop pairs whose titles
+           resolve on different scopes ("win 2nd half" vs "win the match"). Cleans
+           existing cache entries the LLM rubber-stamped, with no re-seed needed.
+        3. A fan-out gate (``max_fanout``): drop multi-outcome cross-products where a
            market maps to many counterparties (see :func:`drop_fanout_pairs`). Pass
            ``None`` to disable.
         """
         rows = self.conn.execute(
-            "SELECT venue_a, market_a, venue_b, market_b, event_key "
-            "FROM match_verdicts WHERE same_event=1 AND confidence >= ?",
+            """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b, v.event_key,
+                      ma.title AS title_a, mb.title AS title_b
+               FROM match_verdicts v
+               LEFT JOIN markets ma ON ma.venue=v.venue_a AND ma.market_id=v.market_a
+               LEFT JOIN markets mb ON mb.venue=v.venue_b AND mb.market_id=v.market_b
+               WHERE v.same_event=1 AND v.confidence >= ?""",
             (min_confidence,),
         ).fetchall()
-        pairs = [
-            (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], r["event_key"])
-            for r in rows
-        ]
+        pairs = []
+        for r in rows:
+            if drop_scope_mismatch and scope_mismatch(r["title_a"] or "", r["title_b"] or ""):
+                continue
+            pairs.append(
+                (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], r["event_key"])
+            )
         if max_fanout is not None:
             pairs = drop_fanout_pairs(pairs, max_fanout=max_fanout)
         return pairs
