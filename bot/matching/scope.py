@@ -44,6 +44,11 @@ _SCOPE_PATTERNS: dict[str, str] = {
                  r"\bknockout\b|\bko/tko/dq\b",
     "method_sub": r"\bby\s+submission\b|\bsubmission\b",
     "method_decision": r"\bby\s+decision\b|\bunanimous\s+decision\b",
+    # winning MARGIN / spread ("wins by over 1.5 goals") — NOT a team total ("scores
+    # over 1.5 goals"). One side margin, the other total -> different markets.
+    "margin": r"\bwins?\s+by\s+(over\s+|under\s+|more\s+than\s+)?\d|\bgoal\s+(margin|spread)\b",
+    # fight goes the distance (duration) — NOT "win the fight" (winner).
+    "distance": r"\bgo(es)?\s+the\s+distance\b",
 }
 
 # The stat a player-prop market resolves on. Mutually exclusive, checked in order so

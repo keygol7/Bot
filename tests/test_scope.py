@@ -118,3 +118,18 @@ def test_year_in_title_is_not_a_scoreline():
 def test_scoreline_helper_imported():
     from bot.matching.scope import _scoreline_tag as _s
     assert _s("win 2-1 in sets") == "score:2-1"
+
+
+def test_first_half_margin_vs_team_total_is_mismatch():
+    # Kalshi 1H spread (margin) vs Polymarket 1H team total — different resolution.
+    assert scope_mismatch(
+        "Mexico wins by over 1.5 goals in the 1st Half? - Mexico wins the 1H by over 1.5 goals",
+        "Will Mexico score more than 1.5 goals in the first half of MEX vs KOR? - Over",
+    )
+
+
+def test_win_fight_vs_go_the_distance_is_mismatch():
+    assert scope_mismatch(
+        "Will Melsik Baghdasaryan win the fight? - Melsik Baghdasaryan",
+        "Will the fight go the distance in Melsik Baghdasaryan vs Murtazali Magomedov - Yes",
+    )
