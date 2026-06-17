@@ -44,6 +44,25 @@ def test_confirm_match_parses_true_verdict():
     assert v.tradeable(min_confidence=0.85)
 
 
+def test_confirm_match_parses_yes_party_format():
+    # New structured response (with yes_party fields) still parses to a verdict.
+    a = mq("kalshi", "K1", "Allan Nascimento win the fight")
+    b = mq("polymarket_us", "P1", "Mitch Raposo win by submission in Nascimento vs Raposo")
+    fake = lambda prompt: ('{"yes_party_a": "Allan Nascimento", "yes_party_b": '
+                           '"Mitch Raposo", "same_event": false, "confidence": 0.98, '
+                           '"rationale": "YES pays for different fighters"}')
+    v = confirm_match(a, b, fake)
+    assert v.same_event is False and not v.tradeable()
+
+
+def test_confirm_prompt_asks_for_yes_party():
+    from bot.matching.llm_match import build_prompt
+    a = mq("kalshi", "K1", "x")
+    b = mq("polymarket_us", "P1", "y")
+    prompt = build_prompt(a, b)
+    assert "yes_party_a" in prompt and "YES party" in prompt
+
+
 def test_confirm_match_fails_closed_on_garbage():
     a = mq("kalshi", "K1", "x")
     b = mq("polymarket_us", "P1", "y")

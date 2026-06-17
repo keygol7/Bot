@@ -25,26 +25,39 @@ from bot.models import MarketQuote
 CompleteFn = Callable[[str], str]
 
 _PROMPT_TEMPLATE = """\
-You are a careful prediction-market analyst. Two markets from different venues may
-or may not refer to the SAME real-world event with the SAME resolution criteria.
+You decide whether two prediction markets are the SAME tradeable contract, so that
+buying YES on one and NO on the other locks a guaranteed payout. Mechanical
+differences (half vs match, handicaps, set winner, goals vs goals+assists, method of
+victory) are ALREADY filtered out before you — your ONLY job is to verify the two
+markets resolve on the SAME contest and the SAME winning party.
 
-Only answer "same_event": true if ALL of these hold:
-  1. Same underlying outcome AND the same specific subject (same exact team / player /
-     candidate — "Los Angeles Angels" is NOT "Los Angeles Dodgers").
-  2. Same EVENT TYPE and scope. A single game is NOT a season-long championship; a
-     regular-season matchup is NOT a "win the World Series" futures market; a primary
-     is NOT a general election.
-  3. Same resolution timing/date and sources, so that exactly one of (YES on A, NO on
-     B) is guaranteed to pay out.
+Work in two explicit steps, then decide:
+  STEP 1 — For EACH market, state the exact PARTY the YES side pays out for (the team,
+  player, or fighter who must win/achieve the outcome). Beware: a title often names
+  BOTH sides of a matchup ("Allan Nascimento vs Mitch Raposo"); the YES party is the
+  ONE the market resolves YES for, not merely a name that appears.
+  STEP 2 — Confirm it is the SAME underlying contest (same competitors, same date).
 
-The two resolution dates below must describe the same event. If they differ
-materially, or you are unsure, answer false. A wrong "true" causes real financial loss.
+Answer "same_event": true ONLY if BOTH YES parties are the SAME individual/team AND it
+is the same contest. Different party, different match, or any doubt -> false. Allow for
+spelling/transliteration variants of the SAME person (e.g. "Ghoddos"/"Ghoddoos",
+"van Dijk"/"Van Dijk") — judge the real-world identity, not the exact string.
+
+EXAMPLES (these are FALSE):
+  - A: "Allan Nascimento win the fight" / B: "Mitch Raposo win ... in Nascimento vs
+    Raposo" -> false (YES pays for different fighters).
+  - A: "final score Draw 0-0" [IRQ vs NOR, Jun 16] / B: "SCO vs MAR finish Draw 0-0"
+    [Jun 19] -> false (different match and date).
+TRUE example:
+  - A: "Will Ciryl Gane win by KO/TKO/DQ?" / B: "Ciryl Gane win by KO,TKO,DQ in Gane
+    vs Pereira" -> true (same fighter, same contest).
 
 Market A ({venue_a}): "{title_a}"  [resolves: {date_a}]
 Market B ({venue_b}): "{title_b}"  [resolves: {date_b}]
 
 Respond with ONLY a JSON object:
-{{"same_event": <true|false>, "confidence": <0.0-1.0>, "rationale": "<one sentence>"}}
+{{"yes_party_a": "<who YES pays in A>", "yes_party_b": "<who YES pays in B>",
+  "same_event": <true|false>, "confidence": <0.0-1.0>, "rationale": "<one sentence>"}}
 """
 
 
