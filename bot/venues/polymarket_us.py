@@ -142,13 +142,17 @@ def _account_balance(body: Any) -> float | None:
     return None
 
 
-def _account_flatness(body: Any) -> tuple[float, int]:
-    """``(asset_notional, open_orders)`` from the USD balance entry — Polymarket's
-    authoritative flatness signal (notional of held positions + open-order count)."""
+def _account_flatness(body: Any) -> tuple[float, float]:
+    """``(asset_notional, open_orders_notional)`` from the USD balance entry.
+
+    Per the API schema both are *notional dollar values* (``assetNotional`` =
+    aggregate value of held securities; ``openOrders`` = aggregate notional of open
+    orders), NOT counts — so they're floats and any positive value means non-flat.
+    """
     entry = _usd_balance_entry(body) or {}
-    notional = _amount(entry.get("assetNotional")) or 0.0
-    orders = int(entry.get("openOrders") or 0)
-    return notional, orders
+    asset_notional = _amount(entry.get("assetNotional")) or 0.0
+    open_orders = _amount(entry.get("openOrders")) or 0.0
+    return asset_notional, open_orders
 
 
 def _parse_positions(body: Any):
@@ -595,16 +599,21 @@ class PolymarketUSVenue:
         resp.raise_for_status()
         balance_body = resp.json()
         balance = _account_balance(balance_body)
-        asset_notional, open_orders = _account_flatness(balance_body)
+        asset_notional, open_orders_notional = _account_flatness(balance_body)
 
         await self._limiter.wait()
         path = "/v1/portfolio/positions"
         resp = await self._api().get(path, headers=self._auth_headers("GET", path))
         resp.raise_for_status()
         positions = _parse_positions(resp.json())
-        if not positions and (asset_notional > 1e-9 or open_orders > 0):
-            positions = [VenuePosition("(account-level)", quantity=asset_notional,
-                                       resting_orders=open_orders)]
+        # Both notionals are dollars (not counts); any positive value = non-flat. If the
+        # balance signal says non-flat but the positions list parsed empty, synthesize
+        # an account-level entry so the guard still trips (resting_orders as a 0/1 flag).
+        if not positions and (asset_notional > 1e-9 or open_orders_notional > 1e-9):
+            positions = [VenuePosition(
+                "(account-level)", quantity=asset_notional,
+                resting_orders=1 if open_orders_notional > 1e-9 else 0,
+            )]
         return AccountSnapshot(self.name, balance, positions)
 
     async def aclose(self) -> None:

@@ -118,16 +118,25 @@ def test_poly_balance_real_shape():
     body = {"balances": [{"currentBalance": 142.5258, "currency": "USD",
                           "buyingPower": 142.5258, "assetNotional": 0, "openOrders": 0}]}
     assert _account_balance(body) == 142.5258
-    assert _account_flatness(body) == (0.0, 0)
+    assert _account_flatness(body) == (0.0, 0.0)
 
 
 def test_poly_balance_picks_usd_and_flatness():
     body = {"balances": [
         {"currency": "BTC", "buyingPower": 9},
-        {"currency": "USD", "buyingPower": "50.5", "assetNotional": "120", "openOrders": 2},
+        {"currency": "USD", "buyingPower": "50.5", "assetNotional": "120", "openOrders": "2.5"},
     ]}
     assert _account_balance(body) == 50.5
-    assert _account_flatness(body) == (120.0, 2)
+    # Both are notional dollars (floats), not counts.
+    assert _account_flatness(body) == (120.0, 2.5)
+
+
+def test_poly_subdollar_open_order_is_not_flat():
+    # openOrders is a notional value; a sub-$1 open order must still read as non-flat
+    # (the old int() truncation would have dropped it).
+    body = {"balances": [{"currency": "USD", "buyingPower": "50",
+                          "assetNotional": 0, "openOrders": 0.5}]}
+    assert _account_flatness(body) == (0.0, 0.5)
 
 
 def test_poly_balance_legacy_shapes_still_parse():
