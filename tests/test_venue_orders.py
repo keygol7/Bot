@@ -216,15 +216,16 @@ def test_kalshi_account_snapshot_balance_and_positions():
     assert {p.market_id for p in snap.open_positions} == {"KHELD", "KREST"}
 
 
-def test_polymarket_account_snapshot_balance_and_positions():
+def test_polymarket_account_snapshot_flat():
+    # Real shapes: balances list (USD buyingPower) + empty positions object.
     def handler(req):
-        if req.url.path.endswith("/portfolio/balance"):
-            return httpx.Response(200, json={"availableBalance": "300.50"})
+        if req.url.path.endswith("/account/balances"):
+            return httpx.Response(200, json={"balances": [
+                {"currency": "USD", "buyingPower": 142.53,
+                 "assetNotional": 0, "openOrders": 0}]})
         if req.url.path.endswith("/portfolio/positions"):
-            return httpx.Response(200, json={"positions": [
-                {"marketSlug": "held", "quantity": "4"},
-                {"slug": "flat", "quantity": "0", "openOrders": 0},   # dropped
-            ]})
+            return httpx.Response(200, json={"positions": {}, "availablePositions": [],
+                                             "eof": True})
         return httpx.Response(404, json={})
 
     cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
@@ -232,8 +233,29 @@ def test_polymarket_account_snapshot_balance_and_positions():
     v._api_client = _client(handler, cfg.api_base)
     v._auth_headers = lambda m, p: {}
     snap = asyncio.run(v.account_snapshot())
-    assert snap.balance == 300.50
-    assert [p.market_id for p in snap.open_positions] == ["held"]
+    assert snap.balance == 142.53 and snap.open_positions == []
+
+
+def test_polymarket_account_snapshot_non_flat_via_balance_signal():
+    # Positions endpoint empty, but the balance entry says held notional / open orders
+    # -> a synthetic account-level position so the guard still trips.
+    def handler(req):
+        if req.url.path.endswith("/account/balances"):
+            return httpx.Response(200, json={"balances": [
+                {"currency": "USD", "buyingPower": 50.0,
+                 "assetNotional": 120.0, "openOrders": 1}]})
+        if req.url.path.endswith("/portfolio/positions"):
+            return httpx.Response(200, json={"positions": {}, "availablePositions": []})
+        return httpx.Response(404, json={})
+
+    cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
+    v = PolymarketUSVenue(cfg)
+    v._api_client = _client(handler, cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    snap = asyncio.run(v.account_snapshot())
+    assert snap.balance == 50.0
+    assert len(snap.open_positions) == 1
+    assert snap.open_positions[0].resting_orders == 1
 
 
 def test_place_order_requires_credentials():

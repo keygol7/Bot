@@ -98,19 +98,41 @@ def _amount(value: Any) -> float | None:
 
 
 _BALANCE_KEYS = (
-    "availableBalance", "available", "cashBalance", "cash", "buyingPower", "balance",
+    "buyingPower", "currentBalance", "availableBalance", "available",
+    "cashBalance", "cash", "balance",
 )
-_POSITION_CONTAINER_KEYS = ("positions", "marketPositions", "market_positions")
+_POSITION_CONTAINER_KEYS = ("positions", "availablePositions", "marketPositions",
+                            "market_positions")
+
+
+def _usd_balance_entry(body: Any) -> dict | None:
+    """The USD entry from a ``/v1/account/balances`` payload (``{"balances": [...]}``)."""
+    if not isinstance(body, dict):
+        return None
+    entries = body.get("balances")
+    if not isinstance(entries, list):
+        return None
+    dicts = [e for e in entries if isinstance(e, dict)]
+    usd = [e for e in dicts if (e.get("currency") or "USD") == "USD"]
+    pool = usd or dicts
+    return pool[0] if pool else None
 
 
 def _account_balance(body: Any) -> float | None:
-    """Parse available USD balance from a portfolio-balance payload (best-effort)."""
-    if not isinstance(body, dict):
-        return None
-    sources = [body]
-    nested = body.get("balance")
-    if isinstance(nested, dict):
-        sources.append(nested)   # e.g. {"balance": {"availableBalance": ...}}
+    """Available USD buying power from an account-balances payload.
+
+    Primary shape is ``{"balances": [{"currency":"USD","buyingPower":...}]}``; a few
+    flat/legacy shapes are also accepted for resilience.
+    """
+    entry = _usd_balance_entry(body)
+    sources: list[dict] = []
+    if entry is not None:
+        sources.append(entry)
+    if isinstance(body, dict):
+        sources.append(body)
+        nested = body.get("balance")
+        if isinstance(nested, dict):
+            sources.append(nested)   # e.g. {"balance": {"availableBalance": ...}}
     for src in sources:
         for key in _BALANCE_KEYS:
             if key in src and src[key] not in (None, ""):
@@ -120,32 +142,49 @@ def _account_balance(body: Any) -> float | None:
     return None
 
 
+def _account_flatness(body: Any) -> tuple[float, int]:
+    """``(asset_notional, open_orders)`` from the USD balance entry — Polymarket's
+    authoritative flatness signal (notional of held positions + open-order count)."""
+    entry = _usd_balance_entry(body) or {}
+    notional = _amount(entry.get("assetNotional")) or 0.0
+    orders = int(entry.get("openOrders") or 0)
+    return notional, orders
+
+
 def _parse_positions(body: Any):
     """Parse non-flat positions/resting orders from a portfolio-positions payload.
 
-    Raises ``ValueError`` on an unrecognized shape so the startup guard fails closed
-    rather than reading an unparsed account as flat.
+    Polymarket US returns ``{"positions": {...}|[...], "availablePositions": [...]}``;
+    ``positions`` is an object keyed by market (empty ``{}`` when flat). Raises
+    ``ValueError`` on an unrecognized shape so the startup guard fails closed rather
+    than reading an unparsed account as flat.
     """
     from bot.execution.account import VenuePosition
 
+    items: list[tuple[str | None, Any]] = []
     if isinstance(body, list):
-        rows = body
+        items = [(None, r) for r in body]
     elif isinstance(body, dict):
-        rows = next(
-            (body[k] for k in _POSITION_CONTAINER_KEYS if isinstance(body.get(k), list)),
+        container = next(
+            (body[k] for k in _POSITION_CONTAINER_KEYS
+             if isinstance(body.get(k), (list, dict))),
             None,
         )
-        if rows is None:
+        if container is None:
             raise ValueError(f"unrecognized positions payload keys: {sorted(body)}")
+        items = (list(container.items()) if isinstance(container, dict)
+                 else [(None, r) for r in container])
     else:
         raise ValueError("unrecognized positions payload")
 
     out = []
-    for r in rows:
+    for slug_hint, r in items:
+        if not isinstance(r, dict):
+            continue
         slug = (r.get("marketSlug") or r.get("slug") or r.get("market_id")
-                or r.get("ticker") or "")
+                or r.get("ticker") or slug_hint or "")
         qty = _amount(r.get("quantity") or r.get("netQuantity") or r.get("size")
-                      or r.get("position") or r.get("netSize")) or 0.0
+                      or r.get("position") or r.get("netSize") or r.get("netShares")) or 0.0
         resting = int(r.get("openOrders") or r.get("restingOrders")
                       or r.get("resting_orders_count") or 0)
         pos = VenuePosition(slug, qty, resting)
@@ -538,28 +577,34 @@ class PolymarketUSVenue:
     async def account_snapshot(self):
         """Balance + non-flat positions/resting orders, for the startup guard.
 
-        Uses the authenticated ``/v1/portfolio/balance`` and
-        ``/v1/portfolio/positions`` endpoints. Payload field names are parsed
-        defensively; an unrecognized positions shape RAISES (so the guard fails
-        closed and never mistakes an unparsed account for a flat one). The first
-        live run logs the snapshot so the exact shape can be confirmed.
+        Reads ``/v1/account/balances`` (USD ``buyingPower``, plus ``assetNotional`` /
+        ``openOrders`` as the authoritative flatness signal) and
+        ``/v1/portfolio/positions`` (itemized detail). If the account is non-flat by
+        the balance signal but the positions list parses empty, a synthetic
+        account-level position is recorded so the guard still trips. An unrecognized
+        positions shape raises (the guard then fails closed).
         """
-        from bot.execution.account import AccountSnapshot
+        from bot.execution.account import AccountSnapshot, VenuePosition
 
         if not getattr(self.cfg, "is_trading_configured", False):
             raise OrderNotPermitted("Polymarket US trading credentials not configured")
 
         await self._limiter.wait()
-        path = "/v1/portfolio/balance"
+        path = "/v1/account/balances"
         resp = await self._api().get(path, headers=self._auth_headers("GET", path))
         resp.raise_for_status()
-        balance = _account_balance(resp.json())
+        balance_body = resp.json()
+        balance = _account_balance(balance_body)
+        asset_notional, open_orders = _account_flatness(balance_body)
 
         await self._limiter.wait()
         path = "/v1/portfolio/positions"
         resp = await self._api().get(path, headers=self._auth_headers("GET", path))
         resp.raise_for_status()
         positions = _parse_positions(resp.json())
+        if not positions and (asset_notional > 1e-9 or open_orders > 0):
+            positions = [VenuePosition("(account-level)", quantity=asset_notional,
+                                       resting_orders=open_orders)]
         return AccountSnapshot(self.name, balance, positions)
 
     async def aclose(self) -> None:

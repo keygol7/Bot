@@ -7,7 +7,7 @@ import pytest
 from bot.execution.account import AccountSnapshot, VenuePosition
 from bot.execution.risk import RiskManager
 from bot.execution.startup_guard import reconcile_startup
-from bot.venues.polymarket_us import _account_balance, _parse_positions
+from bot.venues.polymarket_us import _account_balance, _account_flatness, _parse_positions
 
 
 class FakeVenue:
@@ -113,30 +113,44 @@ def test_multi_venue_one_bad_fails_all():
 
 # ---- Polymarket payload parsing ----
 
-def test_poly_balance_parses_various_shapes():
+def test_poly_balance_real_shape():
+    # The real /v1/account/balances payload: a per-currency list; USD buyingPower.
+    body = {"balances": [{"currentBalance": 142.5258, "currency": "USD",
+                          "buyingPower": 142.5258, "assetNotional": 0, "openOrders": 0}]}
+    assert _account_balance(body) == 142.5258
+    assert _account_flatness(body) == (0.0, 0)
+
+
+def test_poly_balance_picks_usd_and_flatness():
+    body = {"balances": [
+        {"currency": "BTC", "buyingPower": 9},
+        {"currency": "USD", "buyingPower": "50.5", "assetNotional": "120", "openOrders": 2},
+    ]}
+    assert _account_balance(body) == 50.5
+    assert _account_flatness(body) == (120.0, 2)
+
+
+def test_poly_balance_legacy_shapes_still_parse():
     assert _account_balance({"availableBalance": "123.45"}) == 123.45
-    assert _account_balance({"balance": {"value": "50", "currency": "USD"}}) == 50.0
-    assert _account_balance({"cashBalance": 7}) == 7.0
     assert _account_balance({"unknown": 1}) is None
 
 
-def test_poly_positions_parse_and_filter_flat():
-    body = {"positions": [
-        {"marketSlug": "a", "quantity": "3"},
-        {"slug": "b", "netQuantity": "0", "openOrders": 1},
-        {"slug": "c", "size": "0", "openOrders": 0},     # flat -> dropped
-    ]}
+def test_poly_positions_real_empty_shape():
+    # Flat account: positions is an empty object, availablePositions an empty list.
+    assert _parse_positions({"positions": {}, "availablePositions": [], "eof": True}) == []
+
+
+def test_poly_positions_object_keyed_by_market():
+    body = {"positions": {
+        "mkt-a": {"netShares": "3"},                 # held -> kept, slug from key
+        "mkt-b": {"netShares": "0", "openOrders": 1},  # resting -> kept
+        "mkt-c": {"netShares": "0", "openOrders": 0},  # flat -> dropped
+    }}
     pos = _parse_positions(body)
-    ids = {p.market_id for p in pos}
-    assert ids == {"a", "b"}
+    assert {p.market_id for p in pos} == {"mkt-a", "mkt-b"}
 
 
 def test_poly_positions_unknown_shape_raises():
     # Fail closed: an unrecognized payload must NOT be read as a flat account.
     with pytest.raises(ValueError):
         _parse_positions({"weird": 123})
-
-
-def test_poly_positions_empty_list_ok():
-    assert _parse_positions({"positions": []}) == []
-    assert _parse_positions([]) == []
