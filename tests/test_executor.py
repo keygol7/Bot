@@ -133,6 +133,50 @@ def test_size_capped_by_max_order_contracts():
     assert yes.calls[0][4] == 2                       # requested contracts capped at 2
 
 
+def test_max_size_binds_on_depth():
+    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], max_order_contracts=0)
+    size, caps = ex._max_size(opp(max_contracts=7))   # no balances/order-cap -> depth wins
+    assert size == 7 and min(caps, key=caps.get) == "depth"
+
+
+def test_max_size_binds_on_balance():
+    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], max_order_contracts=0)
+    # YES leg cash: $4 * 0.99 / $0.40 = 9.9 -> 9 contracts (the binding limit).
+    ex.set_balances([type("S", (), {"venue": "kalshi", "balance": 4.0})(),
+                     type("S", (), {"venue": "poly", "balance": 100.0})()])
+    size, caps = ex._max_size(opp(max_contracts=100))
+    assert size == 9 and min(caps, key=caps.get) == "cash_yes"
+
+
+def test_max_size_binds_on_per_market_cap():
+    ex, _ = make_exec(
+        [FakeVenue("kalshi", []), FakeVenue("poly", [])], max_order_contracts=0,
+        limits=RiskLimits(max_position_per_market=20, max_total_exposure=1e9),
+    )
+    # gross 0.95 -> 20 / 0.95 = 21.05 -> 21 contracts.
+    size, caps = ex._max_size(opp(max_contracts=100))
+    assert size == 21 and min(caps, key=caps.get) == "per_market"
+
+
+def test_max_size_no_order_ceiling_when_zero():
+    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], max_order_contracts=0)
+    _, caps = ex._max_size(opp(max_contracts=100))
+    assert "order_cap" not in caps                     # <=0 disables the per-order ceiling
+
+
+def test_balances_decremented_after_success():
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 5, 0.40, requested=5)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 5, 0.55, requested=5)])
+    ex, _ = make_exec([yes, no], max_order_contracts=0)
+    ex.set_balances([type("S", (), {"venue": "kalshi", "balance": 100.0})(),
+                     type("S", (), {"venue": "poly", "balance": 100.0})()])
+    report = asyncio.run(ex.execute(opp(max_contracts=5)))   # depth binds at 5
+    assert report.status is ExecStatus.SUCCESS
+    assert yes.calls[0][4] == 5                              # sized up to depth, not 2
+    assert round(ex._balances["kalshi"], 2) == 98.0          # 100 - 5*0.40
+    assert round(ex._balances["poly"], 2) == 97.25           # 100 - 5*0.55
+
+
 def test_fill_confirmer_overrides_rest_result():
     # REST says KILLED, but the private fill stream confirms a FILL -> executor uses WS.
     class Confirmer:
@@ -171,4 +215,6 @@ def test_risk_cap_skips():
     no = FakeVenue("poly", [])
     ex, _ = make_exec([yes, no], limits=RiskLimits(max_position_per_market=0.5, max_total_exposure=0.5))
     report = asyncio.run(ex.execute(opp()))
-    assert report.status is ExecStatus.SKIPPED and "risk" in report.reason
+    # A risk cap that leaves room for <1 contract is now caught at sizing, naming the
+    # binding constraint (the per-market cap) rather than a generic risk rejection.
+    assert report.status is ExecStatus.SKIPPED and "per_market" in report.reason

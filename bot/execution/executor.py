@@ -67,15 +67,37 @@ class Executor:
         unwind_slippage: float = 0.05,
         fill_confirmer=None,
         confirm_timeout: float = 5.0,
+        balance_buffer: float = 0.99,
     ) -> None:
         self.venues = venues
         self.risk = risk
         self.fee_models = fee_models or {}
         self.store = store
+        # Per-order contract ceiling; <= 0 means "no ceiling" (size up to balances,
+        # depth, and risk caps). Kept as an optional safety cap.
         self.max_order_contracts = max_order_contracts
         self.unwind_slippage = unwind_slippage
         self.fill_confirmer = fill_confirmer       # optional FillTracker (private WS)
         self.confirm_timeout = confirm_timeout
+        # Available cash per venue, seeded from the startup snapshot and decremented as
+        # legs fill. Used to size each arb to the most the funded balances allow.
+        self.balance_buffer = balance_buffer       # leave headroom for fees/slippage
+        self._balances: dict[str, float] = {}
+
+    def set_balances(self, snapshots) -> None:
+        """Seed available cash per venue from account snapshots (startup/refresh)."""
+        for snap in snapshots:
+            bal = getattr(snap, "balance", None)
+            if bal is not None:
+                self._balances[snap.venue] = float(bal)
+
+    def _balance(self, venue: str) -> float | None:
+        return self._balances.get(venue)
+
+    def _spend(self, venue: str, amount: float) -> None:
+        """Adjust tracked cash after a fill (negative ``amount`` credits it back)."""
+        if venue in self._balances:
+            self._balances[venue] = max(0.0, self._balances[venue] - amount)
 
     def _fee(self, venue: str) -> FeeModel:
         return self.fee_models.get(venue, ZeroFeeModel())
@@ -108,16 +130,53 @@ class Executor:
                 log.warning("fill confirm failed for %s: %s", result.order_id, exc)
         return result
 
-    def _size(self, opp: ArbOpportunity) -> int:
-        return int(math.floor(min(self.max_order_contracts, opp.max_contracts)))
+    def _max_size(self, opp: ArbOpportunity) -> tuple[int, dict[str, float]]:
+        """Largest whole-contract size that fits every hard limit at once:
+
+          * available order-book depth (can't fill more than is quoted),
+          * funded cash on each leg's venue (YES leg needs cash on the YES venue at
+            ``yes_price``; NO leg needs cash on the NO venue at ``no_price``),
+          * the per-market and total exposure risk caps,
+          * the optional per-order contract ceiling.
+
+        Returns ``(size, caps)`` where ``caps`` is each constraint's contract limit
+        (for logging why a size was chosen).
+        """
+        label = f"{opp.buy_yes_venue}:{opp.buy_yes_market}"
+        caps: dict[str, float] = {"depth": float(opp.max_contracts)}
+
+        yb, nb = self._balance(opp.buy_yes_venue), self._balance(opp.buy_no_venue)
+        if yb is not None and opp.yes_price > 0:
+            caps["cash_yes"] = (yb * self.balance_buffer) / opp.yes_price
+        if nb is not None and opp.no_price > 0:
+            caps["cash_no"] = (nb * self.balance_buffer) / opp.no_price
+
+        gross = opp.gross_cost
+        if gross > 0:
+            lim = self.risk.limits
+            caps["per_market"] = max(0.0, lim.max_position_per_market - self.risk.position(label)) / gross
+            caps["total"] = max(0.0, lim.max_total_exposure - self.risk.total_exposure) / gross
+
+        if self.max_order_contracts and self.max_order_contracts > 0:
+            caps["order_cap"] = float(self.max_order_contracts)
+
+        return int(math.floor(max(0.0, min(caps.values())))), caps
 
     async def execute(self, opp: ArbOpportunity) -> ExecutionReport:
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
 
-        size = self._size(opp)
+        size, caps = self._max_size(opp)
         if size < 1:
-            return ExecutionReport(ExecStatus.SKIPPED, "size < 1 contract")
+            binding = min(caps, key=caps.get)
+            return ExecutionReport(
+                ExecStatus.SKIPPED,
+                f"size < 1 contract (binding: {binding}={caps[binding]:.3f})",
+            )
+        binding = min(caps, key=caps.get)
+        log.info("sizing %s: %d contracts (binding: %s) caps=%s",
+                 opp.event_key, size, binding,
+                 {k: round(v, 2) for k, v in caps.items()})
 
         notional = size * opp.gross_cost
         label = f"{opp.buy_yes_venue}:{opp.buy_yes_market}"
@@ -170,6 +229,9 @@ class Executor:
 
         self.risk.record_fill(f"{leg1.venue}:{leg1.market_id}", ya * size)
         self.risk.record_pnl(pnl)
+        # Decrement tracked cash so the next arb sizes against what's actually left.
+        self._spend(leg1.venue, ya * size)
+        self._spend(leg2.venue, na * size)
         if self.store is not None:
             self.store.record_fill(leg1.venue, leg1.market_id, "YES", ya, size)
             self.store.record_fill(leg2.venue, leg2.market_id, "NO", na, size)
@@ -199,6 +261,8 @@ class Executor:
         sell_avg = unwind.avg_price if unwind.avg_price is not None else sell_px
         pnl = leg1.filled * (sell_avg - buy_px) - self._fee(leg1.venue).fee(buy_px, leg1.filled)
         self.risk.record_pnl(pnl)
+        # Net cash effect of buying leg1 then selling it back (a small loss).
+        self._spend(leg1.venue, (buy_px - sell_avg) * leg1.filled)
         if self.store is not None:
             self.store.record_fill(leg1.venue, leg1.market_id, "YES", buy_px, leg1.filled)
             self.store.record_fill(unwind.venue, unwind.market_id, "YES_SELL", sell_avg, unwind.filled)

@@ -522,6 +522,21 @@ async def stream(
     complete_fn = make_complete_fn(settings.llm) if use_llm else None
     embed_fn = make_embed_fn(settings.llm) if use_embed else None
 
+    async def refresh_balances():
+        # Re-read available cash per venue so each arb is sized against what's actually
+        # there (covers settlements, deposits, and any drift from the running estimate).
+        snaps = []
+        for v in venues:
+            fn = getattr(v, "account_snapshot", None)
+            if fn is None:
+                continue
+            try:
+                snaps.append(await fn())
+            except Exception as exc:
+                log.warning("balance refresh failed for %s: %s", v.name, exc)
+        if snaps:
+            executor.set_balances(snaps)
+
     async def refresh_specs():
         # Discovery cycle: scans markets + confirms/caches new pairs (embeddings/LLM).
         res = await run_cycle(
@@ -530,6 +545,7 @@ async def stream(
             limit=limit, embed_fn=embed_fn, max_confirms=max_confirms,
             max_resolve_gap_days=max_resolve_gap_days, executor=None,
         )
+        await refresh_balances()
         return await build_watchlist(store.confirmed_pairs(), res.scanned, venues)
 
     async def feed_private(v):
@@ -560,9 +576,15 @@ async def stream(
         store.close()
         return
 
+    # Seed sizing balances from the guard's snapshots (refreshed each cycle thereafter).
+    executor.set_balances(guard.snapshots)
+
     private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
-    log.warning("STREAMING LIVE — real orders on confirmed pairs (max %s ct/order, "
-                "caps $%.0f/$%.0f/$%.0f)", settings.risk.max_order_contracts,
+    ceiling = (f"{settings.risk.max_order_contracts:g} ct/order"
+               if settings.risk.max_order_contracts and settings.risk.max_order_contracts > 0
+               else "no per-order ceiling — sized to balances/depth")
+    log.warning("STREAMING LIVE — real orders on confirmed pairs (%s, "
+                "caps $%.0f/$%.0f/$%.0f)", ceiling,
                 settings.risk.max_position_per_market, settings.risk.max_total_exposure,
                 settings.risk.max_daily_loss)
     try:
