@@ -481,9 +481,9 @@ class KalshiVenue:
             )
             resp.raise_for_status()
             order = resp.json().get("order", {})
-        except Exception as exc:  # network/HTTP error -> position state UNKNOWN
-            return OrderResult(VENUE, market_id, side, action, count, status=OrderStatus.ERROR,
-                               raw={"error": str(exc)})
+        except Exception as exc:  # 4xx -> REJECTED (no fill); else ERROR (unknown)
+            from bot.execution.orders import order_error_result
+            return order_error_result(VENUE, market_id, side, action, count, exc)
 
         filled = float(order.get("fill_count_fp") or order.get("fill_count") or 0)
         price_key = "yes_price_dollars" if side is Side.YES else "no_price_dollars"

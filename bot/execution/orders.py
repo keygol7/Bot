@@ -54,3 +54,28 @@ class OrderResult:
             f"{self.filled:g}/{self.requested:g}@{self.avg_price if self.avg_price is not None else '?'} "
             f"[{self.status.value}]"
         )
+
+
+def order_error_result(venue, market_id, side, action, contracts, exc) -> "OrderResult":
+    """Map a place-order exception to an :class:`OrderResult`, distinguishing a
+    definitive rejection from a truly ambiguous failure.
+
+    A server HTTP 4xx (e.g. 409 Conflict, 400, 422) means the order was NOT created —
+    no position resulted — so it is REJECTED: the executor aborts that one trade
+    cleanly (and can safely unwind the other leg) without tripping the kill switch.
+    Anything else — network error, timeout, 5xx (the request may or may not have been
+    processed) — is ERROR, which keeps the conservative "halt on unknown fill" rule.
+    """
+    resp = getattr(exc, "response", None)
+    code = getattr(resp, "status_code", None)
+    if isinstance(code, int) and 400 <= code < 500:
+        body = None
+        try:
+            body = resp.text[:500]
+        except Exception:
+            pass
+        return OrderResult(venue, market_id, side, action, contracts,
+                           status=OrderStatus.REJECTED,
+                           raw={"http_status": code, "body": body, "error": str(exc)})
+    return OrderResult(venue, market_id, side, action, contracts,
+                       status=OrderStatus.ERROR, raw={"error": str(exc)})

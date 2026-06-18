@@ -95,6 +95,29 @@ def test_leg2_error_halts_and_trips_kill_switch():
     assert risk.is_killed                            # ambiguous hedge state -> stop everything
 
 
+def test_leg1_rejected_aborts_without_halting():
+    # A definitive 4xx rejection (e.g. Kalshi 409) -> no position, abort the single
+    # trade and KEEP trading. Must NOT trip the sticky kill switch.
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.REJECTED, 0, None)])
+    no = FakeVenue("poly", [])                       # leg2 never attempted
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.SKIPPED
+    assert no.calls == [] and not risk.is_killed     # one bad market doesn't freeze the bot
+
+
+def test_leg2_rejected_unwinds_not_halts():
+    # leg1 fills; leg2 cleanly rejected (4xx) -> definitively no leg-2 position -> unwind.
+    yes = FakeVenue("kalshi", [
+        res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),
+        res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.38, action="sell"),
+    ])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.REJECTED, 0, None)])
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.UNWOUND and not risk.is_killed
+
+
 def test_failed_unwind_halts():
     yes = FakeVenue("kalshi", [
         res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),
@@ -208,6 +231,29 @@ def test_fill_confirmer_needs_order_id():
     ex.fill_confirmer = Confirmer()
     report = asyncio.run(ex.execute(opp()))
     assert report.status is ExecStatus.SKIPPED   # leg1 killed, no order id -> skip
+
+
+def test_order_error_result_classification():
+    from types import SimpleNamespace
+
+    from bot.execution.orders import OrderStatus as OS
+    from bot.execution.orders import order_error_result
+
+    # 4xx (server rejected, no fill) -> REJECTED, body captured.
+    http409 = Exception("Client error '409 Conflict'")
+    http409.response = SimpleNamespace(status_code=409, text="market not accepting orders")
+    r = order_error_result("kalshi", "M", Side.YES, "buy", 1, http409)
+    assert r.status is OS.REJECTED and r.raw["http_status"] == 409
+    assert "not accepting" in r.raw["body"]
+
+    # 5xx (ambiguous — may have processed) -> ERROR.
+    http500 = Exception("Server error")
+    http500.response = SimpleNamespace(status_code=500, text="oops")
+    assert order_error_result("kalshi", "M", Side.YES, "buy", 1, http500).status is OS.ERROR
+
+    # Network error (no response) -> ERROR.
+    assert order_error_result("kalshi", "M", Side.YES, "buy", 1,
+                              TimeoutError("timed out")).status is OS.ERROR
 
 
 def test_risk_cap_skips():

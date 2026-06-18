@@ -545,9 +545,9 @@ class PolymarketUSVenue:
             )
             resp.raise_for_status()
             data = resp.json()
-        except Exception as exc:
-            return OrderResult(VENUE, market_id, side, action, contracts,
-                               status=OrderStatus.ERROR, raw={"error": str(exc)})
+        except Exception as exc:  # 4xx -> REJECTED (no fill); else ERROR (unknown)
+            from bot.execution.orders import order_error_result
+            return order_error_result(VENUE, market_id, side, action, contracts, exc)
 
         order = data.get("order", data)
         state = order.get("state") or order.get("orderState") or ""
