@@ -46,6 +46,10 @@ def parse_execution(message: dict[str, Any]):
     etype = str(ex.get("type") or "").replace("EXECUTION_TYPE_", "")
     px = ex.get("lastPx") or {}
     last_px = float(px["value"]) if isinstance(px, dict) and px.get("value") not in (None, "") else None
+    # lastPx is the YES/long-side price; for a SHORT (NO) order convert to the NO cost.
+    intent = str(order.get("intent") or ex.get("intent") or "")
+    if last_px is not None and "SHORT" in intent.upper():
+        last_px = round(1.0 - last_px, 6)
     ls = ex.get("lastShares")
     last_shares = float(ls) if ls not in (None, "") else 0.0
     return FillEvent(VENUE, str(order_id), etype, last_shares, last_px)
@@ -552,6 +556,13 @@ class PolymarketUSVenue:
         avg_price = None
         if isinstance(avg, dict) and avg.get("value") not in (None, ""):
             avg_price = float(avg["value"])
+        elif avg not in (None, "") and not isinstance(avg, dict):
+            avg_price = float(avg)
+        # avgPx is always the YES/long-side price; convert back to the side we bought
+        # so avg_price is the actual cost of that side (NO cost = 1 - YES-side price).
+        # Without this, a NO fill at $0.855 records as $0.145 and inflates the edge/PnL.
+        if avg_price is not None and side is Side.NO:
+            avg_price = round(1.0 - avg_price, 6)
         if state == _TERMINAL_FILLED or filled >= contracts - 1e-9:
             status = OrderStatus.FILLED
         elif state in _REJECTED:

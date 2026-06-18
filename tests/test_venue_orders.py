@@ -57,9 +57,10 @@ def test_polymarket_buy_no_request_and_fill():
 
     def handler(req):
         cap["body"] = json.loads(req.content)
+        # avgPx is YES-side: a NO bought at 0.55 fills at YES-side 0.45.
         return httpx.Response(200, json={"order": {
             "id": "o1", "state": "ORDER_STATE_FILLED", "cumQuantity": 2,
-            "avgPx": {"value": "0.55", "currency": "USD"}}})
+            "avgPx": {"value": "0.45", "currency": "USD"}}})
 
     cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")  # is_trading_configured -> True
     v = PolymarketUSVenue(cfg)
@@ -73,6 +74,37 @@ def test_polymarket_buy_no_request_and_fill():
     assert cap["body"]["manualOrderIndicator"] == "MANUAL_ORDER_INDICATOR_AUTOMATIC"
     assert cap["body"]["tif"] == "TIME_IN_FORCE_FILL_OR_KILL"
     assert r.status.value == "FILLED" and r.filled == 2
+    # avg_price is the NO cost (1 - YES-side 0.45 = 0.55), NOT the raw YES-side value.
+    assert r.avg_price == 0.55
+
+
+def test_polymarket_no_fill_avg_price_not_inverted():
+    # Regression: the real UZB-COL trade. NO leg filled at $0.855 (YES-side 0.145);
+    # it must record 0.855, not 0.145 (which inflated a 4c arb into a fake 75c one).
+    def handler(req):
+        return httpx.Response(200, json={"order": {
+            "id": "o", "state": "ORDER_STATE_FILLED", "cumQuantity": 2,
+            "avgPx": {"value": "0.145", "currency": "USD"}}})
+
+    cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
+    v = PolymarketUSVenue(cfg)
+    v._api_client = _client(handler, cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    r = asyncio.run(v.place_order("astatc-fwc-uzb-col", Side.NO, "buy", 0.855, 2))
+    assert r.status.value == "FILLED"
+    assert r.avg_price == 0.855          # 1 - 0.145, the true NO cost
+
+    # YES legs are reported on the same side, so they pass through unchanged.
+    def yes_handler(req):
+        return httpx.Response(200, json={"order": {
+            "id": "y", "state": "ORDER_STATE_FILLED", "cumQuantity": 2,
+            "avgPx": {"value": "0.105", "currency": "USD"}}})
+
+    v2 = PolymarketUSVenue(cfg)
+    v2._api_client = _client(yes_handler, cfg.api_base)
+    v2._auth_headers = lambda m, p: {}
+    ry = asyncio.run(v2.place_order("slug", Side.YES, "buy", 0.105, 2))
+    assert ry.avg_price == 0.105
 
 
 def test_polymarket_buy_yes_price_is_yes_side():

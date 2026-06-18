@@ -57,6 +57,22 @@ def test_parse_polymarket_execution():
     assert ev.exec_type == "PARTIAL_FILL" and ev.last_shares == 0.25 and ev.last_px == 0.555
 
 
+def test_parse_polymarket_execution_long_is_unchanged():
+    # A LONG (YES) fill: lastPx is the YES price, used as-is.
+    msg = {"orderSubscriptionUpdate": {"execution": {
+        "id": "e", "order": {"id": "o", "intent": "ORDER_INTENT_BUY_LONG"},
+        "lastShares": "2", "lastPx": {"value": "0.10"}, "type": "EXECUTION_TYPE_FILL"}}}
+    assert parse_execution(msg).last_px == 0.10
+
+
+def test_parse_polymarket_execution_short_inverts_price():
+    # A SHORT (NO) fill: lastPx is YES-side (0.145); the NO cost is 1 - 0.145 = 0.855.
+    msg = {"orderSubscriptionUpdate": {"execution": {
+        "id": "e", "order": {"id": "o", "intent": "ORDER_INTENT_BUY_SHORT"},
+        "lastShares": "2", "lastPx": {"value": "0.145"}, "type": "EXECUTION_TYPE_FILL"}}}
+    assert parse_execution(msg).last_px == 0.855
+
+
 def test_parse_polymarket_non_execution_is_none():
     assert parse_execution({"heartbeat": {}}) is None
     assert parse_execution({"orderSubscriptionSnapshot": {"orders": []}}) is None

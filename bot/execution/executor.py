@@ -98,7 +98,11 @@ class Executor:
                     result.venue, result.order_id, contracts, self.confirm_timeout
                 )
                 result.status, result.filled = status, filled
-                if avg is not None:
+                # The confirmer is authoritative for status/filled, but its price is
+                # raw venue convention (Polymarket reports the YES-side price). Prefer
+                # the per-venue-converted price from place_order; only fall back to the
+                # confirmer's when place_order returned none.
+                if avg is not None and result.avg_price is None:
                     result.avg_price = avg
             except Exception as exc:  # confirmer failure -> keep REST result
                 log.warning("fill confirm failed for %s: %s", result.order_id, exc)
