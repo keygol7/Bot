@@ -201,6 +201,42 @@ def test_prime_and_sweep_seeds_book_and_executes():
     assert len(fe.calls) == 1                          # edge found purely from the prime
 
 
+def test_inflight_execution_survives_consumer_cancellation():
+    # The real bug: a trade fires in the last instant of an interval; run() then
+    # cancels the consumer task that launched it. The shielded execute() must still
+    # run to completion (not be aborted mid-order), and run() must wait for it.
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = []
+
+    class SlowExec:
+        async def execute(self, opp):
+            started.set()
+            await release.wait()        # simulate an in-flight leg placement
+            finished.append(opp.event_key)
+            return f"done {opp.event_key}"
+
+    eng = make_engine(SlowExec())
+
+    async def driver():
+        # First leg seeds the book; the second leg (in a consumer-like task) is what
+        # fires the trade — and that task is the one cancelled mid-flight.
+        await eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
+        consumer = asyncio.create_task(
+            eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60))
+        )
+        await started.wait()
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        assert finished == []                 # still in flight, NOT aborted by cancel
+        assert eng._inflight                  # run() would wait on this
+        release.set()
+        await asyncio.gather(*list(eng._inflight), return_exceptions=True)
+        assert finished == ["E1"]             # completed to a definitive outcome
+
+    asyncio.run(driver())
+
+
 def test_consume_counts_ws_quotes_for_health():
     # The WS-health heartbeat: _consume must count each tick per venue so the run
     # loop can report whether a venue's WebSocket is actually delivering data.

@@ -79,6 +79,7 @@ class StreamingEngine:
         self._index: dict[tuple[str, str], set] = {}   # (venue,market) -> set of pair keys
         self._last_acted: dict[tuple, float] = {}
         self._ws_counts: dict[str, int] = {}   # venue -> quotes seen since last refresh
+        self._inflight: set = set()             # in-flight execute() tasks (cancel-shielded)
 
     def _fee(self, venue: str) -> FeeModel:
         return self.fee_models.get(venue, ZeroFeeModel())
@@ -179,9 +180,21 @@ class StreamingEngine:
             return None
         opp = self._build_opp(p, edge, yq, nq, size)
         log.info("STREAM edge %.4f sz %g on %s -> executing", edge, size, p.event_key)
-        report = await self.executor.execute(opp)
+        report = await self._execute_guarded(opp)
         log.info("STREAM exec %s | %s", p.event_key, report)
         return report
+
+    async def _execute_guarded(self, opp):
+        """Run ``executor.execute`` so a refresh-boundary consumer cancellation can
+        never abort a half-placed trade. The execution runs as a tracked task and is
+        awaited via ``asyncio.shield``: if our caller (a consumer) is cancelled, the
+        trade keeps running to a definitive outcome (locked / unwound / halted) and
+        ``run()`` awaits it before the next cycle. Leaving an order placed-but-tracked
+        is the whole point — an abandoned leg is the dangerous state, not a slow one."""
+        task = asyncio.ensure_future(self.executor.execute(opp))
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
+        return await asyncio.shield(task)
 
     async def on_quote(self, q: MarketQuote):
         """Process one live quote: update the book, then act on any pair it touches.
@@ -258,6 +271,14 @@ class StreamingEngine:
                 for c in consumers:
                     c.cancel()
                 await asyncio.gather(*consumers, return_exceptions=True)
+                # A trade may have fired in the last instant before the interval
+                # ended; the consumer that launched it is now cancelled, but the
+                # shielded execution survives. Wait it out so we never start a new
+                # cycle (or exit) with an order still in flight.
+                if self._inflight:
+                    log.warning("waiting for %d in-flight execution(s) to settle "
+                                "before refresh", len(self._inflight))
+                    await asyncio.gather(*list(self._inflight), return_exceptions=True)
             # WS health: how many live ticks each venue delivered this interval. A
             # venue at 0 means its market WebSocket isn't feeding the fast path.
             counts = {v.name: self._ws_counts.get(v.name, 0) for v in venues}
