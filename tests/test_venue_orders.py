@@ -196,6 +196,46 @@ def test_polymarket_is_open_uses_bbo_never_false():
     assert asyncio.run(v.is_open("goneslug")) is None     # unknown -> keep, never False
 
 
+def test_kalshi_account_snapshot_balance_and_positions():
+    def handler(req):
+        if req.url.path.endswith("/portfolio/balance"):
+            return httpx.Response(200, json={"balance": 25000})        # cents -> $250.00
+        if req.url.path.endswith("/portfolio/positions"):
+            return httpx.Response(200, json={"market_positions": [
+                {"ticker": "KHELD", "position": 5, "resting_orders_count": 0},
+                {"ticker": "KREST", "position": 0, "resting_orders_count": 2},
+                {"ticker": "KFLAT", "position": 0, "resting_orders_count": 0},  # dropped
+            ]})
+        return httpx.Response(404, json={})
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    snap = asyncio.run(v.account_snapshot())
+    assert snap.balance == 250.0
+    assert {p.market_id for p in snap.open_positions} == {"KHELD", "KREST"}
+
+
+def test_polymarket_account_snapshot_balance_and_positions():
+    def handler(req):
+        if req.url.path.endswith("/portfolio/balance"):
+            return httpx.Response(200, json={"availableBalance": "300.50"})
+        if req.url.path.endswith("/portfolio/positions"):
+            return httpx.Response(200, json={"positions": [
+                {"marketSlug": "held", "quantity": "4"},
+                {"slug": "flat", "quantity": "0", "openOrders": 0},   # dropped
+            ]})
+        return httpx.Response(404, json={})
+
+    cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
+    v = PolymarketUSVenue(cfg)
+    v._api_client = _client(handler, cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    snap = asyncio.run(v.account_snapshot())
+    assert snap.balance == 300.50
+    assert [p.market_id for p in snap.open_positions] == ["held"]
+
+
 def test_place_order_requires_credentials():
     from bot.venues.base import OrderNotPermitted
 

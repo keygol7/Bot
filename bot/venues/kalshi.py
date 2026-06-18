@@ -514,6 +514,37 @@ class KalshiVenue:
     async def get_positions(self) -> dict:
         raise NotImplementedError("positions endpoint lands with the live phase")
 
+    async def account_snapshot(self):
+        """Balance + non-flat positions/resting orders, for the startup guard.
+
+        Uses the authenticated portfolio endpoints: ``/portfolio/balance`` (cents)
+        and ``/portfolio/positions`` (``market_positions`` with signed ``position``
+        and ``resting_orders_count``). Raises on any HTTP error so the guard fails
+        closed rather than assuming the account is flat.
+        """
+        from bot.execution.account import AccountSnapshot, VenuePosition
+
+        await self._limiter.wait()
+        resp = await self._http().get(
+            "/portfolio/balance", headers=self._auth_headers("GET", "/portfolio/balance")
+        )
+        resp.raise_for_status()
+        bal = resp.json().get("balance")
+        balance = float(bal) / 100.0 if bal not in (None, "") else None
+
+        await self._limiter.wait()
+        endpoint = "/portfolio/positions"
+        resp = await self._http().get(endpoint, headers=self._auth_headers("GET", endpoint))
+        resp.raise_for_status()
+        positions = []
+        for mp in resp.json().get("market_positions") or []:
+            qty = float(mp.get("position") or 0)
+            resting = int(mp.get("resting_orders_count") or 0)
+            pos = VenuePosition(mp.get("ticker", ""), qty, resting)
+            if pos.is_open:
+                positions.append(pos)
+        return AccountSnapshot(self.name, balance, positions)
+
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()

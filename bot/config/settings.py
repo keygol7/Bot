@@ -94,6 +94,10 @@ class Settings:
     llm: LLMConfig = field(default_factory=LLMConfig)
     risk: RiskLimits = field(default_factory=RiskLimits)
     db_path: str = "data/bot.db"
+    # Startup reconciliation guard: minimum balance required per trading venue, and
+    # whether to allow pre-existing positions (default: refuse to trade if not flat).
+    startup_min_balance: float = 0.0
+    startup_allow_positions: bool = False
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -133,4 +137,8 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
             max_order_contracts=_env_float("RISK_MAX_ORDER_CONTRACTS", 2.0),
         ),
         db_path=env("BOT_DB_PATH", "data/bot.db"),
+        startup_min_balance=_env_float("STARTUP_MIN_BALANCE", 0.0),
+        startup_allow_positions=(
+            env("STARTUP_ALLOW_POSITIONS", "false") or "false"
+        ).lower() == "true",
     )

@@ -97,6 +97,63 @@ def _amount(value: Any) -> float | None:
         return None
 
 
+_BALANCE_KEYS = (
+    "availableBalance", "available", "cashBalance", "cash", "buyingPower", "balance",
+)
+_POSITION_CONTAINER_KEYS = ("positions", "marketPositions", "market_positions")
+
+
+def _account_balance(body: Any) -> float | None:
+    """Parse available USD balance from a portfolio-balance payload (best-effort)."""
+    if not isinstance(body, dict):
+        return None
+    sources = [body]
+    nested = body.get("balance")
+    if isinstance(nested, dict):
+        sources.append(nested)   # e.g. {"balance": {"availableBalance": ...}}
+    for src in sources:
+        for key in _BALANCE_KEYS:
+            if key in src and src[key] not in (None, ""):
+                value = _amount(src[key])
+                if value is not None:
+                    return value
+    return None
+
+
+def _parse_positions(body: Any):
+    """Parse non-flat positions/resting orders from a portfolio-positions payload.
+
+    Raises ``ValueError`` on an unrecognized shape so the startup guard fails closed
+    rather than reading an unparsed account as flat.
+    """
+    from bot.execution.account import VenuePosition
+
+    if isinstance(body, list):
+        rows = body
+    elif isinstance(body, dict):
+        rows = next(
+            (body[k] for k in _POSITION_CONTAINER_KEYS if isinstance(body.get(k), list)),
+            None,
+        )
+        if rows is None:
+            raise ValueError(f"unrecognized positions payload keys: {sorted(body)}")
+    else:
+        raise ValueError("unrecognized positions payload")
+
+    out = []
+    for r in rows:
+        slug = (r.get("marketSlug") or r.get("slug") or r.get("market_id")
+                or r.get("ticker") or "")
+        qty = _amount(r.get("quantity") or r.get("netQuantity") or r.get("size")
+                      or r.get("position") or r.get("netSize")) or 0.0
+        resting = int(r.get("openOrders") or r.get("restingOrders")
+                      or r.get("resting_orders_count") or 0)
+        pos = VenuePosition(slug, qty, resting)
+        if pos.is_open:
+            out.append(pos)
+    return out
+
+
 def normalize_bbo(
     slug: str, title: str, market_data: dict[str, Any], *, event_key: str | None = None
 ) -> MarketQuote:
@@ -477,6 +534,33 @@ class PolymarketUSVenue:
 
     async def get_positions(self) -> dict:
         raise NotImplementedError("positions endpoint lands with the live phase")
+
+    async def account_snapshot(self):
+        """Balance + non-flat positions/resting orders, for the startup guard.
+
+        Uses the authenticated ``/v1/portfolio/balance`` and
+        ``/v1/portfolio/positions`` endpoints. Payload field names are parsed
+        defensively; an unrecognized positions shape RAISES (so the guard fails
+        closed and never mistakes an unparsed account for a flat one). The first
+        live run logs the snapshot so the exact shape can be confirmed.
+        """
+        from bot.execution.account import AccountSnapshot
+
+        if not getattr(self.cfg, "is_trading_configured", False):
+            raise OrderNotPermitted("Polymarket US trading credentials not configured")
+
+        await self._limiter.wait()
+        path = "/v1/portfolio/balance"
+        resp = await self._api().get(path, headers=self._auth_headers("GET", path))
+        resp.raise_for_status()
+        balance = _account_balance(resp.json())
+
+        await self._limiter.wait()
+        path = "/v1/portfolio/positions"
+        resp = await self._api().get(path, headers=self._auth_headers("GET", path))
+        resp.raise_for_status()
+        positions = _parse_positions(resp.json())
+        return AccountSnapshot(self.name, balance, positions)
 
     async def aclose(self) -> None:
         for attr in ("_gateway_client", "_api_client"):

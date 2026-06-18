@@ -541,6 +541,25 @@ async def stream(
         except Exception as exc:
             log.warning("private stream %s ended: %s", v.name, exc)
 
+    # Startup reconciliation: every trading venue must be funded and flat before a
+    # single order can be placed. A leftover leg from a prior crash/abort would turn
+    # a market-neutral arb into naked risk; this fails closed (kill switch) if so.
+    from bot.execution.startup_guard import reconcile_startup
+
+    guard = await reconcile_startup(
+        venues, risk,
+        min_balance=settings.startup_min_balance,
+        allow_existing_positions=settings.startup_allow_positions,
+    )
+    if not guard.ok:
+        log.critical("aborting stream — startup guard failed: %s", "; ".join(guard.reasons))
+        for v in venues:
+            aclose = getattr(v, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        store.close()
+        return
+
     private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
     log.warning("STREAMING LIVE — real orders on confirmed pairs (max %s ct/order, "
                 "caps $%.0f/$%.0f/$%.0f)", settings.risk.max_order_contracts,

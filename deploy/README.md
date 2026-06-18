@@ -54,10 +54,19 @@ sudo journalctl --vacuum-time=14d     # keep ~2 weeks
 ```
 
 ## Safety reminders for the streaming (live) unit
+- **Startup reconciliation guard:** on boot the stream reads each trading venue's
+  balance and positions; it refuses to trade (trips the kill switch, then aborts)
+  unless every venue is funded (≥ `STARTUP_MIN_BALANCE`) and **flat** — no held
+  positions and no resting orders. Set `STARTUP_ALLOW_POSITIONS=true` only if you
+  deliberately want to run with pre-existing positions. After a crash, just restart:
+  the guard catches a leftover/abandoned leg rather than trading on top of it.
+  - The guard logs the snapshot it read (`startup: <venue> balance $X`). On the first
+    live run, confirm those balances match your accounts — the Polymarket US
+    portfolio-payload field names are parsed defensively and an unrecognized shape
+    fails closed (the guard aborts) rather than assuming you're flat.
 - `Restart=on-failure` only — after **any crash during live trading**, run
-  `systemctl status arbbot-stream` and **manually check your open positions on both
-  venues** before restarting. The bot does not reconcile pre-existing positions on
-  startup.
+  `systemctl status arbbot-stream` and check the startup-guard output (or your venue
+  UIs) before relying on it again.
 - The kill switch is in-memory; a restart resets it. If it tripped (see the logs for
-  `HALT`), investigate the cause before re-enabling.
+  `HALT` or `STARTUP GUARD FAILED`), investigate the cause before re-enabling.
 - Review results: `sqlite3 ~/Bot/data/bot.db "SELECT * FROM fills; SELECT * FROM pnl;"`
