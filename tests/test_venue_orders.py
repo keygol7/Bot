@@ -199,7 +199,8 @@ def test_polymarket_is_open_uses_bbo_never_false():
 def test_kalshi_account_snapshot_balance_and_positions():
     def handler(req):
         if req.url.path.endswith("/portfolio/balance"):
-            return httpx.Response(200, json={"balance": 25000})        # cents -> $250.00
+            # Real shape: integer cents + exact dollar string (the latter preferred).
+            return httpx.Response(200, json={"balance": 25000, "balance_dollars": "250.00"})
         if req.url.path.endswith("/portfolio/positions"):
             return httpx.Response(200, json={"market_positions": [
                 {"ticker": "KHELD", "position": 5, "resting_orders_count": 0},
@@ -214,6 +215,20 @@ def test_kalshi_account_snapshot_balance_and_positions():
     snap = asyncio.run(v.account_snapshot())
     assert snap.balance == 250.0
     assert {p.market_id for p in snap.open_positions} == {"KHELD", "KREST"}
+
+
+def test_kalshi_account_snapshot_cents_fallback():
+    # Older/edge payload with only integer cents -> divide by 100.
+    def handler(req):
+        if req.url.path.endswith("/portfolio/balance"):
+            return httpx.Response(200, json={"balance": 11552})
+        return httpx.Response(200, json={"market_positions": []})
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    snap = asyncio.run(v.account_snapshot())
+    assert snap.balance == 115.52 and snap.open_positions == []
 
 
 def test_polymarket_account_snapshot_flat():

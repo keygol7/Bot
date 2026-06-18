@@ -529,8 +529,16 @@ class KalshiVenue:
             "/portfolio/balance", headers=self._auth_headers("GET", "/portfolio/balance")
         )
         resp.raise_for_status()
-        bal = resp.json().get("balance")
-        balance = float(bal) / 100.0 if bal not in (None, "") else None
+        body = resp.json()
+        # Prefer the exact dollar string; fall back to the integer-cents field.
+        bal_dollars = body.get("balance_dollars")
+        bal_cents = body.get("balance")
+        if bal_dollars not in (None, ""):
+            balance = float(bal_dollars)
+        elif bal_cents not in (None, ""):
+            balance = float(bal_cents) / 100.0
+        else:
+            balance = None
 
         await self._limiter.wait()
         endpoint = "/portfolio/positions"
