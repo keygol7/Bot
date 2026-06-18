@@ -270,6 +270,22 @@ async def run_cycle(
     return result
 
 
+def apply_balance_caps(risk, snapshots) -> float:
+    """Set the per-market and total exposure caps from the live balance check.
+
+    Both are set to the sum of funded venue balances so the funded cash (tracked
+    per-venue in the executor) is the real limit — no hardcoded dollar caps. Returns
+    the total used (0.0 if no balances were readable, leaving the caps unchanged).
+    """
+    total = sum(s.balance for s in snapshots if getattr(s, "balance", None) is not None)
+    if total <= 0:
+        return 0.0
+    risk.limits.max_total_exposure = total
+    risk.limits.max_position_per_market = total
+    log.info("risk caps set from balances: per-market=$%.2f total=$%.2f", total, total)
+    return total
+
+
 def _build_venues(settings: Settings) -> list:
     """Both venues read live. Polymarket US market data is on a PUBLIC gateway, so
     no credentials are needed for the dry run — they're only required to place
@@ -536,6 +552,8 @@ async def stream(
                 log.warning("balance refresh failed for %s: %s", v.name, exc)
         if snaps:
             executor.set_balances(snaps)
+            if settings.risk_caps_from_balance:
+                apply_balance_caps(risk, snaps)
 
     async def refresh_specs():
         # Discovery cycle: scans markets + confirms/caches new pairs (embeddings/LLM).
@@ -578,6 +596,8 @@ async def stream(
 
     # Seed sizing balances from the guard's snapshots (refreshed each cycle thereafter).
     executor.set_balances(guard.snapshots)
+    if settings.risk_caps_from_balance:
+        apply_balance_caps(risk, guard.snapshots)
 
     private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
     ceiling = (f"{settings.risk.max_order_contracts:g} ct/order"

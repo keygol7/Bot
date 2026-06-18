@@ -563,3 +563,29 @@ def test_check_ws_probe_times_out_when_silent():
 
     ok, msg, samples = asyncio.run(_probe_stream(SilentVenue(), ["P1"], n=1, timeout=0.1))
     assert not ok and samples == [] and "timeout" in msg
+
+
+def test_apply_balance_caps_sets_from_balances():
+    from types import SimpleNamespace
+
+    from bot.dryrun import apply_balance_caps
+
+    risk = RiskManager(RiskLimits(max_position_per_market=20, max_total_exposure=50))
+    snaps = [SimpleNamespace(venue="kalshi", balance=115.52),
+             SimpleNamespace(venue="polymarket_us", balance=142.53)]
+    total = apply_balance_caps(risk, snaps)
+    assert round(total, 2) == 258.05
+    assert risk.limits.max_total_exposure == total
+    assert risk.limits.max_position_per_market == total
+
+
+def test_apply_balance_caps_noop_when_no_balance():
+    from types import SimpleNamespace
+
+    from bot.dryrun import apply_balance_caps
+
+    risk = RiskManager(RiskLimits(max_position_per_market=20, max_total_exposure=50))
+    total = apply_balance_caps(risk, [SimpleNamespace(venue="x", balance=None)])
+    assert total == 0.0
+    assert risk.limits.max_total_exposure == 50      # caps left unchanged
+    assert risk.limits.max_position_per_market == 20

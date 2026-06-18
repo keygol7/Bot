@@ -98,6 +98,10 @@ class Settings:
     # whether to allow pre-existing positions (default: refuse to trade if not flat).
     startup_min_balance: float = 0.0
     startup_allow_positions: bool = False
+    # When true, the per-market and total exposure caps are set from the live balance
+    # check (sum of funded venue balances) at startup and each refresh — so "balances
+    # are the limit" without hardcoding dollar caps. Overrides RISK_MAX_* exposure caps.
+    risk_caps_from_balance: bool = False
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -140,5 +144,8 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         startup_min_balance=_env_float("STARTUP_MIN_BALANCE", 0.0),
         startup_allow_positions=(
             env("STARTUP_ALLOW_POSITIONS", "false") or "false"
+        ).lower() == "true",
+        risk_caps_from_balance=(
+            env("RISK_CAPS_FROM_BALANCE", "false") or "false"
         ).lower() == "true",
     )
