@@ -934,6 +934,54 @@ def inspect_matches(
         store.close()
 
 
+def probe_account(settings: Settings) -> int:
+    """Discover the Polymarket US account/portfolio REST endpoints empirically.
+
+    Signs and GETs a ranked list of candidate paths (balance is under ``account``,
+    positions under ``portfolio`` per the official SDK) and prints the status + a
+    JSON snippet for any that return 200, so the real paths/shapes can be locked in
+    without guessing. Read-only — never places an order.
+    """
+    from bot.venues.polymarket_us import PolymarketUSVenue
+
+    if not settings.qcex.is_trading_configured:
+        print("Polymarket US trading creds not configured "
+              "(set QCEX_API_KEY_ID + QCEX_SECRET_KEY or the PEM path)")
+        return 1
+
+    v = PolymarketUSVenue(settings.qcex)
+    candidates = {
+        "BALANCE": [
+            "/v1/account/balances", "/v1/account/balance", "/v1/account",
+            "/v1/balances", "/v1/balance", "/v1/portfolio/balances",
+        ],
+        "POSITIONS": [
+            "/v1/portfolio/positions", "/v1/positions", "/v1/account/positions",
+        ],
+    }
+
+    async def _probe():
+        client = v._api()
+        for label, paths in candidates.items():
+            print(f"\n== {label} ==")
+            for path in paths:
+                await v._limiter.wait()
+                try:
+                    resp = await client.get(path, headers=v._auth_headers("GET", path))
+                except Exception as exc:
+                    print(f"  {path}  ERROR {exc}")
+                    continue
+                marker = "  <-- 200 OK" if resp.status_code == 200 else ""
+                print(f"  {resp.status_code:>3}  {path}{marker}")
+                if resp.status_code == 200:
+                    print(f"       body: {resp.text[:600]}")
+        await v.aclose()
+
+    asyncio.run(_probe())
+    print("\nPaste the 200-OK path(s) + body above and I'll lock the parser.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Live read-only DRY_RUN arbitrage monitor")
     p.add_argument("--check-llm", action="store_true",
@@ -946,6 +994,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--count-markets", action="store_true",
                    help="pull every open market from each venue, print the counts, "
                         "and exit (no matching)")
+    p.add_argument("--probe-account", action="store_true",
+                   help="probe Polymarket US account/portfolio endpoints (read-only) "
+                        "to discover the real balance/positions paths")
     p.add_argument("--show-book", metavar="VENUE:MARKET", default=None,
                    help="fetch and print one market's real order book (sized quote)")
     p.add_argument("--test-order", metavar="VENUE:MARKET", default=None,
@@ -1010,6 +1061,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.count_markets:
         raise SystemExit(count_markets(load_settings()))
+
+    if args.probe_account:
+        raise SystemExit(probe_account(load_settings()))
 
     if args.show_book:
         raise SystemExit(show_book(load_settings(), args.show_book))
