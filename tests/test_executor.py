@@ -76,6 +76,22 @@ def test_leg2_killed_unwinds_leg1():
     assert yes.calls[1][2] == "sell"                 # second yes call was the unwind
 
 
+def test_leg1_partial_unwinds_not_halts():
+    # FoK partial-filled leg1 (observed on Polymarket, e.g. 0.62/6). The known filled
+    # amount is unwound and the bot keeps running — no halt, no naked position.
+    yes = FakeVenue("kalshi", [
+        res("kalshi", Side.YES, OrderStatus.PARTIAL, 0.62, 0.40, requested=6),
+        res("kalshi", Side.YES, OrderStatus.FILLED, 0.62, 0.38, action="sell", requested=0.62),
+    ])
+    no = FakeVenue("poly", [])                       # leg2 never attempted on a partial leg1
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp(max_contracts=6)))
+    assert report.status is ExecStatus.UNWOUND
+    assert not risk.is_killed                         # bot keeps trading
+    assert no.calls == []                             # no hedge leg placed
+    assert yes.calls[1][2] == "sell"                  # the partial was sold back
+
+
 def test_leg1_killed_skips_no_position():
     yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.KILLED, 0, None)])
     no = FakeVenue("poly", [])  # must never be called

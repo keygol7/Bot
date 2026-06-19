@@ -200,8 +200,12 @@ class Executor:
             return self._halt("leg1 ERROR — fill state unknown", [leg1])
         if not leg1.left_a_position:
             return ExecutionReport(ExecStatus.SKIPPED, f"leg1 not filled ({leg1.status.value})", [leg1])
-        if not leg1.filled_fully:  # PARTIAL on an all-or-nothing leg — shouldn't happen
-            return self._halt("leg1 partial fill — unexpected", [leg1])
+        if not leg1.filled_fully:
+            # FoK didn't behave all-or-nothing (observed on Polymarket: a 0.62/6 fill).
+            # The filled amount is KNOWN (not ambiguous), so unwind that portion and skip
+            # rather than halting the whole bot and stranding a naked leg.
+            log.warning("leg1 PARTIAL %g/%g — unwinding the filled portion", leg1.filled, size)
+            return await self._unwind(opp, leg1, None, reason="leg1 partial fill")
 
         # ----- Leg 2: buy NO (fill-or-kill) -----
         leg2 = await self._place(
@@ -241,8 +245,10 @@ class Executor:
         log.info("ARB LOCKED %s | pnl=%+.2f", opp.event_key, pnl)
         return ExecutionReport(ExecStatus.SUCCESS, "both legs filled", [leg1, leg2], pnl)
 
-    async def _unwind(self, opp, leg1, leg2) -> ExecutionReport:
-        """Sell leg 1 back (IOC, slippage-tolerant) to return to flat."""
+    async def _unwind(self, opp, leg1, leg2, *, reason: str = "leg2 failed") -> ExecutionReport:
+        """Sell the filled leg-1 quantity back (IOC, slippage-tolerant) to return to
+        flat. Used both when leg 2 cleanly fails and when leg 1 itself partial-fills
+        (``leg2`` is then ``None``)."""
         venue = self.venues[leg1.venue]
         buy_px = leg1.avg_price if leg1.avg_price is not None else opp.yes_price
         sell_px = max(0.01, round(buy_px - self.unwind_slippage, 4))  # aggressive to cross
@@ -251,11 +257,11 @@ class Executor:
         )
         log.warning("unwind %s", unwind)
 
+        legs = [leg1] + ([leg2] if leg2 is not None else []) + [unwind]
         if not unwind.filled_fully:
             # Couldn't flatten -> we're still holding a one-sided position. Stop everything.
             return self._halt(
-                "UNWIND FAILED — still holding leg1, manual action required",
-                [leg1, leg2, unwind],
+                "UNWIND FAILED — still holding leg1, manual action required", legs,
             )
 
         sell_avg = unwind.avg_price if unwind.avg_price is not None else sell_px
@@ -266,10 +272,10 @@ class Executor:
         if self.store is not None:
             self.store.record_fill(leg1.venue, leg1.market_id, "YES", buy_px, leg1.filled)
             self.store.record_fill(unwind.venue, unwind.market_id, "YES_SELL", sell_avg, unwind.filled)
-            self.store.record_pnl(pnl, note="leg-failure unwind")
+            self.store.record_pnl(pnl, note=f"unwind ({reason})")
         self._audit("execute_unwound", opp, pnl=pnl)
-        log.warning("UNWOUND %s | pnl=%+.2f", opp.event_key, pnl)
-        return ExecutionReport(ExecStatus.UNWOUND, "leg2 failed; leg1 unwound", [leg1, leg2, unwind], pnl)
+        log.warning("UNWOUND %s (%s) | pnl=%+.2f", opp.event_key, reason, pnl)
+        return ExecutionReport(ExecStatus.UNWOUND, f"{reason}; leg1 unwound", legs, pnl)
 
     def _halt(self, reason: str, legs: list[OrderResult]) -> ExecutionReport:
         self.risk.trip_kill_switch(f"executor halt: {reason}")
