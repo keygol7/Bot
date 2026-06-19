@@ -81,6 +81,8 @@ class Executor:
         fill_confirmer=None,
         confirm_timeout: float = 5.0,
         balance_buffer: float = 0.99,
+        min_lock_edge: float | None = None,
+        leg2_slippage_share: float = 0.6,
     ) -> None:
         self.venues = venues
         self.risk = risk
@@ -96,6 +98,11 @@ class Executor:
         # legs fill. Used to size each arb to the most the funded balances allow.
         self.balance_buffer = balance_buffer       # leave headroom for fees/slippage
         self._balances: dict[str, float] = {}
+        # Bounded-aggressive limit pricing: how much edge to preserve as locked profit
+        # (defaults to the risk min_edge floor), and how the spendable surplus is split
+        # toward the completing NO leg (which we most want to fill once leg 1 commits us).
+        self.min_lock_edge = min_lock_edge
+        self.leg2_slippage_share = min(max(leg2_slippage_share, 0.0), 1.0)
 
     def set_balances(self, snapshots) -> None:
         """Seed available cash per venue from account snapshots (startup/refresh)."""
@@ -179,6 +186,23 @@ class Executor:
 
         return int(math.floor(max(0.0, min(caps.values())))), caps
 
+    def _aggressive_limits(self, opp: ArbOpportunity) -> tuple[float, float]:
+        """Per-leg limit prices that may pay worse than the quoted ask to fill on a
+        moving book, but never enough to drop the locked edge below the floor.
+
+        The detected edge above the floor is the ``surplus`` we can spend on slippage;
+        it is split between the legs (favoring the completing NO leg). Worst case both
+        legs fill at their limits -> combined cost = gross + surplus = 1 - floor, so the
+        locked profit is >= floor by construction. Thin edges get ~no room (stay
+        conservative); fat edges get room to chase the fill."""
+        floor = self.min_lock_edge if self.min_lock_edge is not None else self.risk.limits.min_edge
+        surplus = max(0.0, opp.edge_per_contract - floor)
+        no_buf = surplus * self.leg2_slippage_share
+        yes_buf = surplus - no_buf
+        yes_limit = min(0.99, round(opp.yes_price + yes_buf, 4))
+        no_limit = min(0.99, round(opp.no_price + no_buf, 4))
+        return yes_limit, no_limit
+
     async def execute(self, opp: ArbOpportunity) -> ExecutionReport:
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
@@ -195,7 +219,8 @@ class Executor:
                  opp.event_key, size, binding,
                  {k: round(v, 2) for k, v in caps.items()})
 
-        notional = size * opp.gross_cost
+        yes_limit, no_limit = self._aggressive_limits(opp)
+        notional = size * (yes_limit + no_limit)   # worst-case cost for the risk check
         label = f"{opp.buy_yes_venue}:{opp.buy_yes_market}"
         decision = self.risk.check(label, notional)
         if not decision.allowed:
@@ -210,7 +235,7 @@ class Executor:
 
         # ----- Leg 1: buy YES (fill-or-kill) -----
         leg1 = await self._place(
-            yes_venue, opp.buy_yes_market, Side.YES, "buy", opp.yes_price, size, "fill_or_kill"
+            yes_venue, opp.buy_yes_market, Side.YES, "buy", yes_limit, size, "fill_or_kill"
         )
         log.info("leg1 %s", leg1)
         if leg1.status is OrderStatus.ERROR:
@@ -228,7 +253,7 @@ class Executor:
 
         # ----- Leg 2: buy NO (fill-or-kill) -----
         leg2 = await self._place(
-            no_venue, opp.buy_no_market, Side.NO, "buy", opp.no_price, size, "fill_or_kill"
+            no_venue, opp.buy_no_market, Side.NO, "buy", no_limit, size, "fill_or_kill"
         )
         log.info("leg2 %s", leg2)
 

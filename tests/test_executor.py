@@ -264,6 +264,38 @@ def test_fill_confirmer_needs_order_id():
     assert report.status is ExecStatus.SKIPPED   # leg1 killed, no order id -> skip
 
 
+def test_aggressive_limits_preserve_edge_floor():
+    # Fat edge (0.05) with a 0.01 floor -> 0.04 surplus split toward the NO leg.
+    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])],
+                      limits=RiskLimits(min_edge=0.01))
+    o = opp(yes_price=0.40, no_price=0.55)            # gross 0.95, edge 0.05
+    yes_limit, no_limit = ex._aggressive_limits(o)
+    assert yes_limit > 0.40 and no_limit > 0.55       # both reach past the quoted ask
+    assert no_limit - 0.55 > yes_limit - 0.40         # NO (completing leg) gets more room
+    # Worst case (both fill at the limit) still locks >= the floor.
+    assert round(1 - (yes_limit + no_limit), 4) >= 0.01
+
+
+def test_aggressive_limits_thin_edge_stays_conservative():
+    # Edge at the floor -> no surplus -> no slippage room (don't chase a thin edge).
+    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])],
+                      limits=RiskLimits(min_edge=0.05))
+    o = opp(yes_price=0.45, no_price=0.50)            # gross 0.95, edge 0.05 == floor
+    yes_limit, no_limit = ex._aggressive_limits(o)
+    assert yes_limit == 0.45 and no_limit == 0.50
+
+
+def test_aggressive_limits_used_in_execution():
+    # The legs are actually placed at the widened limits, not the bare quoted ask.
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
+    ex, _ = make_exec([yes, no], limits=RiskLimits(min_edge=0.01, max_position_per_market=1e9,
+                                                   max_total_exposure=1e12))
+    asyncio.run(ex.execute(opp(yes_price=0.40, no_price=0.55)))
+    assert yes.calls[0][3] > 0.40                     # leg1 limit widened past the ask
+    assert no.calls[0][3] > 0.55                      # leg2 limit widened past the ask
+
+
 def test_order_error_result_classification():
     from types import SimpleNamespace
 

@@ -175,9 +175,11 @@ class StreamingEngine:
             return None
         self._last_acted[key] = self.clock()      # cooldown set now to avoid REST storms
         log.info("STREAM %s: price edge %.4f -> confirming real depth", p.event_key, edge)
-        # WS ticker has no depth (size 0): confirm real size + fresh price via a REST
-        # order-book fetch before firing. Skip the hop only if the book already shows size.
-        if size < 1 and self.depth_fetch is not None:
+        # Re-fetch the real order book right before firing so size AND price are as fresh
+        # as possible (WS quotes lag on fast in-play markets, and Kalshi's ticker carries
+        # no depth at all). The executor's bounded-aggressive limits absorb any residual
+        # move during the order itself.
+        if self.depth_fetch is not None:
             ev = await self._confirm_depth(p)
             if ev is None:
                 return None
