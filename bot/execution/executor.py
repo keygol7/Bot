@@ -119,13 +119,17 @@ class Executor:
                 status, filled, avg = await self.fill_confirmer.confirm(
                     result.venue, result.order_id, contracts, self.confirm_timeout
                 )
-                result.status, result.filled = status, filled
-                # The confirmer is authoritative for status/filled, but its price is
-                # raw venue convention (Polymarket reports the YES-side price). Prefer
-                # the per-venue-converted price from place_order; only fall back to the
-                # confirmer's when place_order returned none.
-                if avg is not None and result.avg_price is None:
-                    result.avg_price = avg
+                # The synchronous REST result is authoritative for a terminal outcome.
+                # Only let the stream OVERRIDE it to upgrade (e.g. REST KILLED -> a
+                # confirmed FILL); never let a timed-out / non-terminal stream result
+                # downgrade a terminal REST result into a spurious PARTIAL/KILLED.
+                terminal = {OrderStatus.FILLED, OrderStatus.KILLED, OrderStatus.REJECTED}
+                if status in terminal or result.status not in terminal:
+                    result.status, result.filled = status, filled
+                    # Confirmer price is raw venue convention (Polymarket = YES-side);
+                    # prefer the per-venue-converted price from place_order.
+                    if avg is not None and result.avg_price is None:
+                        result.avg_price = avg
             except Exception as exc:  # confirmer failure -> keep REST result
                 log.warning("fill confirm failed for %s: %s", result.order_id, exc)
         return result

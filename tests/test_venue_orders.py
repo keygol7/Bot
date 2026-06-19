@@ -52,15 +52,22 @@ def test_kalshi_buy_no_uses_no_price_cents():
     assert r.status.value == "KILLED"   # fill_count 0 on FoK
 
 
+def _exec_response(order_id, state, cum, last_shares, avg_yes, etype="EXECUTION_TYPE_FILL"):
+    """Build a synchronous CreateOrderResponse ({id, executions:[Execution]})."""
+    order = {"id": order_id, "state": state, "cumQuantity": cum}
+    if avg_yes is not None:
+        order["avgPx"] = {"value": str(avg_yes), "currency": "USD"}
+    return {"id": order_id, "executions": [
+        {"type": etype, "lastShares": str(last_shares), "order": order}]}
+
+
 def test_polymarket_buy_no_request_and_fill():
     cap = {}
 
     def handler(req):
         cap["body"] = json.loads(req.content)
         # avgPx is YES-side: a NO bought at 0.55 fills at YES-side 0.45.
-        return httpx.Response(200, json={"order": {
-            "id": "o1", "state": "ORDER_STATE_FILLED", "cumQuantity": 2,
-            "avgPx": {"value": "0.45", "currency": "USD"}}})
+        return httpx.Response(200, json=_exec_response("o1", "ORDER_STATE_FILLED", 2, 2, "0.45"))
 
     cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")  # is_trading_configured -> True
     v = PolymarketUSVenue(cfg)
@@ -73,7 +80,7 @@ def test_polymarket_buy_no_request_and_fill():
     assert cap["body"]["price"]["value"] == "0.45"
     assert cap["body"]["manualOrderIndicator"] == "MANUAL_ORDER_INDICATOR_AUTOMATIC"
     assert cap["body"]["tif"] == "TIME_IN_FORCE_FILL_OR_KILL"
-    assert r.status.value == "FILLED" and r.filled == 2
+    assert r.status.value == "FILLED" and r.filled == 2 and r.order_id == "o1"
     # avg_price is the NO cost (1 - YES-side 0.45 = 0.55), NOT the raw YES-side value.
     assert r.avg_price == 0.55
 
@@ -82,9 +89,7 @@ def test_polymarket_no_fill_avg_price_not_inverted():
     # Regression: the real UZB-COL trade. NO leg filled at $0.855 (YES-side 0.145);
     # it must record 0.855, not 0.145 (which inflated a 4c arb into a fake 75c one).
     def handler(req):
-        return httpx.Response(200, json={"order": {
-            "id": "o", "state": "ORDER_STATE_FILLED", "cumQuantity": 2,
-            "avgPx": {"value": "0.145", "currency": "USD"}}})
+        return httpx.Response(200, json=_exec_response("o", "ORDER_STATE_FILLED", 2, 2, "0.145"))
 
     cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
     v = PolymarketUSVenue(cfg)
@@ -96,9 +101,7 @@ def test_polymarket_no_fill_avg_price_not_inverted():
 
     # YES legs are reported on the same side, so they pass through unchanged.
     def yes_handler(req):
-        return httpx.Response(200, json={"order": {
-            "id": "y", "state": "ORDER_STATE_FILLED", "cumQuantity": 2,
-            "avgPx": {"value": "0.105", "currency": "USD"}}})
+        return httpx.Response(200, json=_exec_response("y", "ORDER_STATE_FILLED", 2, 2, "0.105"))
 
     v2 = PolymarketUSVenue(cfg)
     v2._api_client = _client(yes_handler, cfg.api_base)
@@ -107,12 +110,47 @@ def test_polymarket_no_fill_avg_price_not_inverted():
     assert ry.avg_price == 0.105
 
 
+def test_polymarket_fok_killed_when_no_fill():
+    # FOK that couldn't fill -> terminal CANCELED, 0 filled -> KILLED (clean skip).
+    def handler(req):
+        return httpx.Response(200, json=_exec_response(
+            "o", "ORDER_STATE_CANCELED", 0, 0, None, etype="EXECUTION_TYPE_CANCELED"))
+
+    cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
+    v = PolymarketUSVenue(cfg)
+    v._api_client = _client(handler, cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    r = asyncio.run(v.place_order("slug", Side.YES, "buy", 0.62, 6))
+    assert r.status.value == "KILLED" and r.filled == 0
+
+
+def test_polymarket_full_fill_from_multiple_executions():
+    # A 6-ct fill arriving as a partial then a completing fill; the terminal order
+    # snapshot (cumQuantity 6, state FILLED) -> FILLED 6, not a spurious partial.
+    def handler(req):
+        return httpx.Response(200, json={"id": "o", "executions": [
+            {"type": "EXECUTION_TYPE_PARTIAL_FILL", "lastShares": "0.62",
+             "order": {"id": "o", "state": "ORDER_STATE_PARTIALLY_FILLED", "cumQuantity": 0.62}},
+            {"type": "EXECUTION_TYPE_FILL", "lastShares": "5.38",
+             "order": {"id": "o", "state": "ORDER_STATE_FILLED", "cumQuantity": 6,
+                       "avgPx": {"value": "0.88", "currency": "USD"}}},
+        ]})
+
+    cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
+    v = PolymarketUSVenue(cfg)
+    v._api_client = _client(handler, cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    r = asyncio.run(v.place_order("slug", Side.YES, "buy", 0.88, 6))
+    assert r.status.value == "FILLED" and r.filled == 6 and r.avg_price == 0.88
+
+
 def test_polymarket_buy_yes_price_is_yes_side():
     cap = {}
 
     def handler(req):
         cap["body"] = json.loads(req.content)
-        return httpx.Response(200, json={"order": {"id": "o", "state": "ORDER_STATE_CANCELED", "cumQuantity": 0}})
+        return httpx.Response(200, json=_exec_response(
+            "o", "ORDER_STATE_CANCELED", 0, 0, None, etype="EXECUTION_TYPE_CANCELED"))
 
     cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
     v = PolymarketUSVenue(cfg)

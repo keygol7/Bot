@@ -233,6 +233,21 @@ def test_fill_confirmer_overrides_rest_result():
     assert report.status is ExecStatus.SUCCESS
 
 
+def test_confirmer_partial_does_not_downgrade_rest_filled():
+    # The 0.62/6 race: the synchronous REST result is a full FILL, but the WS confirmer
+    # times out mid-stream and returns a non-terminal PARTIAL. REST must win (no halt).
+    class Confirmer:
+        async def confirm(self, venue, order_id, requested, timeout):
+            return OrderStatus.PARTIAL, 0.62, 0.88
+
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 6, 0.40, requested=6)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 6, 0.55, requested=6)])
+    ex, risk = make_exec([yes, no], max_order_contracts=0)
+    ex.fill_confirmer = Confirmer()
+    report = asyncio.run(ex.execute(opp(max_contracts=6)))
+    assert report.status is ExecStatus.SUCCESS and not risk.is_killed
+
+
 def test_fill_confirmer_needs_order_id():
     # No order_id -> confirmer is skipped, REST result stands.
     class Confirmer:

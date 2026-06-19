@@ -201,6 +201,60 @@ def _parse_positions(body: Any):
     return out
 
 
+_STATE_FILLED = "ORDER_STATE_FILLED"
+_STATE_REJECTED = "ORDER_STATE_REJECTED"
+
+
+def _parse_create_order_response(data: Any, requested: float, side: Side):
+    """Parse a synchronous ``CreateOrderResponse`` -> (status, filled, avg_price, id).
+
+    The real shape is ``{"id", "executions": [Execution, ...]}`` — there is NO
+    top-level ``order``. With ``synchronousExecution`` the response carries the full
+    execution list and each execution embeds the order snapshot at that point
+    (``order.state`` / ``order.cumQuantity`` / ``order.avgPx``), so the LAST snapshot
+    is the terminal outcome. This is authoritative for the order; the private-WS
+    confirmer is only a fallback (and must never downgrade this terminal result).
+    """
+    if not isinstance(data, dict):
+        return OrderStatus.ERROR, 0.0, None, None
+    order_id = data.get("id") or data.get("orderId")
+    executions = data.get("executions") or []
+    terminal_order: dict = {}
+    filled_from_exec = 0.0
+    rejected = False
+    for ex in executions:
+        etype = str(ex.get("type") or "")
+        if "REJECT" in etype:
+            rejected = True
+        shares = _amount(ex.get("lastShares"))
+        if shares and "FILL" in etype:           # EXECUTION_TYPE_FILL / _PARTIAL_FILL
+            filled_from_exec += shares
+        snap = ex.get("order")
+        if isinstance(snap, dict):
+            terminal_order = snap
+
+    state = str(terminal_order.get("state") or "")
+    cum = terminal_order.get("cumQuantity")
+    filled = float(cum) if cum not in (None, "") else filled_from_exec
+    if not order_id:
+        order_id = terminal_order.get("id")
+
+    avg_price = _amount(terminal_order.get("avgPx"))
+    # avgPx is the YES/long-side price; for a NO buy the cost is 1 - that.
+    if avg_price is not None and side is Side.NO:
+        avg_price = round(1.0 - avg_price, 6)
+
+    if state == _STATE_FILLED or (requested > 0 and filled >= requested - 1e-9):
+        status = OrderStatus.FILLED
+    elif state == _STATE_REJECTED or (rejected and filled <= 1e-9):
+        status = OrderStatus.REJECTED
+    elif filled <= 1e-9:
+        status = OrderStatus.KILLED      # FOK/IOC with no fill = canceled
+    else:
+        status = OrderStatus.PARTIAL     # IOC partial (FOK should never land here)
+    return status, filled, avg_price, order_id
+
+
 def normalize_bbo(
     slug: str, title: str, market_data: dict[str, Any], *, event_key: str | None = None
 ) -> MarketQuote:
@@ -536,7 +590,10 @@ class PolymarketUSVenue:
             "tif": _TIF.get(tif, "TIME_IN_FORCE_FILL_OR_KILL"),
             "intent": _INTENT[(side, action)],
             "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+            # Block until the order reaches a terminal state so the response carries the
+            # full executions (authoritative). maxBlockTime stays under the HTTP timeout.
             "synchronousExecution": True,
+            "maxBlockTime": "5",
         }
         await self._limiter.wait()
         try:
@@ -549,32 +606,11 @@ class PolymarketUSVenue:
             from bot.execution.orders import order_error_result
             return order_error_result(VENUE, market_id, side, action, contracts, exc)
 
-        order = data.get("order", data)
-        state = order.get("state") or order.get("orderState") or ""
-        filled = float(order.get("cumQuantity") or order.get("filledQuantity") or 0)
-        avg = order.get("avgPx", {})
-        avg_price = None
-        if isinstance(avg, dict) and avg.get("value") not in (None, ""):
-            avg_price = float(avg["value"])
-        elif avg not in (None, "") and not isinstance(avg, dict):
-            avg_price = float(avg)
-        # avgPx is always the YES/long-side price; convert back to the side we bought
-        # so avg_price is the actual cost of that side (NO cost = 1 - YES-side price).
-        # Without this, a NO fill at $0.855 records as $0.145 and inflates the edge/PnL.
-        if avg_price is not None and side is Side.NO:
-            avg_price = round(1.0 - avg_price, 6)
-        if state == _TERMINAL_FILLED or filled >= contracts - 1e-9:
-            status = OrderStatus.FILLED
-        elif state in _REJECTED:
-            status = OrderStatus.REJECTED
-        elif filled <= 1e-9:
-            status = OrderStatus.KILLED
-        else:
-            status = OrderStatus.PARTIAL
+        status, filled, avg_price, order_id = _parse_create_order_response(data, contracts, side)
         return OrderResult(
             venue=VENUE, market_id=market_id, side=side, action=action,
             requested=contracts, filled=filled, avg_price=avg_price,
-            order_id=order.get("id") or order.get("orderId"), status=status, raw=order,
+            order_id=order_id, status=status, raw=data,
         )
 
     async def cancel_order(self, order_id: str) -> dict:
