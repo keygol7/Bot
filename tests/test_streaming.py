@@ -237,6 +237,43 @@ def test_inflight_execution_survives_consumer_cancellation():
     asyncio.run(driver())
 
 
+def test_rejected_pair_backs_off_then_retries():
+    # A pair whose order keeps failing must not be hammered every tick: after a failed
+    # attempt the engine backs it off, and only retries once the backoff elapses.
+    from bot.execution.executor import ExecStatus, ExecutionReport
+    from bot.execution.orders import OrderResult, OrderStatus
+
+    now = {"t": 1000.0}
+
+    class RejectExec:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, opp):
+            self.calls += 1
+            leg = OrderResult("kalshi", "K1", None, "buy", 1, status=OrderStatus.REJECTED)
+            return ExecutionReport(ExecStatus.SKIPPED, "leg1 not filled (REJECTED)", [leg])
+
+    fe = RejectExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=5.0, clock=lambda: now["t"],
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)))
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)))
+    assert fe.calls == 1                          # fired once, then rejected -> backoff
+
+    now["t"] += 10                                # past the 5s cooldown, but inside backoff (60s)
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)))
+    assert fe.calls == 1                          # still backed off, not retried
+
+    now["t"] += 60                                # backoff elapsed -> retries
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)))
+    assert fe.calls == 2
+
+
 def test_consume_counts_ws_quotes_for_health():
     # The WS-health heartbeat: _consume must count each tick per venue so the run
     # loop can report whether a venue's WebSocket is actually delivering data.

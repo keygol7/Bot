@@ -80,6 +80,12 @@ class StreamingEngine:
         self._last_acted: dict[tuple, float] = {}
         self._ws_counts: dict[str, int] = {}   # venue -> quotes seen since last refresh
         self._inflight: set = set()             # in-flight execute() tasks (cancel-shielded)
+        # Escalating backoff for pairs whose orders keep failing (e.g. a venue that
+        # rejects on a live/in-play market) so the engine stops hammering them.
+        self._fail_counts: dict[tuple, int] = {}
+        self._backoff_until: dict[tuple, float] = {}
+        self._backoff_base = 60.0               # first penalty after a failed attempt
+        self._backoff_cap = 1800.0              # max 30 min between retries
 
     def _fee(self, venue: str) -> FeeModel:
         return self.fee_models.get(venue, ZeroFeeModel())
@@ -163,6 +169,8 @@ class StreamingEngine:
         edge, yq, nq, size = ev
         if edge <= self.min_edge:                # price-edge gate (size checked below)
             return None
+        if self.clock() < self._backoff_until.get(key, 0.0):
+            return None                           # market keeps rejecting -> backing off
         if self.clock() - self._last_acted.get(key, -1e9) < self.cooldown:
             return None
         self._last_acted[key] = self.clock()      # cooldown set now to avoid REST storms
@@ -182,7 +190,31 @@ class StreamingEngine:
         log.info("STREAM edge %.4f sz %g on %s -> executing", edge, size, p.event_key)
         report = await self._execute_guarded(opp)
         log.info("STREAM exec %s | %s", p.event_key, report)
+        self._note_outcome(key, p, report)
         return report
+
+    def _note_outcome(self, key, p, report) -> None:
+        """Escalating backoff for a pair whose orders keep failing (e.g. a venue that
+        rejects orders on a live/in-play market). A real fill resets it; a failed
+        attempt (an order was placed but didn't lock the arb) pushes the next retry
+        out exponentially, so the engine stops hammering an untradeable market."""
+        from bot.execution.executor import ExecStatus
+
+        status = getattr(report, "status", None)
+        if status is None:
+            return                                # not an ExecutionReport (test stub)
+        if status is ExecStatus.SUCCESS:
+            self._fail_counts.pop(key, None)
+            self._backoff_until.pop(key, None)
+            return
+        if not getattr(report, "legs", None):
+            return                                # pre-order skip (risk/size) — not a failure
+        n = self._fail_counts.get(key, 0) + 1
+        self._fail_counts[key] = n
+        delay = min(self._backoff_base * (2 ** (n - 1)), self._backoff_cap)
+        self._backoff_until[key] = self.clock() + delay
+        log.info("STREAM backing off %s for %.0fs after failed attempt #%d (%s)",
+                 p.event_key, delay, n, report.reason)
 
     async def _execute_guarded(self, opp):
         """Run ``executor.execute`` so a refresh-boundary consumer cancellation can

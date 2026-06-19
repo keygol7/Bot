@@ -37,6 +37,19 @@ from bot.strategies.arbitrage import ArbOpportunity
 log = logging.getLogger("bot.executor")
 
 
+def _reject_reason(result) -> str:
+    """Human-readable why-it-failed from an OrderResult's raw payload (HTTP status +
+    venue error body), so a rejection isn't an opaque [REJECTED] in the log."""
+    raw = getattr(result, "raw", None) or {}
+    parts = []
+    if raw.get("http_status"):
+        parts.append(f"HTTP {raw['http_status']}")
+    body = raw.get("body") or raw.get("error")
+    if body:
+        parts.append(str(body)[:200])
+    return " ".join(parts) or "no detail"
+
+
 class ExecStatus(str, Enum):
     SUCCESS = "SUCCESS"      # both legs filled — locked arb
     SKIPPED = "SKIPPED"      # didn't act (risk/size/leg-1 no fill)
@@ -201,9 +214,11 @@ class Executor:
         )
         log.info("leg1 %s", leg1)
         if leg1.status is OrderStatus.ERROR:
-            return self._halt("leg1 ERROR — fill state unknown", [leg1])
+            return self._halt(f"leg1 ERROR — fill state unknown ({_reject_reason(leg1)})", [leg1])
         if not leg1.left_a_position:
-            return ExecutionReport(ExecStatus.SKIPPED, f"leg1 not filled ({leg1.status.value})", [leg1])
+            return ExecutionReport(
+                ExecStatus.SKIPPED,
+                f"leg1 not filled ({leg1.status.value}: {_reject_reason(leg1)})", [leg1])
         if not leg1.filled_fully:
             # FoK didn't behave all-or-nothing (observed on Polymarket: a 0.62/6 fill).
             # The filled amount is KNOWN (not ambiguous), so unwind that portion and skip
