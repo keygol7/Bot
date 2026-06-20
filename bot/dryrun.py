@@ -758,6 +758,63 @@ def show_book(settings: Settings, spec: str) -> int:
     return asyncio.run(_run())
 
 
+def find_markets(settings: Settings, term: str, *, limit: int = 8000) -> int:
+    """Search BOTH venues' scans for a term (team/player) and show whether the bot can
+    see and pair it. Answers "there's a live match — why isn't the bot trading it?":
+    it scans exactly like discovery (so a market missing here is outside the scan
+    window), lists the matches per venue, and runs the fingerprint matcher across the
+    cross-venue candidates so you can see which pair (if any) is complementary.
+    """
+    from bot.matching.fingerprint import complement_reason, from_kalshi, from_polymarket
+
+    t = term.lower()
+
+    async def _run() -> int:
+        venues = _build_venues(settings)
+        by_venue: dict[str, list] = {}
+        try:
+            for v in venues:
+                try:
+                    qs = await v.scan_quotes(limit)
+                except Exception as exc:
+                    print(f"{v.name}: scan failed ({exc})")
+                    continue
+                hits = [q for q in qs
+                        if t in (q.title or "").lower() or t in q.market_id.lower()]
+                by_venue[v.name] = hits
+                print(f"\n== {v.name}: {len(hits)} of {len(qs)} scanned markets match '{term}' ==")
+                for q in hits[:40]:
+                    print(f"  {q.market_id}  | {q.title}")
+        finally:
+            for v in venues:
+                aclose = getattr(v, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+
+        k = by_venue.get("kalshi", [])
+        p = by_venue.get("polymarket_us", [])
+        if not k or not p:
+            print(f"\n>>> no cross-venue pair: kalshi={len(k)} poly={len(p)} markets "
+                  f"matching '{term}' in the scan window. If it's live on a venue but 0 "
+                  f"here, it's beyond the scan --limit (coverage gap).")
+            return 0
+        print(f"\n== fingerprint pairing ({len(k)}x{len(p)} combos; showing complementary "
+              f"+ near-misses) ==")
+        shown = 0
+        for a in k:
+            fa = from_kalshi(a.market_id, a.title)
+            for b in p:
+                fb = from_polymarket(b.market_id, b.title)
+                reason = complement_reason(fa, fb)
+                if reason == "ok" or shown < 20:
+                    tag = "MATCH" if reason == "ok" else f"no ({reason})"
+                    print(f"  [{tag}] {a.market_id}  <>  {b.market_id}")
+                    shown += 1
+        return 0
+
+    return asyncio.run(_run())
+
+
 def count_markets(settings: Settings, *, limit: int = 50000) -> int:
     """Pull every open market from each venue (no matching) and print the counts.
 
@@ -1150,6 +1207,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--count-markets", action="store_true",
                    help="pull every open market from each venue, print the counts, "
                         "and exit (no matching)")
+    p.add_argument("--find", metavar="TERM", default=None,
+                   help="search both venues' scans for a team/player and show whether "
+                        "the bot sees + can pair it (diagnose a live match not trading)")
     p.add_argument("--probe-account", action="store_true",
                    help="probe Polymarket US account/portfolio endpoints (read-only) "
                         "to discover the real balance/positions paths")
@@ -1220,6 +1280,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.count_markets:
         raise SystemExit(count_markets(load_settings()))
+
+    if args.find:
+        raise SystemExit(find_markets(load_settings(), args.find))
 
     if args.probe_account:
         raise SystemExit(probe_account(load_settings()))
