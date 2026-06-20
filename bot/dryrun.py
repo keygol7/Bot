@@ -98,6 +98,8 @@ async def run_cycle(
     max_confirms: int = 50,
     max_resolve_gap_days: float = 3.0,
     executor=None,
+    use_fingerprint: bool = False,
+    fingerprint_metrics=None,
 ) -> CycleResult:
     result = CycleResult()
 
@@ -167,6 +169,24 @@ async def run_cycle(
                 # (e.g. "win 2nd half" vs "win the match") is not the same market.
                 if scope_mismatch(c.a.title, c.b.title):
                     continue
+                # Structured complement gate (when enabled): skip non-complementary
+                # pairs BEFORE the LLM — stops wasting confirmations on junk (e.g.
+                # KXWCMENTION novelty cross-products) and keeps discovery aligned with
+                # what the watchlist will actually trade.
+                if use_fingerprint:
+                    from bot.matching.fingerprint import (
+                        are_complementary, from_kalshi, from_polymarket,
+                    )
+
+                    def _fpq(q):
+                        return (from_kalshi(q.market_id, q.title) if q.venue == "kalshi"
+                                else from_polymarket(q.market_id, q.title))
+
+                    fa, fb = _fpq(c.a), _fpq(c.b)
+                    if not are_complementary(fa, fb):
+                        continue
+                    if fingerprint_metrics and fa.metric not in fingerprint_metrics:
+                        continue
                 result.candidate_pairs += 1
 
                 verdict = _cached_verdict(store, c.a, c.b)
@@ -562,6 +582,8 @@ async def stream(
             min_edge=min_edge, match_threshold=match_threshold, complete_fn=complete_fn,
             limit=limit, embed_fn=embed_fn, max_confirms=max_confirms,
             max_resolve_gap_days=max_resolve_gap_days, executor=None,
+            use_fingerprint=settings.match_use_fingerprint,
+            fingerprint_metrics=settings.match_fingerprint_metrics or None,
         )
         await refresh_balances()
         cached = store.confirmed_pairs(

@@ -40,12 +40,13 @@ def generous_risk():
 
 
 def run_cycle_kw(venues, complete_fn=None, store=None, min_edge=0.01, threshold=0.3,
-                 embed_fn=None, max_confirms=50):
+                 embed_fn=None, max_confirms=50, use_fingerprint=False):
     return asyncio.run(run_cycle(
         venues, store=store, risk=generous_risk(),
         fee_models={v.name: ZeroFeeModel() for v in venues},
         min_edge=min_edge, match_threshold=threshold, complete_fn=complete_fn,
         limit=50, embed_fn=embed_fn, max_confirms=max_confirms,
+        use_fingerprint=use_fingerprint,
     ))
 
 
@@ -623,3 +624,31 @@ def test_compare_filters_reports_adds(capsys, tmp_path):
     assert compare_filters(settings) == 0
     out = capsys.readouterr().out
     assert "ADDS (fingerprint only):   1" in out
+
+
+def test_run_cycle_fingerprint_gate_skips_novelty(capsys):
+    # With use_fingerprint, the discovery cycle must NOT confirm a KXWCMENTION novelty
+    # cross-product (unmatchable metric), but MUST still confirm a real winner pair.
+    import asyncio as _asyncio
+
+    mention_k = mq("kalshi", "KXWCMENTION-26JUN22NORSEN-SHUT",
+                   "Norway vs Senegal - Shutout", yes_ask=0.21, yes_ask_size=100,
+                   no_ask=0.79, no_ask_size=100)
+    mention_p = mq("polymarket_us", "atc-fwc-nor-sen-2026-06-22-sen",
+                   "Norway vs Senegal - Senegal", yes_ask=0.31, yes_ask_size=100,
+                   no_ask=0.69, no_ask_size=100)
+    win_k = mq("kalshi", "KXATPMATCH-26JUN22DESHA-DE",
+               "Will Alex de Minaur win the de Minaur vs Shapovalov match? - Alex de Minaur",
+               yes_ask=0.40, yes_ask_size=100, no_ask=0.62, no_ask_size=100)
+    win_p = mq("polymarket_us", "aec-atp-alemin-densha-2026-06-22",
+               "Alex de Minaur vs. Denis Shapovalov - Alex de Minaur",
+               yes_ask=0.62, yes_ask_size=100, no_ask=0.40, no_ask_size=60)
+    venues = [
+        StubVenue("kalshi", {mention_k.market_id: mention_k, win_k.market_id: win_k}),
+        StubVenue("polymarket_us", {mention_p.market_id: mention_p, win_p.market_id: win_p}),
+    ]
+    fake = lambda prompt: '{"same_event": true, "confidence": 0.95, "rationale": "x"}'
+    res = run_cycle_kw(venues, complete_fn=fake, use_fingerprint=True)
+    confirmed = {(a, b) for (_, a, _, b, _) in res.confirmed_pairs}
+    assert ("KXATPMATCH-26JUN22DESHA-DE", "aec-atp-alemin-densha-2026-06-22") in confirmed
+    assert all("MENTION" not in a for (a, b) in confirmed)
