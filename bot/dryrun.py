@@ -853,7 +853,10 @@ def show_watchlist(settings: Settings, *, limit: int = 500) -> int:
 
     async def _run() -> int:
         try:
-            cached = store.confirmed_pairs()
+            cached = store.confirmed_pairs(
+                use_fingerprint=settings.match_use_fingerprint,
+                fingerprint_metrics=settings.match_fingerprint_metrics or None,
+            )
             # No wide scan needed: build_watchlist probes each cached leg directly.
             live = await build_watchlist(cached, set(), venues)
 
