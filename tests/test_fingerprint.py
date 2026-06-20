@@ -46,6 +46,25 @@ def test_true_game_winner_is_complementary():
     assert are_complementary(k, p)
 
 
+def test_polymarket_prop_subject_from_question():
+    # Real format: Poly props read "Will <Player> record N+ <stat> ... - Yes". The
+    # entity is in the question, not the Yes suffix. (No yes_sub_title, as in the DB.)
+    k = from_kalshi("KXWCAST-26JUN18CANQAT-CANCLARIN17-2", "Cyle Larin: 2+ assists? - Cyle Larin: 2+")
+    p = from_polymarket("astatc-fwc-can-qat-2026-06-18-a-fwccyllar-gte2",
+                        "Will Cyle Larin record at least 2 assists in CAN vs QAT? - Yes")
+    assert "larin" in k.subject and "larin" in p.subject
+    assert are_complementary(k, p)
+
+
+def test_prop_wrong_player_same_game_not_complementary():
+    # Same game/metric/threshold but different players must still reject (the team codes
+    # in the Poly subject can't cause a false align against the clean Kalshi player name).
+    k = from_kalshi("KXWCGOAL-26JUN18CANQAT-CANCLARIN17-2", "Cyle Larin: 2+ goals - Cyle Larin: 2+")
+    p = from_polymarket("astatc-fwc-can-qat-2026-06-18-g-fwcismkon-gte2",
+                        "Will Ismael Kone record at least 2 goals in CAN vs QAT? - Yes")
+    assert not are_complementary(k, p)
+
+
 def test_mention_novelty_not_complementary():
     k, p = _pair(
         "KXWCMENTION-26JUN22JORDZA-CAPT", "Jordan vs Algeria - Captain", "Captain",

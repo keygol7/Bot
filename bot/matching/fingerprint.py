@@ -164,6 +164,11 @@ def from_polymarket(slug: str, title: str, end_date: str | None = None,
         if m:
             date = parse_iso8601(m.group(1))
     subject = _subject_tokens(outcome) or _subject_tokens(_outcome_from_title(title))
+    if not subject:
+        # Prop markets read "Will <Player> record N+ <stat> in A vs B? - Yes": the
+        # entity is in the question, not the Yes/No outcome suffix. (Winners keep their
+        # team/player suffix above, preserving YES polarity.)
+        subject = _subject_tokens(title.rsplit(" - ", 1)[0])
     return ContractFingerprint(
         venue="polymarket_us", metric=metric, scope=_scope_only(title),
         threshold=_threshold_int(title), subject=subject, date=date,
