@@ -635,6 +635,9 @@ async def stream(
         apply_balance_caps(risk, guard.snapshots)
 
     private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
+    log.warning("matching mode: fingerprint=%s metrics=%s (MATCH_USE_FINGERPRINT)",
+                settings.match_use_fingerprint,
+                sorted(settings.match_fingerprint_metrics) or "all")
     ceiling = (f"{settings.risk.max_order_contracts:g} ct/order"
                if settings.risk.max_order_contracts and settings.risk.max_order_contracts > 0
                else "no per-order ceiling — sized to balances/depth")
