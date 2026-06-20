@@ -466,46 +466,69 @@ class KalshiVenue:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
+    # tif -> V2 time_in_force enum (GTT is internal-only and not a valid API value).
+    _TIF_V2 = {
+        "fill_or_kill": "fill_or_kill",
+        "immediate_or_cancel": "immediate_or_cancel",
+        "gtc": "good_till_canceled",
+        "good_till_canceled": "good_till_canceled",
+    }
+
     async def place_order(
         self, market_id: str, side: Side, action: str, price: float, contracts: float,
         *, tif: str = "fill_or_kill",
     ) -> OrderResult:
-        """Place an order via legacy /portfolio/orders (explicit yes/no side).
+        """Place an order via the V2 /portfolio/events/orders endpoint.
 
-        ``price`` is the cost to buy that ``side`` (dollars 0.01-0.99); converted to
-        Kalshi cents. ``contracts`` is whole contracts. Requires credentials.
-        NOTE: fill-response field mapping should be confirmed against the demo
-        environment before live use.
+        The legacy /portfolio/orders was deprecated (no earlier than 2026-05-06). V2
+        quotes everything from the YES side: ``bid`` buys YES, ``ask`` sells YES, and
+        buying NO is economically selling YES at ``1 - price``. So:
+          (YES, buy)  -> bid @ price          (NO, buy)  -> ask @ 1 - price
+          (YES, sell) -> ask @ price          (NO, sell) -> bid @ 1 - price
+        ``price`` is the cost/price of the requested ``side`` (dollars 0.01-0.99).
+        Prices/counts are fixed-point dollar strings. Requires credentials.
         """
         if not self.authenticated:
             raise OrderNotPermitted("Kalshi credentials not configured")
-        cents = int(round(price * 100))
-        count = int(round(contracts))
+        # Map (side, action) onto the YES-side book and the YES-side price.
+        if side is Side.YES:
+            book_side = "bid" if action == "buy" else "ask"
+            yes_px = price
+        else:
+            book_side = "ask" if action == "buy" else "bid"
+            yes_px = round(1.0 - price, 4)
+        # Round to the cent (Kalshi tick) and clamp to a valid 0.01-0.99 quote.
+        yes_px = min(max(round(yes_px, 2), 0.01), 0.99)
+        count = float(contracts)
         body: dict[str, Any] = {
             "ticker": market_id,
-            "action": action,                 # "buy" | "sell"
-            "side": side.value.lower(),        # "yes" | "no"
-            "count": count,
-            "time_in_force": tif,              # fill_or_kill | immediate_or_cancel | ...
             "client_order_id": str(uuid.uuid4()),
+            "side": book_side,                       # bid = buy YES, ask = sell YES
+            "count": f"{count:.2f}",                 # contracts as a fixed-point string
+            "price": f"{yes_px:.4f}",                # YES-side price, fixed-point dollars
+            "time_in_force": self._TIF_V2.get(tif, "fill_or_kill"),
+            "self_trade_prevention_type": "taker_at_cross",
+            "post_only": False,
         }
-        body["yes_price" if side is Side.YES else "no_price"] = cents
 
+        endpoint = "/portfolio/events/orders"
         await self._limiter.wait()
         try:
             resp = await self._http().post(
-                "/portfolio/orders", json=body,
-                headers=self._auth_headers("POST", "/portfolio/orders"),
+                endpoint, json=body, headers=self._auth_headers("POST", endpoint),
             )
             resp.raise_for_status()
-            order = resp.json().get("order", {})
+            data = resp.json()
         except Exception as exc:  # 4xx -> REJECTED (no fill); else ERROR (unknown)
             from bot.execution.orders import order_error_result
             return order_error_result(VENUE, market_id, side, action, count, exc)
 
-        filled = float(order.get("fill_count_fp") or order.get("fill_count") or 0)
-        price_key = "yes_price_dollars" if side is Side.YES else "no_price_dollars"
-        avg = order.get(price_key)
+        filled = float(data.get("fill_count") or 0)
+        avg = data.get("average_fill_price")
+        avg_price = float(avg) if avg not in (None, "") else None
+        # average_fill_price is the YES-side price; for a NO trade the cost is 1 - that.
+        if avg_price is not None and side is Side.NO:
+            avg_price = round(1.0 - avg_price, 4)
         status = (
             OrderStatus.FILLED if filled >= count - 1e-9
             else OrderStatus.KILLED if filled <= 1e-9
@@ -513,9 +536,8 @@ class KalshiVenue:
         )
         return OrderResult(
             venue=VENUE, market_id=market_id, side=side, action=action,
-            requested=count, filled=filled,
-            avg_price=float(avg) if avg not in (None, "") else None,
-            order_id=order.get("order_id"), status=status, raw=order,
+            requested=count, filled=filled, avg_price=avg_price,
+            order_id=data.get("order_id"), status=status, raw=data,
         )
 
     async def cancel_order(self, order_id: str) -> dict:

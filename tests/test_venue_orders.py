@@ -17,39 +17,72 @@ def _client(handler, base_url):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url=base_url)
 
 
-def test_kalshi_buy_yes_request_and_fill():
+def test_kalshi_buy_yes_v2_request_and_fill():
+    # V2 /portfolio/events/orders: buy YES -> bid @ price (fixed-point strings).
     cap = {}
 
     def handler(req):
+        cap["url"] = req.url.path
         cap["body"] = json.loads(req.content)
-        return httpx.Response(201, json={"order": {
-            "order_id": "abc", "fill_count_fp": "2.00", "yes_price_dollars": "0.40"}})
+        return httpx.Response(201, json={
+            "order_id": "abc", "fill_count": "2.00", "remaining_count": "0.00",
+            "average_fill_price": "0.40"})
 
     v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
     v._client = _client(handler, v.cfg.api_base)
     v._auth_headers = lambda m, p: {}  # skip real signing for this test
 
     r = asyncio.run(v.place_order("KTICK", Side.YES, "buy", 0.40, 2))
-    assert cap["body"]["ticker"] == "KTICK"
-    assert cap["body"]["action"] == "buy" and cap["body"]["side"] == "yes"
-    assert cap["body"]["yes_price"] == 40 and "no_price" not in cap["body"]
-    assert cap["body"]["count"] == 2 and cap["body"]["time_in_force"] == "fill_or_kill"
+    assert cap["url"].endswith("/portfolio/events/orders")
+    assert cap["body"]["ticker"] == "KTICK" and cap["body"]["side"] == "bid"
+    assert cap["body"]["price"] == "0.4000" and cap["body"]["count"] == "2.00"
+    assert cap["body"]["time_in_force"] == "fill_or_kill"
+    assert cap["body"]["self_trade_prevention_type"] == "taker_at_cross"
     assert r.status.value == "FILLED" and r.filled == 2.0 and r.avg_price == 0.40
 
 
-def test_kalshi_buy_no_uses_no_price_cents():
+def test_kalshi_buy_no_v2_sells_yes_at_one_minus_price():
+    # Buy NO @ 0.55 == sell YES @ 0.45 -> side "ask", price "0.4500". The YES-side
+    # average_fill_price (0.45) inverts back to a NO cost of 0.55.
     cap = {}
 
     def handler(req):
         cap["body"] = json.loads(req.content)
-        return httpx.Response(201, json={"order": {"order_id": "x", "fill_count_fp": "0.00"}})
+        return httpx.Response(201, json={
+            "order_id": "x", "fill_count": "2.00", "remaining_count": "0.00",
+            "average_fill_price": "0.45"})
 
     v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
     v._client = _client(handler, v.cfg.api_base)
     v._auth_headers = lambda m, p: {}
     r = asyncio.run(v.place_order("KTICK", Side.NO, "buy", 0.55, 2))
-    assert cap["body"]["side"] == "no" and cap["body"]["no_price"] == 55
+    assert cap["body"]["side"] == "ask" and cap["body"]["price"] == "0.4500"
+    assert r.status.value == "FILLED" and r.avg_price == 0.55
+
+
+def test_kalshi_v2_fok_no_fill_is_killed():
+    def handler(req):
+        return httpx.Response(201, json={
+            "order_id": "x", "fill_count": "0.00", "remaining_count": "2.00"})
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    r = asyncio.run(v.place_order("KTICK", Side.NO, "buy", 0.55, 2))
     assert r.status.value == "KILLED"   # fill_count 0 on FoK
+
+
+def test_kalshi_v2_rejection_surfaces_body():
+    # A 4xx (e.g. legacy-endpoint-style errors) -> REJECTED with the venue body.
+    def handler(req):
+        return httpx.Response(400, json={"error": {"code": "bad_request", "message": "x"}})
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    r = asyncio.run(v.place_order("KTICK", Side.YES, "buy", 0.40, 2))
+    assert r.status.value == "REJECTED"
+    assert r.raw.get("http_status") == 400
 
 
 def _exec_response(order_id, state, cum, last_shares, avg_yes, etype="EXECUTION_TYPE_FILL"):
