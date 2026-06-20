@@ -13,6 +13,12 @@ from pathlib import Path
 from bot.execution.risk import RiskLimits
 from bot.modes import RunMode
 
+# Recognized fingerprint metrics (mirrors bot.matching.fingerprint). Used to validate
+# MATCH_FINGERPRINT_METRICS so a malformed value can't silently filter out everything.
+_VALID_FINGERPRINT_METRICS = frozenset(
+    {"winner", "goals", "assists", "ga", "points", "saves", "shots"}
+)
+
 
 def _load_dotenv(path: str = ".env") -> None:
     """Populate ``os.environ`` from a ``.env`` file if present (without overriding
@@ -32,6 +38,9 @@ def _load_dotenv(path: str = ".env") -> None:
             quote = value[0]
             end = value.find(quote, 1)
             value = value[1:end] if end != -1 else value[1:]
+        elif value.startswith("#"):
+            # The whole value is a comment (e.g. `KEY=# note`) -> empty value.
+            value = ""
         else:
             # Unquoted: strip an inline comment (" #...").
             value = value.split(" #", 1)[0].rstrip()
@@ -156,8 +165,11 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         match_use_fingerprint=(
             env("MATCH_USE_FINGERPRINT", "false") or "false"
         ).lower() == "true",
+        # Keep ONLY recognized metric names — so a malformed value (e.g. an inline
+        # comment captured as the value, or a stray token) degrades to "all matchable"
+        # instead of silently filtering out every real metric.
         match_fingerprint_metrics=frozenset(
-            m.strip() for m in (env("MATCH_FINGERPRINT_METRICS", "") or "").split(",")
-            if m.strip()
+            tok for raw in (env("MATCH_FINGERPRINT_METRICS", "") or "").split(",")
+            if (tok := raw.strip().lower()) in _VALID_FINGERPRINT_METRICS
         ),
     )
