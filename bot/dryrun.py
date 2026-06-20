@@ -564,7 +564,11 @@ async def stream(
             max_resolve_gap_days=max_resolve_gap_days, executor=None,
         )
         await refresh_balances()
-        return await build_watchlist(store.confirmed_pairs(), res.scanned, venues)
+        cached = store.confirmed_pairs(
+            use_fingerprint=settings.match_use_fingerprint,
+            fingerprint_metrics=settings.match_fingerprint_metrics or None,
+        )
+        return await build_watchlist(cached, res.scanned, venues)
 
     async def feed_private(v):
         try:

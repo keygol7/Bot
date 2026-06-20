@@ -102,6 +102,11 @@ class Settings:
     # check (sum of funded venue balances) at startup and each refresh — so "balances
     # are the limit" without hardcoding dollar caps. Overrides RISK_MAX_* exposure caps.
     risk_caps_from_balance: bool = False
+    # When true, the streaming watchlist is gated by the structured fingerprint matcher
+    # (are_complementary) instead of the series/title allowlists. Optionally restrict to
+    # specific metrics (e.g. "winner") for a staged rollout; empty = all matchable.
+    match_use_fingerprint: bool = False
+    match_fingerprint_metrics: frozenset = field(default_factory=frozenset)
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -148,4 +153,11 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         risk_caps_from_balance=(
             env("RISK_CAPS_FROM_BALANCE", "false") or "false"
         ).lower() == "true",
+        match_use_fingerprint=(
+            env("MATCH_USE_FINGERPRINT", "false") or "false"
+        ).lower() == "true",
+        match_fingerprint_metrics=frozenset(
+            m.strip() for m in (env("MATCH_FINGERPRINT_METRICS", "") or "").split(",")
+            if m.strip()
+        ),
     )

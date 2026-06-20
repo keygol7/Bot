@@ -158,6 +158,41 @@ def test_confirmed_pairs_safe_types_only():
     s.close()
 
 
+def test_confirmed_pairs_fingerprint_mode():
+    # The fingerprint gate is strictly better than the allowlist: it ADMITS a clean
+    # winner the title/series allowlist drops, and REJECTS a winner<->method-decision
+    # pair the allowlist wrongly keeps.
+    s = Store(":memory:")
+    # (1) Tennis winner: Poly title lacks "win" so the allowlist drops it; fingerprint
+    #     keeps it (vs -> winner, same player/date).
+    s.upsert_market("kalshi", "KXATPMATCH-26JUN17DESHA-DE",
+                    "Will Alex de Minaur win the de Minaur vs Shapovalov match? - Alex de Minaur")
+    s.upsert_market("polymarket_us", "aec-atp-alemin-densha-2026-06-17",
+                    "Alex de Minaur vs. Denis Shapovalov - Alex de Minaur")
+    s.cache_verdict("kalshi", "KXATPMATCH-26JUN17DESHA-DE",
+                    "polymarket_us", "aec-atp-alemin-densha-2026-06-17",
+                    same_event=True, confidence=1.0)
+    # (2) Fight winner <-> "go to a decision" method market: allowlist keeps (the word
+    #     "draw" trips its winner regex); fingerprint rejects (no clean YES side).
+    s.upsert_market("kalshi", "KXUFCFIGHT-26JUN20KAPHOR-HOR",
+                    "Will Kyoji Horiguchi win the Kape vs Horiguchi MMA fight? - Kyoji Horiguchi")
+    s.upsert_market("polymarket_us", "astatc-ufc-kyohor-mankap-2026-06-20-rov-dec",
+                    "Will Kyoji Horiguchi vs. Manel Kape go to a decision, draw, or no contest? - Yes")
+    s.cache_verdict("kalshi", "KXUFCFIGHT-26JUN20KAPHOR-HOR",
+                    "polymarket_us", "astatc-ufc-kyohor-mankap-2026-06-20-rov-dec",
+                    same_event=True, confidence=1.0)
+
+    live = {(p[0], p[1]) for p in s.confirmed_pairs()}
+    fp = {(p[0], p[1]) for p in s.confirmed_pairs(use_fingerprint=True)}
+    assert ("kalshi", "KXATPMATCH-26JUN17DESHA-DE") not in live   # allowlist drops winner
+    assert ("kalshi", "KXATPMATCH-26JUN17DESHA-DE") in fp         # fingerprint keeps it
+    assert ("kalshi", "KXUFCFIGHT-26JUN20KAPHOR-HOR") in live     # allowlist keeps FP
+    assert ("kalshi", "KXUFCFIGHT-26JUN20KAPHOR-HOR") not in fp   # fingerprint rejects it
+    # Metric restriction for a staged rollout.
+    assert s.confirmed_pairs(use_fingerprint=True, fingerprint_metrics=frozenset({"goals"})) == []
+    s.close()
+
+
 def test_drop_fanout_pairs_pure():
     from bot.data.store import drop_fanout_pairs
 

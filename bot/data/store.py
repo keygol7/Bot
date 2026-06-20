@@ -238,6 +238,7 @@ class Store:
     def confirmed_pairs(
         self, min_confidence: float = 0.85, max_fanout: Optional[int] = 1,
         drop_scope_mismatch: bool = True, safe_types_only: bool = True,
+        use_fingerprint: bool = False, fingerprint_metrics: Optional[frozenset] = None,
     ) -> list[tuple]:
         """Cached tradeable pairs: (venue_a, market_a, venue_b, market_b, event_key).
 
@@ -268,22 +269,44 @@ class Store:
                WHERE v.same_event=1 AND v.confidence >= ?""",
             (min_confidence,),
         ).fetchall()
+        if use_fingerprint:
+            from bot.matching.fingerprint import (
+                are_complementary, from_kalshi, from_polymarket,
+            )
+
+            def _fp(venue, mid, title):
+                return (from_kalshi(mid, title) if venue == "kalshi"
+                        else from_polymarket(mid, title))
+
         pairs = []
         for r in rows:
             ta, tb = r["title_a"] or "", r["title_b"] or ""
-            if drop_scope_mismatch and scope_mismatch(ta, tb):
-                continue
-            if safe_types_only:
-                if not (is_tradeable_market_type(ta) and is_tradeable_market_type(tb)):
+            if use_fingerprint:
+                # Structured complement match (validated via --compare-filters): admits
+                # any category whose fingerprints prove complementary, regardless of the
+                # series/title allowlists, and rejects winner<->method false positives
+                # the title whitelist lets through. Optionally restrict to specific
+                # metrics for a staged rollout.
+                fa = _fp(r["venue_a"], r["market_a"], ta)
+                fb = _fp(r["venue_b"], r["market_b"], tb)
+                if not are_complementary(fa, fb):
                     continue
-                # Kalshi series allowlist (more reliable than titles). The kalshi leg
-                # must be a vetted series; unknown/exotic series are excluded.
-                kalshi_mkt = (
-                    r["market_a"] if r["venue_a"] == "kalshi"
-                    else r["market_b"] if r["venue_b"] == "kalshi" else None
-                )
-                if kalshi_mkt is not None and not is_allowed_kalshi_series(kalshi_mkt):
+                if fingerprint_metrics and fa.metric not in fingerprint_metrics:
                     continue
+            else:
+                if drop_scope_mismatch and scope_mismatch(ta, tb):
+                    continue
+                if safe_types_only:
+                    if not (is_tradeable_market_type(ta) and is_tradeable_market_type(tb)):
+                        continue
+                    # Kalshi series allowlist (more reliable than titles). The kalshi
+                    # leg must be a vetted series; unknown/exotic series are excluded.
+                    kalshi_mkt = (
+                        r["market_a"] if r["venue_a"] == "kalshi"
+                        else r["market_b"] if r["venue_b"] == "kalshi" else None
+                    )
+                    if kalshi_mkt is not None and not is_allowed_kalshi_series(kalshi_mkt):
+                        continue
             pairs.append(
                 (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], r["event_key"])
             )
