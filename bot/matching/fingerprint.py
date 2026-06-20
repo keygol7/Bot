@@ -39,6 +39,9 @@ _NON_SCOPE_PREFIXES = ("metric:", "score:", "thr:")
 # ``unknown`` = could not classify (fails closed, same as unmatchable).
 _UNMATCHABLE = "unmatchable"
 _UNKNOWN = "unknown"
+# Player-prop stat metrics — these carry the entity in the question ("Will <Player>
+# record N+ <stat>"), so the Yes-outcome subject may be recovered from the question.
+_STAT_METRICS = frozenset({"goals", "assists", "ga", "points", "saves", "shots"})
 
 # Kalshi encodes the market type in the series token (more reliable than the title).
 # Classify EVERY series into a canonical metric — including an explicit unmatchable
@@ -164,10 +167,13 @@ def from_polymarket(slug: str, title: str, end_date: str | None = None,
         if m:
             date = parse_iso8601(m.group(1))
     subject = _subject_tokens(outcome) or _subject_tokens(_outcome_from_title(title))
-    if not subject:
-        # Prop markets read "Will <Player> record N+ <stat> in A vs B? - Yes": the
-        # entity is in the question, not the Yes/No outcome suffix. (Winners keep their
-        # team/player suffix above, preserving YES polarity.)
+    if not subject and metric in _STAT_METRICS:
+        # Player props read "Will <Player> record N+ <stat> in A vs B? - Yes": the
+        # entity is in the question, not the Yes/No suffix. Restricted to stat metrics:
+        # a "A vs B end before round 3? - Yes" matchup has no clean YES side (the
+        # question names BOTH parties), so it stays subject-less -> unmatchable, rather
+        # than falsely aligning a duration/method market to a fight WINNER. Winners keep
+        # their team/player suffix above (preserving YES polarity).
         subject = _subject_tokens(title.rsplit(" - ", 1)[0])
     return ContractFingerprint(
         venue="polymarket_us", metric=metric, scope=_scope_only(title),

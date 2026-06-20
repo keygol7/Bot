@@ -65,6 +65,25 @@ def test_prop_wrong_player_same_game_not_complementary():
     assert not are_complementary(k, p)
 
 
+def test_fight_winner_vs_duration_not_complementary():
+    # Fight WINNER must NOT match a "ends before round N" duration market (the Yes-side
+    # matchup question names both fighters, so it has no clean YES side).
+    k = from_kalshi("KXUFCFIGHT-26JUN20CUTSTI-STI",
+                    "Will Navajo Stirling win the Cutelaba vs Stirling MMA fight? - Navajo Stirling")
+    p = from_polymarket("astatc-ufc-ioncut-navsti-2026-06-20-rof-before-r3",
+                        "Will Ion Cutelaba vs. Navajo Stirling end before round 3? - Yes")
+    assert p.subject == frozenset()                # no entity recovered -> unmatchable side
+    assert not are_complementary(k, p)
+
+
+def test_real_fight_winner_is_complementary():
+    k = from_kalshi("KXUFCFIGHT-26JUN20KAPHOR-HOR",
+                    "Will Kyoji Horiguchi win the Kape vs Horiguchi MMA fight? - Kyoji Horiguchi")
+    p = from_polymarket("aec-ufc-kyohor-mankap-2026-06-20",
+                        "Kyoji Horiguchi vs. Manel Kape - Kyoji Horiguchi")
+    assert are_complementary(k, p)
+
+
 def test_mention_novelty_not_complementary():
     k, p = _pair(
         "KXWCMENTION-26JUN22JORDZA-CAPT", "Jordan vs Algeria - Captain", "Captain",
