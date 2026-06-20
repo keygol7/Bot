@@ -238,6 +238,61 @@ def test_polymarket_scan_quotes_stops_when_offset_ignored():
     assert len(quotes) == 500                      # only the unique first page kept
 
 
+def test_kalshi_scan_quotes_targeted_close_window():
+    # Targeted scan: max_close_ts is sent as a query param AND enforced client-side.
+    # Near market is kept, far market is dropped, no-close-time market is kept.
+    import time as _time
+    from datetime import datetime, timezone
+
+    now = _time.time()
+    window = int(now + 2 * 86400)
+    near = datetime.fromtimestamp(now + 3600, timezone.utc).isoformat()
+    far = datetime.fromtimestamp(now + 10 * 86400, timezone.utc).isoformat()
+    seen_params = []
+
+    def handler(req):
+        seen_params.append(dict(req.url.params))
+        return httpx.Response(200, json={"markets": [
+            {"ticker": "NEAR", "title": "near", "close_time": near},
+            {"ticker": "FAR", "title": "far", "close_time": far},
+            {"ticker": "NOCLOSE", "title": "noclose"},
+        ], "cursor": ""})
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    quotes = asyncio.run(v.scan_quotes(100, max_close_ts=window))
+    ids = {q.market_id for q in quotes}
+    assert ids == {"NEAR", "NOCLOSE"}                     # FAR filtered out
+    assert seen_params[0]["max_close_ts"] == str(window)  # server-side param sent
+
+
+def test_polymarket_scan_quotes_targeted_close_window():
+    # Polymarket has no documented close-time query param -> client-side filter on endDate.
+    import time as _time
+    from datetime import datetime, timezone
+
+    now = _time.time()
+    window = int(now + 2 * 86400)
+    near = datetime.fromtimestamp(now + 3600, timezone.utc).isoformat()
+    far = datetime.fromtimestamp(now + 10 * 86400, timezone.utc).isoformat()
+
+    def handler(req):
+        return httpx.Response(200, json={"markets": [
+            {"slug": "near", "question": "near", "bestAsk": "0.4", "bestBid": "0.38",
+             "endDate": near},
+            {"slug": "far", "question": "far", "bestAsk": "0.4", "bestBid": "0.38",
+             "endDate": far},
+            {"slug": "noclose", "question": "noclose", "bestAsk": "0.4", "bestBid": "0.38"},
+        ]})
+
+    cfg = QcexConfig()
+    v = PolymarketUSVenue(cfg)
+    v._gateway_client = _client(handler, cfg.gateway_base)
+    quotes = asyncio.run(v.scan_quotes(100, max_close_ts=window))
+    assert {q.market_id for q in quotes} == {"near", "noclose"}   # far filtered out
+
+
 def test_kalshi_is_open_status():
     def handler(req):
         if "SETTLED" in str(req.url):

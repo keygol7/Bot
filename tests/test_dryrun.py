@@ -21,7 +21,7 @@ class StubVenue:
         self.fee_model = ZeroFeeModel()
         self._quotes = quotes
 
-    async def scan_quotes(self, limit=500):
+    async def scan_quotes(self, limit=500, *, max_close_ts=None):
         return [
             dataclasses.replace(q, yes_ask_size=0.0, no_ask_size=0.0)
             for q in self._quotes.values()
@@ -48,6 +48,37 @@ def run_cycle_kw(venues, complete_fn=None, store=None, min_edge=0.01, threshold=
         limit=50, embed_fn=embed_fn, max_confirms=max_confirms,
         use_fingerprint=use_fingerprint,
     ))
+
+
+def test_close_within_days_passes_max_close_ts_to_scan():
+    # close_within_days > 0 -> run_cycle computes a max_close_ts (now + days) and hands
+    # it to each venue's scan_quotes; 0 -> None (scan all).
+    import time as _time
+
+    captured = []
+
+    class RecordingVenue(StubVenue):
+        async def scan_quotes(self, limit=500, *, max_close_ts=None):
+            captured.append(max_close_ts)
+            return []
+
+    before = _time.time()
+    asyncio.run(run_cycle(
+        [RecordingVenue("kalshi", {})], store=None, risk=generous_risk(),
+        fee_models={"kalshi": ZeroFeeModel()}, min_edge=0.01, match_threshold=0.3,
+        complete_fn=None, limit=50, close_within_days=2.0,
+    ))
+    after = _time.time()
+    assert len(captured) == 1 and captured[0] is not None
+    assert int(before + 2 * 86400) <= captured[0] <= int(after + 2 * 86400)
+
+    captured.clear()
+    asyncio.run(run_cycle(
+        [RecordingVenue("kalshi", {})], store=None, risk=generous_risk(),
+        fee_models={"kalshi": ZeroFeeModel()}, min_edge=0.01, match_threshold=0.3,
+        complete_fn=None, limit=50, close_within_days=0.0,
+    ))
+    assert captured == [None]                              # disabled -> no window
 
 
 def test_max_confirms_caps_llm_calls_per_cycle():
@@ -172,7 +203,7 @@ def test_cross_pair_without_list_prices_still_confirmed():
         def __init__(self, name, scan_q, deep_q):
             super().__init__(name, {deep_q.market_id: deep_q})
             self._scan = scan_q
-        async def scan_quotes(self, limit=500):
+        async def scan_quotes(self, limit=500, *, max_close_ts=None):
             return [self._scan]
 
     venues = [TwoPhaseStub("kalshi", ka_scan, ka), TwoPhaseStub("polymarket_us", pa_scan, pa)]
@@ -220,7 +251,7 @@ def test_resolution_date_gate_allows_same_date():
 
 def test_scan_failure_isolated_per_venue():
     class DeadVenue(StubVenue):
-        async def scan_quotes(self, limit=500):
+        async def scan_quotes(self, limit=500, *, max_close_ts=None):
             raise RuntimeError("venue down")
 
     kb = mq("kalshi", "B1", "Bundle", yes_ask=0.40, yes_ask_size=50, no_ask=0.55, no_ask_size=50)

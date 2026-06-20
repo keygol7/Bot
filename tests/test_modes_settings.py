@@ -22,6 +22,7 @@ def test_load_settings_defaults(tmp_path, monkeypatch):
     for key in (
         "BOT_RUN_MODE", "RISK_MAX_DAILY_LOSS", "RISK_MIN_EDGE",
         "RISK_MAX_POSITION_PER_MARKET", "RISK_MAX_TOTAL_EXPOSURE",
+        "SCAN_CLOSE_WITHIN_DAYS",
     ):
         monkeypatch.delenv(key, raising=False)
     settings = load_settings(dotenv_path=str(tmp_path / "nonexistent.env"))
@@ -31,6 +32,13 @@ def test_load_settings_defaults(tmp_path, monkeypatch):
     assert settings.qcex.use_sandbox is False
     assert settings.qcex.gateway_base == "https://gateway.polymarket.us"
     assert settings.qcex.is_trading_configured is False  # no creds by default
+    assert settings.scan_close_within_days == 0.0         # targeted scan off by default
+
+
+def test_load_settings_reads_scan_close_within_days(tmp_path, monkeypatch):
+    monkeypatch.setenv("SCAN_CLOSE_WITHIN_DAYS", "4")
+    settings = load_settings(dotenv_path=str(tmp_path / "nonexistent.env"))
+    assert settings.scan_close_within_days == 4.0
 
 
 def test_load_settings_reads_env(tmp_path, monkeypatch):

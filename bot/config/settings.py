@@ -116,6 +116,10 @@ class Settings:
     # specific metrics (e.g. "winner") for a staged rollout; empty = all matchable.
     match_use_fingerprint: bool = False
     match_fingerprint_metrics: frozenset = field(default_factory=frozenset)
+    # Targeted scan: only scan markets closing within this many days (the live/imminent
+    # set), so today's games are always covered without a huge --limit (the matcher
+    # embeds every scanned title, so scan size is the cost). 0 = disabled (scan all).
+    scan_close_within_days: float = 0.0
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -172,4 +176,5 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
             tok for raw in (env("MATCH_FINGERPRINT_METRICS", "") or "").split(",")
             if (tok := raw.strip().lower()) in _VALID_FINGERPRINT_METRICS
         ),
+        scan_close_within_days=_env_float("SCAN_CLOSE_WITHIN_DAYS", 0.0),
     )

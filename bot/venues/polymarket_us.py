@@ -396,7 +396,9 @@ class PolymarketUSVenue:
             out.append(RawMarket(market_id=slug, title=build_market_title(m), raw=m))
         return out
 
-    async def scan_quotes(self, limit: int = 500) -> list[MarketQuote]:
+    async def scan_quotes(
+        self, limit: int = 500, *, max_close_ts: int | None = None
+    ) -> list[MarketQuote]:
         """Phase 1: paginate /v1/markets -> price-only quotes (bestBid/bestAsk).
 
         Sizes are not in the list payload, so this is the cheap wide scan; the sized
@@ -405,6 +407,11 @@ class PolymarketUSVenue:
         ``limit`` is a TOTAL cap across pages. We page via ``offset`` and dedupe by
         slug; if the gateway ignores ``offset`` (returns the same page) we get no new
         slugs and stop, so this is safe whether or not paging is supported.
+
+        ``max_close_ts`` (Unix seconds) enables a TARGETED scan: only markets closing
+        at/before that time (from ``endDate``) are returned. The public gateway has no
+        documented close-time query param, so this is enforced client-side; markets
+        with no close_time are kept (never drop a live market on missing data).
         """
         out: list[MarketQuote] = []
         seen: set[str] = set()
@@ -427,7 +434,15 @@ class PolymarketUSVenue:
                 if not slug or slug in seen:
                     continue
                 seen.add(slug)
-                new += 1
+                new += 1  # progress through the feed (counts even if out-of-window)
+                close_time = parse_iso8601(m.get("endDate"))
+                # Targeted window: skip markets closing past it (keep unknown close).
+                if (
+                    max_close_ts is not None
+                    and close_time is not None
+                    and close_time > max_close_ts
+                ):
+                    continue
                 best_ask = _amount(m.get("bestAsk"))
                 best_bid = _amount(m.get("bestBid"))
                 out.append(
@@ -439,7 +454,7 @@ class PolymarketUSVenue:
                         yes_ask_size=0.0,
                         no_ask=round(1.0 - best_bid, 6) if best_bid is not None else None,
                         no_ask_size=0.0,
-                        close_time=parse_iso8601(m.get("endDate")),
+                        close_time=close_time,
                     )
                 )
             offset += len(markets)

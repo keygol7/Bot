@@ -333,26 +333,36 @@ class KalshiVenue:
             "closed", "settled", "determined", "finalized", "cancelled", "expired",
         }
 
-    async def scan_quotes(self, limit: int = 500) -> list[MarketQuote]:
+    async def scan_quotes(
+        self, limit: int = 500, *, max_close_ts: int | None = None
+    ) -> list[MarketQuote]:
         """Phase 1: price-only quotes for open markets, up to ``limit`` markets total.
 
         Kalshi caps a single /markets page at 1000 and the markets we care about can
         sit past the first page (e.g. UFC fights), so we follow the ``cursor`` until
         we've scanned ``limit`` markets or the feed is exhausted. ``limit`` is a TOTAL
         cap across pages, not a per-page size.
+
+        ``max_close_ts`` (Unix seconds) enables a TARGETED scan: only markets closing
+        at/before that time (the live/imminent set). It's sent as the documented
+        ``max_close_ts`` query param AND enforced client-side on ``close_time`` as a
+        fail-safe — so coverage is correct whether or not the server honors the param.
+        Markets with no close_time are kept (don't drop a live market on missing data).
         """
         out: list[MarketQuote] = []
         cursor: str | None = None
         fetched = 0
         while fetched < limit:
             await self._limiter.wait()
-            params = {
+            params: dict[str, Any] = {
                 # mve_filter=exclude drops multivariate/parlay markets server-side,
                 # which otherwise dominate the feed. Client-side filter below backs it up.
                 "limit": min(limit - fetched, 1000),
                 "status": "open",
                 "mve_filter": "exclude",
             }
+            if max_close_ts is not None:
+                params["max_close_ts"] = int(max_close_ts)
             if cursor:
                 params["cursor"] = cursor  # query only — not part of the signed path
             resp = await self._http().get(
@@ -363,11 +373,19 @@ class KalshiVenue:
             markets = body.get("markets", [])
             fetched += len(markets)
             # Drop multivariate/parlay markets — not arbitrageable, junk titles.
-            out.extend(
-                normalize_summary(m)
-                for m in markets
-                if m.get("ticker") and not is_multivariate(m["ticker"])
-            )
+            for m in markets:
+                if not m.get("ticker") or is_multivariate(m["ticker"]):
+                    continue
+                q = normalize_summary(m)
+                # Client-side fail-safe for the targeted window (server may ignore the
+                # param). Keep markets with no close_time — never drop on missing data.
+                if (
+                    max_close_ts is not None
+                    and q.close_time is not None
+                    and q.close_time > max_close_ts
+                ):
+                    continue
+                out.append(q)
             cursor = body.get("cursor")
             if not cursor or not markets:
                 break  # end of feed

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 
 from bot.config.settings import Settings, load_settings
@@ -100,8 +101,19 @@ async def run_cycle(
     executor=None,
     use_fingerprint: bool = False,
     fingerprint_metrics=None,
+    close_within_days: float = 0.0,
 ) -> CycleResult:
     result = CycleResult()
+
+    # Targeted scan window: only pull markets closing within ``close_within_days`` (the
+    # live/imminent set) so today's games are always covered without a huge --limit.
+    # 0 = disabled (scan the whole board). Passed to each venue's scan_quotes.
+    max_close_ts: int | None = (
+        int(time.time() + close_within_days * 86400) if close_within_days > 0 else None
+    )
+    if max_close_ts is not None:
+        log.info("targeted scan: markets closing within %.2g days (max_close_ts=%d)",
+                 close_within_days, max_close_ts)
 
     # ----- Phase 1: cheap wide price scan (one list call per venue) -----
     # Price-only quotes (no depth) for every market, so we can match/shortlist
@@ -110,7 +122,7 @@ async def run_cycle(
     quotes_by_venue: dict[str, list[MarketQuote]] = {}
     for v in venues:
         try:
-            qs = await v.scan_quotes(limit)
+            qs = await v.scan_quotes(limit, max_close_ts=max_close_ts)
         except Exception as exc:
             log.warning("scan_quotes failed for %s: %s", v.name, exc)
             quotes_by_venue[v.name] = []
@@ -336,6 +348,7 @@ async def run(
     max_resolve_gap_days: float = 3.0,
     live: bool = False,
     store: Store | None = None,
+    close_within_days: float | None = None,
 ) -> CycleResult | None:
     settings = settings or load_settings()
     own_store = store is None
@@ -343,6 +356,8 @@ async def run(
     risk = RiskManager(settings.risk)
     if min_edge is None:
         min_edge = settings.risk.min_edge
+    if close_within_days is None:
+        close_within_days = settings.scan_close_within_days
     if venues is None:
         venues = _build_venues(settings)
     fee_models = {v.name: v.fee_model for v in venues}
@@ -395,7 +410,7 @@ async def run(
                 min_edge=min_edge, match_threshold=match_threshold,
                 complete_fn=complete_fn, limit=limit, embed_fn=embed_fn,
                 max_confirms=max_confirms, max_resolve_gap_days=max_resolve_gap_days,
-                executor=executor,
+                executor=executor, close_within_days=close_within_days,
             )
             log.info("cycle: %s", last.summary())
             if once:
@@ -516,6 +531,7 @@ async def stream(
     min_edge: float | None = None,
     max_confirms: int = 50,
     max_resolve_gap_days: float = 3.0,
+    close_within_days: float | None = None,
 ) -> None:
     """Streaming LIVE execution: slow match loop refreshes confirmed pairs; fast WS
     loop re-checks edge on every book update and fires the executor instantly.
@@ -527,6 +543,8 @@ async def stream(
     from bot.streaming.fills import FillTracker
 
     settings = settings or load_settings()
+    if close_within_days is not None:
+        settings.scan_close_within_days = close_within_days
     if min_edge is None:
         min_edge = settings.risk.min_edge
     if match_threshold is None:
@@ -593,6 +611,7 @@ async def stream(
             max_resolve_gap_days=max_resolve_gap_days, executor=None,
             use_fingerprint=settings.match_use_fingerprint,
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
+            close_within_days=settings.scan_close_within_days,
         )
         await refresh_balances()
         cached = store.confirmed_pairs(
@@ -638,6 +657,9 @@ async def stream(
     log.warning("matching mode: fingerprint=%s metrics=%s (MATCH_USE_FINGERPRINT)",
                 settings.match_use_fingerprint,
                 sorted(settings.match_fingerprint_metrics) or "all")
+    log.warning("scan window: %s (SCAN_CLOSE_WITHIN_DAYS)",
+                f"markets closing within {settings.scan_close_within_days:g} days"
+                if settings.scan_close_within_days > 0 else "all open markets (no window)")
     ceiling = (f"{settings.risk.max_order_contracts:g} ct/order"
                if settings.risk.max_order_contracts and settings.risk.max_order_contracts > 0
                else "no per-order ceiling — sized to balances/depth")
@@ -1259,6 +1281,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--max-resolve-gap-days", type=float, default=3.0,
                    help="reject cross-venue pairs whose resolution dates differ by "
                         "more than this many days (settlement-mismatch guard)")
+    p.add_argument("--close-within-days", type=float, default=None,
+                   help="TARGETED scan: only scan markets closing within this many days "
+                        "(the live/imminent set). Default from SCAN_CLOSE_WITHIN_DAYS "
+                        "(0 = scan all). Keeps the scan small + complete for today's games.")
     p.add_argument("--live", action="store_true",
                    help="PLACE REAL ORDERS on confirmed arbs (needs trading creds; "
                         "point base URLs at the sandbox/demo first). Default: monitor only.")
@@ -1315,6 +1341,7 @@ def main(argv: list[str] | None = None) -> None:
             refresh_interval=interval, limit=args.limit, use_llm=True, use_embed=True,
             match_threshold=threshold, min_edge=args.min_edge,
             max_confirms=args.max_confirms, max_resolve_gap_days=args.max_resolve_gap_days,
+            close_within_days=args.close_within_days,
         ))
         return
 
@@ -1323,6 +1350,7 @@ def main(argv: list[str] | None = None) -> None:
         use_llm=args.llm, use_embed=args.embed, match_threshold=threshold,
         min_edge=args.min_edge, max_confirms=args.max_confirms,
         max_resolve_gap_days=args.max_resolve_gap_days, live=args.live,
+        close_within_days=args.close_within_days,
     ))
 
 
