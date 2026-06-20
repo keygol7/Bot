@@ -64,7 +64,8 @@ def parse_market_data_lite(message: dict[str, Any]) -> MarketQuote | None:
     """Normalize a ``MARKET_DATA_LITE`` WS message into a top-of-book quote.
 
     The payload (`marketDataLite`) carries the same bestBid/bestAsk/askDepth/bidDepth
-    shape as the REST BBO, so it reuses :func:`normalize_bbo`.
+    shape as the REST BBO, so it reuses :func:`normalize_bbo` (price-only — the lite
+    feed's depth fields are level counts, not sizes).
     """
     md = message.get("marketDataLite")
     if not isinstance(md, dict):
@@ -73,6 +74,22 @@ def parse_market_data_lite(message: dict[str, Any]) -> MarketQuote | None:
     if not slug:
         return None
     return normalize_bbo(slug, "", md)
+
+
+def parse_market_data(message: dict[str, Any]) -> MarketQuote | None:
+    """Normalize a ``MARKET_DATA`` (full book) WS message into a SIZED quote.
+
+    The payload (`marketData`) carries the same ``bids``/``offers`` (with real ``qty``)
+    shape as the REST ``/book``, so it reuses :func:`normalize_book` — giving real
+    top-of-book size over the stream (unlike the lite feed's level counts).
+    """
+    md = message.get("marketData")
+    if not isinstance(md, dict):
+        return None
+    slug = md.get("marketSlug")
+    if not slug:
+        return None
+    return normalize_book(slug, "", md)
 
 
 # (side, action) -> order intent. Price is always quoted on the YES/long side.
@@ -575,11 +592,12 @@ class PolymarketUSVenue:
         return state not in _TERMINAL_MARKET_STATES
 
     async def stream_order_book(self, market_ids: list[str]) -> AsyncIterator[MarketQuote]:
-        """Stream real-time top-of-book via the markets WS (MARKET_DATA_LITE).
+        """Stream real-time SIZED top-of-book via the markets WS (MARKET_DATA full book).
 
         Requires credentials (the markets WS is on the authenticated API, unlike the
         public REST gateway). Subscribes in batches of 100 slugs; reconnects with
-        exponential backoff; ignores heartbeats.
+        exponential backoff; ignores heartbeats. Uses the full-book channel (not the
+        lite BBO) so the streamed quote carries real per-level size.
         """
         if not getattr(self.cfg, "is_trading_configured", False):
             raise OrderNotPermitted("Polymarket US credentials required for the WebSocket")
@@ -602,7 +620,7 @@ class PolymarketUSVenue:
                     for n, chunk in enumerate(chunks):
                         sub: dict[str, Any] = {
                             "requestId": f"md-{n}",
-                            "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA_LITE",
+                            "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
                         }
                         if chunk:
                             sub["marketSlugs"] = chunk
@@ -615,7 +633,7 @@ class PolymarketUSVenue:
                         if data.get("error"):
                             log.warning("polymarket ws error: %s", data["error"])
                             continue
-                        quote = parse_market_data_lite(data)
+                        quote = parse_market_data(data)
                         if quote is not None:
                             yield quote
             except asyncio.CancelledError:

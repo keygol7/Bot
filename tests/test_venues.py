@@ -39,7 +39,8 @@ def test_kalshi_title_idempotent_suffix():
     # ...but re-normalizing an already-suffixed title doesn't double up.
     assert build_summary_title({"title": once, "yes_sub_title": "Chargers"}) == once
 from bot.venues.polymarket_us import (
-    build_market_title, normalize_bbo, normalize_book, parse_market_data_lite,
+    build_market_title, normalize_bbo, normalize_book, parse_market_data,
+    parse_market_data_lite,
 )
 
 
@@ -59,6 +60,25 @@ def test_polymarket_ws_market_data_lite_parsing():
 def test_polymarket_ws_ignores_non_lite():
     assert parse_market_data_lite({"heartbeat": {}}) is None
     assert parse_market_data_lite({"marketDataLite": {}}) is None
+
+
+def test_polymarket_ws_full_book_parsing_has_real_size():
+    # The MARKET_DATA (full book) channel carries bids/offers with real qty.
+    msg = {"marketData": {
+        "marketSlug": "tec-mlb-champ-lad",
+        "bids": [{"px": {"value": "0.54"}, "qty": "300"}],
+        "offers": [{"px": {"value": "0.56"}, "qty": "200"}],
+        "state": "MARKET_STATE_OPEN",
+    }}
+    q = parse_market_data(msg)
+    assert q.market_id == "tec-mlb-champ-lad"
+    assert q.yes_ask == 0.56 and q.yes_ask_size == 200       # real size, not a level count
+    assert round(q.no_ask, 4) == 0.46 and q.no_ask_size == 300
+
+
+def test_polymarket_ws_full_book_ignores_non_data():
+    assert parse_market_data({"heartbeat": {}}) is None
+    assert parse_market_data({"marketData": {}}) is None      # no slug
 
 
 def test_polymarket_title_appends_outcome():
