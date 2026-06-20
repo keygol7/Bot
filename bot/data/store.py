@@ -314,6 +314,25 @@ class Store:
             pairs = drop_fanout_pairs(pairs, max_fanout=max_fanout)
         return pairs
 
+    def prune_market(self, venue: str, market_id: str) -> int:
+        """Delete a settled/closed market and every cached verdict referencing it.
+
+        Returns the number of verdict rows removed. Keeps the cache focused on live
+        events so the watchlist build stops re-probing dead markets every cycle.
+        Safe because a closed/settled status is terminal — the market won't reopen.
+        """
+        cur = self.conn.execute(
+            """DELETE FROM match_verdicts
+               WHERE (venue_a=? AND market_a=?) OR (venue_b=? AND market_b=?)""",
+            (venue, market_id, venue, market_id),
+        )
+        n = cur.rowcount
+        self.conn.execute(
+            "DELETE FROM markets WHERE venue=? AND market_id=?", (venue, market_id)
+        )
+        self.conn.commit()
+        return n
+
     def get_verdict(self, va: str, ma: str, vb: str, mb: str) -> Optional[sqlite3.Row]:
         a, ma2, b, mb2 = self._pair_key(va, ma, vb, mb)
         return self.conn.execute(

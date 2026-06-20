@@ -411,7 +411,7 @@ async def run(
     return last
 
 
-async def build_watchlist(cached, scanned, venues):
+async def build_watchlist(cached, scanned, venues, store=None):
     """Confirmed pairs whose BOTH legs are live now -> the streaming watchlist.
 
     Durable across embedding/LLM variance: discovery only *adds* to the cache. A
@@ -429,6 +429,7 @@ async def build_watchlist(cached, scanned, venues):
 
     live = set(scanned)
     venue_by_name = {v.name: v for v in venues}
+    settled: list[tuple[str, str]] = []   # confirmed closed -> prune from the cache
 
     to_probe = {
         (vn, mid)
@@ -453,6 +454,7 @@ async def build_watchlist(cached, scanned, venues):
                 ok = None
             if ok is False:
                 log.info("watchlist drop %s:%s — market closed/settled", vn, mid)
+                settled.append((vn, mid))
                 continue
             live.add((vn, mid))
         else:
@@ -464,6 +466,13 @@ async def build_watchlist(cached, scanned, venues):
                 continue
             if q is not None:
                 live.add((vn, mid))
+
+    # Settled markets are terminal — prune them (and their verdicts) so the cache
+    # stays focused on live events and we don't re-probe dead markets next cycle.
+    if store is not None and settled:
+        verdicts = sum(store.prune_market(vn, mid) for (vn, mid) in settled)
+        log.info("pruned %d settled markets (%d cached verdicts) from the cache",
+                 len(settled), verdicts)
 
     out = []
     missing_a = missing_b = 0  # legs of cached pairs still not live after probing
@@ -590,7 +599,7 @@ async def stream(
             use_fingerprint=settings.match_use_fingerprint,
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
         )
-        return await build_watchlist(cached, res.scanned, venues)
+        return await build_watchlist(cached, res.scanned, venues, store=store)
 
     async def feed_private(v):
         try:

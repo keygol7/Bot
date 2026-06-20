@@ -652,3 +652,45 @@ def test_run_cycle_fingerprint_gate_skips_novelty(capsys):
     confirmed = {(a, b) for (_, a, _, b, _) in res.confirmed_pairs}
     assert ("KXATPMATCH-26JUN22DESHA-DE", "aec-atp-alemin-densha-2026-06-22") in confirmed
     assert all("MENTION" not in a for (a, b) in confirmed)
+
+
+def test_build_watchlist_prunes_settled(tmp_path):
+    import asyncio as _a
+    from bot.dryrun import build_watchlist
+
+    path = str(tmp_path / "w.db")
+    store = Store(path)
+    # One pair whose Kalshi leg has settled.
+    store.upsert_market("kalshi", "KSET", "x")
+    store.upsert_market("polymarket_us", "PLIVE", "x")
+    store.cache_verdict("kalshi", "KSET", "polymarket_us", "PLIVE",
+                        same_event=True, confidence=1.0)
+    cached = [("kalshi", "KSET", "polymarket_us", "PLIVE", "KSET|PLIVE")]
+
+    class V:
+        def __init__(self, name, open_map):
+            self.name = name
+            self._open = open_map
+        async def is_open(self, mid):
+            return self._open.get(mid)
+
+    venues = [V("kalshi", {"KSET": False}), V("polymarket_us", {"PLIVE": True})]
+    out = _a.run(build_watchlist(cached, set(), venues, store=store))
+    assert out == []                                  # settled pair dropped
+    # The settled market + its verdict were pruned, so next cycle won't re-probe it.
+    assert store.confirmed_pairs(use_fingerprint=False, safe_types_only=False) == []
+    assert store.conn.execute(
+        "SELECT COUNT(*) c FROM match_verdicts").fetchone()["c"] == 0
+    store.close()
+
+
+def test_prune_market_removes_verdicts():
+    s = Store(":memory:")
+    s.upsert_market("kalshi", "K", "t")
+    s.upsert_market("polymarket_us", "P", "t")
+    s.cache_verdict("kalshi", "K", "polymarket_us", "P", same_event=True, confidence=1.0)
+    assert s.prune_market("kalshi", "K") == 1
+    assert s.conn.execute("SELECT COUNT(*) c FROM match_verdicts").fetchone()["c"] == 0
+    assert s.conn.execute(
+        "SELECT COUNT(*) c FROM markets WHERE market_id='K'").fetchone()["c"] == 0
+    s.close()
