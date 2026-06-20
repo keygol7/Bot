@@ -1024,6 +1024,82 @@ def probe_account(settings: Settings) -> int:
     return 0
 
 
+def compare_filters(settings: Settings, limit: int = 40) -> int:
+    """SHADOW report: the structured fingerprint matcher vs the live filter.
+
+    Over every LLM-confirmed verdict (same_event=1), compare which pairs the current
+    live filter (store.confirmed_pairs) keeps against which the fingerprint matcher
+    (are_complementary) keeps. Prints the ADDS (fingerprint keeps, live drops — the
+    volume the rework would unlock) and REMOVES (live keeps, fingerprint drops — a
+    precision change to eyeball). Trades nothing; changes nothing.
+    """
+    from collections import Counter
+
+    from bot.matching.fingerprint import (
+        complement_reason, from_kalshi, from_polymarket,
+    )
+
+    store = Store(settings.db_path)
+    try:
+        rows = store.conn.execute(
+            """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b, v.confidence,
+                      ma.title AS title_a, mb.title AS title_b
+               FROM match_verdicts v
+               LEFT JOIN markets ma ON ma.venue=v.venue_a AND ma.market_id=v.market_a
+               LEFT JOIN markets mb ON mb.venue=v.venue_b AND mb.market_id=v.market_b
+               WHERE v.same_event=1""",
+        ).fetchall()
+        live_keys = {(r[0], r[1], r[2], r[3]) for r in store.confirmed_pairs()}
+
+        def fp(venue, mid, title):
+            return (from_kalshi(mid, title) if venue == "kalshi"
+                    else from_polymarket(mid, title))
+
+        adds, removes, both, reasons = [], [], 0, Counter()
+        new_kept = 0
+        for r in rows:
+            key = (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
+            reason = complement_reason(
+                fp(r["venue_a"], r["market_a"], r["title_a"] or ""),
+                fp(r["venue_b"], r["market_b"], r["title_b"] or ""),
+            )
+            keep_new = reason == "ok"
+            keep_old = key in live_keys
+            new_kept += keep_new
+            reasons[reason if not keep_new else "ok"] += 1
+            if keep_new and keep_old:
+                both += 1
+            elif keep_new and not keep_old:
+                adds.append(r)
+            elif keep_old and not keep_new:
+                removes.append((r, reason))
+
+        print(f"confirmed verdicts (same_event=1): {len(rows)}")
+        print(f"  live filter keeps:        {len(live_keys)}")
+        print(f"  fingerprint keeps:        {new_kept}")
+        print(f"  both agree (intersection): {both}")
+        print(f"  ADDS (fingerprint only):   {len(adds)}   <- volume the rework unlocks")
+        print(f"  REMOVES (live only):       {len(removes)}   <- eyeball for precision\n")
+
+        print("reject reasons across all confirmed verdicts:")
+        for reason, n in reasons.most_common(15):
+            print(f"  {n:>5}  {reason}")
+
+        def _show(label, items, get_reason=None):
+            print(f"\n== {label} (showing {min(limit, len(items))} of {len(items)}) ==")
+            for it in items[:limit]:
+                r = it[0] if get_reason else it
+                extra = f"   [{it[1]}]" if get_reason else ""
+                print(f"  [{r['venue_a']}] {r['market_a']}  {r['title_a']}")
+                print(f"  [{r['venue_b']}] {r['market_b']}  {r['title_b']}{extra}\n")
+
+        _show("ADDS — fingerprint keeps, live drops", adds)
+        _show("REMOVES — live keeps, fingerprint drops", removes, get_reason=True)
+        return 0
+    finally:
+        store.close()
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Live read-only DRY_RUN arbitrage monitor")
     p.add_argument("--check-llm", action="store_true",
@@ -1039,6 +1115,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--probe-account", action="store_true",
                    help="probe Polymarket US account/portfolio endpoints (read-only) "
                         "to discover the real balance/positions paths")
+    p.add_argument("--compare-filters", action="store_true",
+                   help="SHADOW: compare the structured fingerprint matcher vs the live "
+                        "filter over cached verdicts (adds/removes); trades nothing")
     p.add_argument("--show-book", metavar="VENUE:MARKET", default=None,
                    help="fetch and print one market's real order book (sized quote)")
     p.add_argument("--test-order", metavar="VENUE:MARKET", default=None,
@@ -1106,6 +1185,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.probe_account:
         raise SystemExit(probe_account(load_settings()))
+
+    if args.compare_filters:
+        raise SystemExit(compare_filters(load_settings(), limit=args.limit))
 
     if args.show_book:
         raise SystemExit(show_book(load_settings(), args.show_book))

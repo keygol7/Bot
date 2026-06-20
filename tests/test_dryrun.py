@@ -589,3 +589,37 @@ def test_apply_balance_caps_noop_when_no_balance():
     assert total == 0.0
     assert risk.limits.max_total_exposure == 50      # caps left unchanged
     assert risk.limits.max_position_per_market == 20
+
+
+def test_compare_filters_reports_adds(capsys, tmp_path):
+    from bot.config.settings import Settings
+    from bot.dryrun import compare_filters
+
+    path = str(tmp_path / "cmp.db")
+    store = Store(path)
+    seed = [
+        # A WINNER whose Kalshi series (WCWINNER) isn't on the live allowlist and whose
+        # title lacks the word "win" -> live filter drops it; fingerprint sees
+        # winner==winner, same team/date -> keeps it. A real ADD.
+        ("kalshi", "KXWCWINNER-26JUN22NORSEN-NOR", "Norway vs Senegal - Norway"),
+        ("polymarket_us", "aec-fwc-nor-sen-2026-06-22-nor", "Norway vs Senegal - Norway"),
+        # A MENTION novelty the LLM rubber-stamped: live drops (allowlist) AND
+        # fingerprint drops (unmatchable). Neither keeps -> not an add.
+        ("kalshi", "KXWCMENTION-26JUN22NORSEN-SHUT", "Norway vs Senegal - Shutout"),
+        ("polymarket_us", "atc-fwc-nor-sen-2026-06-22-sen", "Norway to advance - Senegal"),
+    ]
+    for v, m, t in seed:
+        store.upsert_market(v, m, t)
+    store.cache_verdict("kalshi", "KXWCWINNER-26JUN22NORSEN-NOR",
+                        "polymarket_us", "aec-fwc-nor-sen-2026-06-22-nor",
+                        same_event=True, confidence=0.95)
+    store.cache_verdict("kalshi", "KXWCMENTION-26JUN22NORSEN-SHUT",
+                        "polymarket_us", "atc-fwc-nor-sen-2026-06-22-sen",
+                        same_event=True, confidence=0.95)
+    store.close()
+
+    settings = Settings()
+    object.__setattr__(settings, "db_path", path)
+    assert compare_filters(settings) == 0
+    out = capsys.readouterr().out
+    assert "ADDS (fingerprint only):   1" in out
