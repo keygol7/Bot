@@ -276,12 +276,20 @@ class Executor:
             return self._settle_success(opp, size, leg1, leg2)
 
         if leg2.status in (OrderStatus.KILLED, OrderStatus.REJECTED) and leg2.filled <= 1e-9:
-            # Definitively no leg-2 position -> safe to unwind leg 1.
-            return await self._unwind(opp, leg1, leg2)
+            # Definitively no leg-2 position -> safe to unwind leg 1. Carry WHY leg2
+            # failed (HTTP status + venue body) into the unwind/log so a rejection is
+            # diagnosable instead of an opaque [REJECTED].
+            log.warning("leg2 %s — %s", leg2.status.value, _reject_reason(leg2))
+            return await self._unwind(
+                opp, leg1, leg2, reason=f"leg2 {leg2.status.value} ({_reject_reason(leg2)})"
+            )
 
         # ERROR or PARTIAL on leg 2: we cannot be sure of the hedge state. Do NOT
         # auto-unwind (risk of doubling up). Halt for manual reconciliation.
-        return self._halt(f"leg2 ambiguous ({leg2.status.value}) — manual reconcile", [leg1, leg2])
+        return self._halt(
+            f"leg2 ambiguous ({leg2.status.value}: {_reject_reason(leg2)}) — manual reconcile",
+            [leg1, leg2],
+        )
 
     # ---- outcomes ----
     def _settle_success(self, opp, size, leg1, leg2) -> ExecutionReport:
@@ -330,9 +338,12 @@ class Executor:
 
         legs = [leg1] + ([leg2] if leg2 is not None else []) + [unwind]
         if not unwind.filled_fully:
-            # Couldn't flatten -> we're still holding a one-sided position. Stop everything.
+            # Couldn't flatten -> we're still holding a one-sided position. Stop
+            # everything, surfacing both WHY we were unwinding and why the unwind failed.
             return self._halt(
-                "UNWIND FAILED — still holding leg1, manual action required", legs,
+                f"UNWIND FAILED ({reason}; unwind {unwind.status.value}: "
+                f"{_reject_reason(unwind)}) — still holding leg1, manual action required",
+                legs,
             )
 
         sell_avg = unwind.avg_price if unwind.avg_price is not None else sell_px

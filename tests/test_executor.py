@@ -134,6 +134,36 @@ def test_leg2_rejected_unwinds_not_halts():
     assert report.status is ExecStatus.UNWOUND and not risk.is_killed
 
 
+def test_leg2_reject_reason_in_unwind_report():
+    # A rejected leg2 carries its HTTP status + venue body into the UNWOUND report so
+    # the reason is diagnosable (not an opaque [REJECTED]).
+    rej = OrderResult(venue="poly", market_id="P1", side=Side.NO, action="buy",
+                      requested=2, filled=0, avg_price=None, order_id=None,
+                      status=OrderStatus.REJECTED,
+                      raw={"http_status": 409, "body": "in-play trading halted"})
+    yes = FakeVenue("kalshi", [
+        res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),
+        res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.38, action="sell"),
+    ])
+    no = FakeVenue("poly", [rej])
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.UNWOUND
+    assert "409" in report.reason and "in-play trading halted" in report.reason
+
+
+def test_leg2_ambiguous_halt_includes_reason():
+    err = OrderResult(venue="poly", market_id="P1", side=Side.NO, action="buy",
+                      requested=2, filled=0, avg_price=None, order_id=None,
+                      status=OrderStatus.ERROR, raw={"error": "connection reset"})
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = FakeVenue("poly", [err])
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.HALTED and risk.is_killed
+    assert "connection reset" in report.reason
+
+
 def test_failed_unwind_halts():
     yes = FakeVenue("kalshi", [
         res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),
