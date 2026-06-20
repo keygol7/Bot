@@ -146,6 +146,63 @@ def test_failed_unwind_halts():
     assert risk.is_killed
 
 
+def test_liquidity_guard_skips_thin_book():
+    # Depth below the min-leg-depth floor -> skip before placing anything (so we never
+    # end up half-filled on a book too thin to hedge/unwind).
+    yes = FakeVenue("kalshi", [])
+    no = FakeVenue("poly", [])
+    risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({v.name: v for v in [yes, no]}, risk,
+                  fee_models={v.name: ZeroFeeModel() for v in [yes, no]},
+                  max_order_contracts=0, min_leg_depth=25)
+    report = asyncio.run(ex.execute(opp(max_contracts=10)))   # 10 < 25 floor
+    assert report.status is ExecStatus.SKIPPED
+    assert "thin book" in report.reason
+    assert yes.calls == [] and no.calls == [] and not risk.is_killed
+
+
+def test_liquidity_guard_allows_deep_book():
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 30, 0.40)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 30, 0.55)])
+    risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({v.name: v for v in [yes, no]}, risk,
+                  fee_models={v.name: ZeroFeeModel() for v in [yes, no]},
+                  max_order_contracts=0, min_leg_depth=25)
+    report = asyncio.run(ex.execute(opp(max_contracts=30)))   # 30 >= 25 floor
+    assert report.status is ExecStatus.SUCCESS
+
+
+class QuotingVenue(FakeVenue):
+    """FakeVenue that also answers fetch_quote (for the unwind's bid lookup)."""
+
+    def __init__(self, name, responses, quote):
+        super().__init__(name, responses)
+        self._quote = quote
+
+    async def fetch_quote(self, market):
+        return self._quote
+
+
+def test_unwind_crosses_real_bid():
+    # On a thin book the unwind must sell at the REAL best bid (yes_bid = 1 - no_ask),
+    # not a fixed haircut off the entry price (which could sit above the bid and never
+    # fill -> stuck naked + halt).
+    from bot.models import MarketQuote
+
+    # yes_bid = 1 - 0.95 = 0.05, well below the 0.35 haircut (0.40 - 0.05).
+    thin = MarketQuote(venue="kalshi", market_id="K1", title="", no_ask=0.95)
+    yes = QuotingVenue("kalshi", [
+        res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),
+        res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.05, action="sell"),
+    ], thin)
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)])
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.UNWOUND and not risk.is_killed
+    assert yes.calls[1][2] == "sell"
+    assert yes.calls[1][3] == 0.05            # crossed the real bid, not the 0.35 haircut
+
+
 def test_skips_when_kill_switch_active():
     yes = FakeVenue("kalshi", [])
     no = FakeVenue("poly", [])

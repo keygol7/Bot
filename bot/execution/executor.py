@@ -33,6 +33,7 @@ from bot.execution.risk import RiskManager
 from bot.fees import FeeModel, ZeroFeeModel
 from bot.models import Side
 from bot.strategies.arbitrage import ArbOpportunity
+from bot.venues.base import RawMarket
 
 log = logging.getLogger("bot.executor")
 
@@ -83,6 +84,7 @@ class Executor:
         balance_buffer: float = 0.99,
         min_lock_edge: float | None = None,
         leg2_slippage_share: float = 0.6,
+        min_leg_depth: float = 0.0,
     ) -> None:
         self.venues = venues
         self.risk = risk
@@ -92,6 +94,10 @@ class Executor:
         # depth, and risk caps). Kept as an optional safety cap.
         self.max_order_contracts = max_order_contracts
         self.unwind_slippage = unwind_slippage
+        # Min resting depth (contracts) required on BOTH legs before firing. Thin books
+        # are where a leg rejects and the other can't be hedged/unwound — skipping them
+        # means we should never have to unwind. 0 = disabled.
+        self.min_leg_depth = min_leg_depth
         self.fill_confirmer = fill_confirmer       # optional FillTracker (private WS)
         self.confirm_timeout = confirm_timeout
         # Available cash per venue, seeded from the startup snapshot and decremented as
@@ -207,6 +213,15 @@ class Executor:
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
 
+        # Liquidity guard: don't fire unless BOTH legs have real resting depth. Thin
+        # books are where a leg rejects and we can't hedge/unwind — skip them outright
+        # so we should never have to unwind. opp.max_contracts is the min leg depth.
+        if self.min_leg_depth > 0 and opp.max_contracts < self.min_leg_depth:
+            return ExecutionReport(
+                ExecStatus.SKIPPED,
+                f"thin book: depth {opp.max_contracts:g} < min {self.min_leg_depth:g} contracts",
+            )
+
         size, caps = self._max_size(opp)
         if size < 1:
             binding = min(caps, key=caps.get)
@@ -295,7 +310,19 @@ class Executor:
         (``leg2`` is then ``None``)."""
         venue = self.venues[leg1.venue]
         buy_px = leg1.avg_price if leg1.avg_price is not None else opp.yes_price
-        sell_px = max(0.01, round(buy_px - self.unwind_slippage, 4))  # aggressive to cross
+        # Cross the REAL best bid so the IOC actually fills (a fixed haircut off the buy
+        # price can sit above a thin book's bid and never fill -> stuck naked + halt).
+        # The YES bid = 1 - no_ask from the live book; floor at $0.01. Fall back to the
+        # haircut only if the book can't be read.
+        sell_px = max(0.01, round(buy_px - self.unwind_slippage, 4))
+        try:
+            q = await venue.fetch_quote(RawMarket(market_id=leg1.market_id, title="", raw={}))
+        except Exception as exc:
+            log.warning("unwind book fetch failed for %s: %s", leg1.market_id, exc)
+            q = None
+        if q is not None and q.no_ask is not None:
+            yes_bid = round(1.0 - q.no_ask, 4)
+            sell_px = max(0.01, min(sell_px, yes_bid))   # take the bid, never above it
         unwind = await self._place(
             venue, leg1.market_id, Side.YES, "sell", sell_px, leg1.filled, "immediate_or_cancel"
         )

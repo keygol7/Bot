@@ -381,6 +381,7 @@ async def run(
             {v.name: v for v in venues}, risk,
             fee_models=fee_models, store=store,
             max_order_contracts=settings.risk.max_order_contracts,
+            min_leg_depth=settings.exec_min_leg_depth,
         )
         log.warning(
             "LIVE EXECUTION ENABLED (mode=%s) — placing REAL orders, max %s contracts/order, "
@@ -566,6 +567,7 @@ async def stream(
     executor = Executor(
         {v.name: v for v in venues}, risk, fee_models=fee_models, store=store,
         max_order_contracts=settings.risk.max_order_contracts, fill_confirmer=tracker,
+        min_leg_depth=settings.exec_min_leg_depth,
     )
 
     venue_by_name = {v.name: v for v in venues}
@@ -660,6 +662,9 @@ async def stream(
     log.warning("scan window: %s (SCAN_CLOSE_WITHIN_DAYS)",
                 f"markets closing within {settings.scan_close_within_days:g} days"
                 if settings.scan_close_within_days > 0 else "all open markets (no window)")
+    log.warning("liquidity guard: %s (EXEC_MIN_LEG_DEPTH)",
+                f"both legs need >= {settings.exec_min_leg_depth:g} contracts of depth"
+                if settings.exec_min_leg_depth > 0 else "off (will trade any depth)")
     ceiling = (f"{settings.risk.max_order_contracts:g} ct/order"
                if settings.risk.max_order_contracts and settings.risk.max_order_contracts > 0
                else "no per-order ceiling — sized to balances/depth")

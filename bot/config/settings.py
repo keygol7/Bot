@@ -120,6 +120,10 @@ class Settings:
     # set), so today's games are always covered without a huge --limit (the matcher
     # embeds every scanned title, so scan size is the cost). 0 = disabled (scan all).
     scan_close_within_days: float = 0.0
+    # Liquidity guard: min resting depth (contracts) required on BOTH legs before the
+    # executor fires. Thin books are where a leg rejects and can't be hedged/unwound;
+    # skipping them means we should never have to unwind. 0 = disabled.
+    exec_min_leg_depth: float = 0.0
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -177,4 +181,5 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
             if (tok := raw.strip().lower()) in _VALID_FINGERPRINT_METRICS
         ),
         scan_close_within_days=_env_float("SCAN_CLOSE_WITHIN_DAYS", 0.0),
+        exec_min_leg_depth=_env_float("EXEC_MIN_LEG_DEPTH", 0.0),
     )
