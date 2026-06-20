@@ -38,7 +38,9 @@ def test_kalshi_title_idempotent_suffix():
     assert once == "Will the Chargers win? - Chargers"
     # ...but re-normalizing an already-suffixed title doesn't double up.
     assert build_summary_title({"title": once, "yes_sub_title": "Chargers"}) == once
-from bot.venues.polymarket_us import build_market_title, normalize_bbo, parse_market_data_lite
+from bot.venues.polymarket_us import (
+    build_market_title, normalize_bbo, normalize_book, parse_market_data_lite,
+)
 
 
 def test_polymarket_ws_market_data_lite_parsing():
@@ -49,8 +51,9 @@ def test_polymarket_ws_market_data_lite_parsing():
         "bidDepth": 5, "askDepth": 4}}
     q = parse_market_data_lite(msg)
     assert q.venue == "polymarket_us" and q.market_id == "tec-mlb-champ-lad"
-    assert q.yes_ask == 0.56 and q.yes_ask_size == 4
-    assert round(q.no_ask, 4) == 0.46 and q.no_ask_size == 5  # 1 - bestBid
+    # askDepth/bidDepth are LEVEL COUNTS, not sizes -> the lite quote carries no size.
+    assert q.yes_ask == 0.56 and q.yes_ask_size == 0.0
+    assert round(q.no_ask, 4) == 0.46 and q.no_ask_size == 0.0  # 1 - bestBid
 
 
 def test_polymarket_ws_ignores_non_lite():
@@ -143,15 +146,41 @@ def test_polymarket_bbo_normalization():
     }
     quote = normalize_bbo("fed-cuts-march-2026", "Fed cuts March 2026", md, event_key="E2")
     assert quote.venue == "polymarket_us" and quote.event_key == "E2"
-    assert quote.yes_ask == 0.62 and quote.yes_ask_size == 40
-    assert round(quote.no_ask, 6) == 0.40 and quote.no_ask_size == 75  # 1 - 0.60
+    # Prices come from the BBO; sizes do NOT (askDepth/bidDepth are level counts).
+    assert quote.yes_ask == 0.62 and quote.yes_ask_size == 0.0
+    assert round(quote.no_ask, 6) == 0.40 and quote.no_ask_size == 0.0  # 1 - 0.60
 
 
 def test_polymarket_bbo_handles_missing_sides():
     md = {"marketSlug": "x", "bestAsk": None, "bestBid": {"value": "0.30"}, "askDepth": 0, "bidDepth": 12}
     quote = normalize_bbo("x", "x", md)
     assert quote.yes_ask is None              # no ask -> can't buy YES
-    assert round(quote.no_ask, 6) == 0.70 and quote.no_ask_size == 12
+    assert round(quote.no_ask, 6) == 0.70 and quote.no_ask_size == 0.0
+
+
+def test_polymarket_book_normalization_uses_real_qty():
+    # The full /book carries real per-level qty (unlike the BBO's level counts).
+    md = {
+        "marketSlug": "will-team-a-win",
+        "bids": [{"px": {"value": "0.55"}, "qty": "1000"},
+                 {"px": {"value": "0.54"}, "qty": "500"}],
+        "offers": [{"px": {"value": "0.56"}, "qty": "750"},
+                   {"px": {"value": "0.57"}, "qty": "1200"}],
+        "state": "MARKET_STATE_OPEN",
+    }
+    q = normalize_book("will-team-a-win", "Team A", md, event_key="E9")
+    # Buy YES by crossing the best (lowest) offer 0.56 -> size 750.
+    assert q.yes_ask == 0.56 and q.yes_ask_size == 750
+    # Buy NO by crossing the best (highest) bid 0.55 -> no_ask = 0.45, size 1000.
+    assert round(q.no_ask, 6) == 0.45 and q.no_ask_size == 1000
+    assert q.event_key == "E9"
+
+
+def test_polymarket_book_one_sided():
+    md = {"bids": [{"px": {"value": "0.40"}, "qty": "20"}], "offers": []}
+    q = normalize_book("s", "s", md)
+    assert q.yes_ask is None and q.yes_ask_size == 0.0     # no offers -> can't buy YES
+    assert round(q.no_ask, 6) == 0.60 and q.no_ask_size == 20
 
 
 def test_polymarket_bbo_accepts_bare_numbers():

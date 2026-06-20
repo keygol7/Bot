@@ -5,8 +5,11 @@ Market data comes from the PUBLIC gateway (`gateway.polymarket.us`) — no auth:
   - ``GET /v1/markets/{slug}/bbo`` best bid/offer + depth for one market
 
 Binary mapping (prices in dollars, 0..1): ``bestAsk`` is the cost to buy YES; the
-NO ask is ``1 - bestBid`` (buying NO == taking the YES bid). Sizes come from
-``askDepth`` / ``bidDepth``. Standard markets are ~zero-fee -> :class:`ZeroFeeModel`.
+NO ask is ``1 - bestBid`` (buying NO == taking the YES bid). NOTE: ``askDepth`` /
+``bidDepth`` in the BBO/lite payload are the NUMBER OF PRICE LEVELS, not contract
+sizes, so real takeable size comes from the full ``/book`` (``offers``/``bids`` with
+``qty``) — see :func:`normalize_book`. Standard markets are ~zero-fee
+-> :class:`ZeroFeeModel`.
 
 Trading (later) uses the authenticated API (`api.polymarket.us`) with X-PM-* Ed25519
 headers — see :func:`build_auth_headers` / :func:`load_ed25519_key`. Read-only here.
@@ -17,7 +20,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import math
 import time
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 from bot.execution.orders import OrderResult, OrderStatus
@@ -255,18 +260,25 @@ def _parse_create_order_response(data: Any, requested: float, side: Side):
     return status, filled, avg_price, order_id
 
 
+# Market states that mean the market is terminally done (vs temporarily not trading).
+# Used by is_open: only these drop a cached market; everything else stays live.
+_TERMINAL_MARKET_STATES = frozenset(
+    {"MARKET_STATE_EXPIRED", "MARKET_STATE_TERMINATED"}
+)
+
+
 def normalize_bbo(
     slug: str, title: str, market_data: dict[str, Any], *, event_key: str | None = None
 ) -> MarketQuote:
-    """Turn a ``v1MarketDataLite`` (BBO) payload into a :class:`MarketQuote`.
+    """Turn a ``v1MarketDataLite`` (BBO) payload into a price-only :class:`MarketQuote`.
 
-    ``bestAsk`` is the YES ask; the NO ask is synthesized as ``1 - bestBid``. Sizes
-    are taken from ``askDepth`` (YES) and ``bidDepth`` (the YES bid backing the NO).
+    ``bestAsk`` is the YES ask; the NO ask is synthesized as ``1 - bestBid``. The
+    payload's ``askDepth``/``bidDepth`` are LEVEL COUNTS (not contract sizes), so this
+    carries NO size — real takeable size needs the full ``/book`` (:func:`normalize_book`).
+    Sizes are left at 0 so nothing mistakes a level count for available liquidity.
     """
     best_ask = _amount(market_data.get("bestAsk"))
     best_bid = _amount(market_data.get("bestBid"))
-    ask_depth = float(market_data.get("askDepth") or 0)
-    bid_depth = float(market_data.get("bidDepth") or 0)
 
     no_ask = round(1.0 - best_bid, 6) if best_bid is not None else None
 
@@ -276,9 +288,57 @@ def normalize_bbo(
         title=title,
         event_key=event_key,
         yes_ask=best_ask,
-        yes_ask_size=ask_depth,
+        yes_ask_size=0.0,
         no_ask=no_ask,
-        no_ask_size=bid_depth,
+        no_ask_size=0.0,
+    )
+
+
+def _book_levels(entries: Any) -> list[tuple[float, float]]:
+    """``[(price, qty), ...]`` from a ``/book`` side (``[{"px":{value},"qty":...}]``)."""
+    out: list[tuple[float, float]] = []
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        px = _amount(e.get("px"))
+        qty = _amount(e.get("qty"))
+        if px is not None and qty is not None:
+            out.append((px, qty))
+    return out
+
+
+def normalize_book(
+    slug: str, title: str, market_data: dict[str, Any], *, event_key: str | None = None
+) -> MarketQuote:
+    """Turn a full ``/book`` payload into a sized :class:`MarketQuote`.
+
+    ``offers`` are sell orders (buy YES by crossing the best/lowest offer) and ``bids``
+    are buy orders (buy NO by crossing the best/highest bid). Unlike the BBO, these
+    carry real ``qty`` per level, so the top-of-book ``qty`` is the actual takeable
+    size used to size an arb. ``yes_ask = best offer px`` (size = its qty);
+    ``no_ask = 1 - best bid px`` (size = the bid's qty).
+    """
+    offers = _book_levels(market_data.get("offers"))
+    bids = _book_levels(market_data.get("bids"))
+
+    yes_ask = no_ask = None
+    yes_ask_size = no_ask_size = 0.0
+    if offers:
+        px, qty = min(offers, key=lambda lvl: lvl[0])   # best (lowest) ask
+        yes_ask, yes_ask_size = px, qty
+    if bids:
+        px, qty = max(bids, key=lambda lvl: lvl[0])      # best (highest) bid
+        no_ask, no_ask_size = round(1.0 - px, 6), qty
+
+    return MarketQuote(
+        venue=VENUE,
+        market_id=slug,
+        title=title,
+        event_key=event_key,
+        yes_ask=yes_ask,
+        yes_ask_size=yes_ask_size,
+        no_ask=no_ask,
+        no_ask_size=no_ask_size,
     )
 
 
@@ -357,6 +417,10 @@ class PolymarketUSVenue:
         self._api_client = None      # authenticated trading (later)
         self._key = None
         self._limiter = AsyncRateLimiter(rate_per_min)
+        # Per-slug order constraints (orderPriceMinTickSize / minimumTradeQty) captured
+        # during scan_quotes, so place_order can round price/qty to valid increments
+        # without a hot-path fetch. The docs warn NOT to infer these from slug/type.
+        self._meta: dict[str, dict[str, float | None]] = {}
 
     @property
     def is_trading_configured(self) -> bool:
@@ -416,14 +480,21 @@ class PolymarketUSVenue:
         out: list[MarketQuote] = []
         seen: set[str] = set()
         offset = 0
+        # Server-side close-time filter (docs: endDateMax, ISO 8601). Cuts the feed at
+        # the source; the client-side endDate filter below still backs it up.
+        end_date_max = (
+            datetime.fromtimestamp(max_close_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if max_close_ts is not None else None
+        )
         while len(out) < limit:
             await self._limiter.wait()
             page_size = min(limit - len(out), 500)
-            resp = await self._gateway().get(
-                "/v1/markets",
-                params={"limit": page_size, "active": "true", "closed": "false",
-                        "offset": offset},
-            )
+            params: dict[str, Any] = {
+                "limit": page_size, "active": "true", "closed": "false", "offset": offset,
+            }
+            if end_date_max is not None:
+                params["endDateMax"] = end_date_max
+            resp = await self._gateway().get("/v1/markets", params=params)
             resp.raise_for_status()
             markets = resp.json().get("markets", [])
             if not markets:
@@ -435,6 +506,11 @@ class PolymarketUSVenue:
                     continue
                 seen.add(slug)
                 new += 1  # progress through the feed (counts even if out-of-window)
+                # Capture order constraints for place_order (don't infer from slug/type).
+                self._meta[slug] = {
+                    "tick": _amount(m.get("orderPriceMinTickSize")),
+                    "min_qty": _amount(m.get("minimumTradeQty")),
+                }
                 close_time = parse_iso8601(m.get("endDate"))
                 # Targeted window: skip markets closing past it (keep unknown close).
                 if (
@@ -464,31 +540,39 @@ class PolymarketUSVenue:
         return out
 
     async def fetch_quote(self, market: RawMarket) -> MarketQuote | None:
-        """Deep (sized) quote: BBO for one market (by slug), used in phase 2."""
+        """Deep (sized) quote: the full ``/book`` for one market (by slug), used in
+        phase 2. The book carries real per-level ``qty`` (the BBO only carries level
+        COUNTS), so this is the authoritative size for arb sizing."""
         await self._limiter.wait()
-        resp = await self._gateway().get(f"/v1/markets/{market.market_id}/bbo")
+        resp = await self._gateway().get(f"/v1/markets/{market.market_id}/book")
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
         market_data = resp.json().get("marketData", {})
         if not market_data:
             return None
-        return normalize_bbo(market.market_id, market.title, market_data)
+        return normalize_book(market.market_id, market.title, market_data)
 
     async def is_open(self, market_id: str):
-        """Whether the market is still quotable. The gateway has no bare
-        ``/v1/markets/{slug}`` detail endpoint (it 404s), so we use the ``/bbo``
-        subpath that does exist: a 200 means the market is live (even if the book is
-        momentarily empty). We NEVER return False here — only ``True`` (live) or
-        ``None`` (unknown -> caller keeps it), so a gateway quirk can't wrongly drop a
-        live market. Settled pairs are shed via the Kalshi leg's real status instead.
+        """Whether the market is still live (vs terminally expired/terminated).
+
+        Reads the ``/book`` ``state`` field: only ``MARKET_STATE_EXPIRED`` /
+        ``MARKET_STATE_TERMINATED`` count as closed (return ``False``). Everything else
+        (open/pre-open/suspended/halted/closing-auction) is live (``True``), and any
+        error / 404 / missing state is ``None`` (unknown -> caller keeps it) so a
+        transient quirk can't wrongly drop a live market.
         """
         await self._limiter.wait()
         try:
-            resp = await self._gateway().get(f"/v1/markets/{market_id}/bbo")
+            resp = await self._gateway().get(f"/v1/markets/{market_id}/book")
         except Exception:
             return None
-        return True if resp.status_code == 200 else None
+        if resp.status_code != 200:
+            return None
+        state = (resp.json().get("marketData") or {}).get("state")
+        if not state:
+            return None
+        return state not in _TERMINAL_MARKET_STATES
 
     async def stream_order_book(self, market_ids: list[str]) -> AsyncIterator[MarketQuote]:
         """Stream real-time top-of-book via the markets WS (MARKET_DATA_LITE).
@@ -597,11 +681,24 @@ class PolymarketUSVenue:
             raise OrderNotPermitted("Polymarket US trading credentials not configured")
         yes_value = price if side is Side.YES else round(1.0 - price, 6)
         yes_value = min(max(yes_value, 0.01), 0.99)
+        # Snap to the market's valid order increments (captured during scan_quotes).
+        # The docs say to use orderPriceMinTickSize / minimumTradeQty and NOT infer them
+        # from the slug/type; off-grid price or qty gets the order rejected.
+        meta = self._meta.get(market_id) or {}
+        tick, min_qty = meta.get("tick"), meta.get("min_qty")
+        if tick and tick > 0:
+            yes_value = round(round(yes_value / tick) * tick, 6)
+            yes_value = min(max(yes_value, tick), round(1.0 - tick, 6))
+        quantity: float = contracts
+        if min_qty and min_qty > 0:
+            snapped = math.floor(round(contracts / min_qty, 9)) * min_qty
+            if snapped >= min_qty:          # keep original if snapping would zero it out
+                quantity = round(snapped, 6)
         body = {
             "marketSlug": market_id,
             "type": "ORDER_TYPE_LIMIT",
             "price": {"value": f"{yes_value}", "currency": "USD"},
-            "quantity": contracts,
+            "quantity": quantity,
             "tif": _TIF.get(tif, "TIME_IN_FORCE_FILL_OR_KILL"),
             "intent": _INTENT[(side, action)],
             "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",

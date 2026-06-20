@@ -306,19 +306,105 @@ def test_kalshi_is_open_status():
     assert asyncio.run(v.is_open("KSETTLED")) is False
 
 
-def test_polymarket_is_open_uses_bbo_never_false():
-    # The gateway 404s the bare /v1/markets/{slug}; is_open must use /bbo and never
-    # return False (a quirky 404 must not drop a live market -> None = keep).
+def test_polymarket_is_open_uses_book_state():
+    # is_open reads /book state: terminal states -> False; live states -> True;
+    # 404 / missing state -> None (unknown -> keep, never wrongly drop a live market).
     def handler(req):
         if "goneslug" in str(req.url):
             return httpx.Response(404, json={})
-        return httpx.Response(200, json={"marketData": {"bestAsk": "0.4"}})
+        if "deadslug" in str(req.url):
+            return httpx.Response(200, json={"marketData": {"state": "MARKET_STATE_EXPIRED"}})
+        if "haltedslug" in str(req.url):
+            return httpx.Response(200, json={"marketData": {"state": "MARKET_STATE_HALTED"}})
+        return httpx.Response(200, json={"marketData": {"state": "MARKET_STATE_OPEN"}})
 
     cfg = QcexConfig()
     v = PolymarketUSVenue(cfg)
     v._gateway_client = _client(handler, cfg.gateway_base)
     assert asyncio.run(v.is_open("liveslug")) is True
+    assert asyncio.run(v.is_open("haltedslug")) is True   # temporary, not terminal -> keep
+    assert asyncio.run(v.is_open("deadslug")) is False    # expired -> drop
     assert asyncio.run(v.is_open("goneslug")) is None     # unknown -> keep, never False
+
+
+def test_polymarket_fetch_quote_uses_book_real_sizes():
+    # Phase-2 deep fetch must hit /book (real qty), not /bbo (level counts).
+    paths = []
+
+    def handler(req):
+        paths.append(req.url.path)
+        return httpx.Response(200, json={"marketData": {
+            "offers": [{"px": {"value": "0.56"}, "qty": "750"}],
+            "bids": [{"px": {"value": "0.55"}, "qty": "1000"}],
+        }})
+
+    cfg = QcexConfig()
+    v = PolymarketUSVenue(cfg)
+    v._gateway_client = _client(handler, cfg.gateway_base)
+    from bot.venues.base import RawMarket
+    q = asyncio.run(v.fetch_quote(RawMarket(market_id="slug", title="t", raw={})))
+    assert paths[0].endswith("/book")               # not /bbo
+    assert q.yes_ask == 0.56 and q.yes_ask_size == 750
+    assert round(q.no_ask, 6) == 0.45 and q.no_ask_size == 1000
+
+
+def test_polymarket_scan_sends_end_date_max_and_captures_meta():
+    import time as _time
+    from datetime import datetime, timezone
+
+    window = int(_time.time() + 2 * 86400)
+    seen = []
+
+    def handler(req):
+        seen.append(dict(req.url.params))
+        return httpx.Response(200, json={"markets": [
+            {"slug": "m1", "question": "m1", "bestAsk": "0.4", "bestBid": "0.38",
+             "orderPriceMinTickSize": "0.005", "minimumTradeQty": "0.01"},
+        ]})
+
+    cfg = QcexConfig()
+    v = PolymarketUSVenue(cfg)
+    v._gateway_client = _client(handler, cfg.gateway_base)
+    asyncio.run(v.scan_quotes(50, max_close_ts=window))
+    expected = datetime.fromtimestamp(window, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert seen[0]["endDateMax"] == expected          # server-side filter sent
+    assert v._meta["m1"] == {"tick": 0.005, "min_qty": 0.01}   # constraints captured
+
+
+def test_polymarket_place_order_snaps_to_tick_and_min_qty():
+    cap = {}
+
+    def handler(req):
+        cap["body"] = json.loads(req.content)
+        return httpx.Response(200, json=_exec_response(
+            "o", "ORDER_STATE_FILLED", 4, 4, None))
+
+    cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
+    v = PolymarketUSVenue(cfg)
+    v._api_client = _client(handler, cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    v._meta["slug"] = {"tick": 0.05, "min_qty": 2.0}
+    # price 0.62 snaps to nearest 0.05 tick -> 0.60; qty 5 floors to a 2.0 grid -> 4.
+    asyncio.run(v.place_order("slug", Side.YES, "buy", 0.62, 5))
+    assert cap["body"]["price"]["value"] == "0.6"
+    assert cap["body"]["quantity"] == 4.0
+
+
+def test_polymarket_place_order_no_meta_unchanged():
+    # No captured constraints -> no rounding (whole contracts already valid).
+    cap = {}
+
+    def handler(req):
+        cap["body"] = json.loads(req.content)
+        return httpx.Response(200, json=_exec_response("o", "ORDER_STATE_FILLED", 3, 0.62, None))
+
+    cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
+    v = PolymarketUSVenue(cfg)
+    v._api_client = _client(handler, cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    asyncio.run(v.place_order("slug", Side.YES, "buy", 0.62, 3))
+    assert cap["body"]["price"]["value"] == "0.62"
+    assert cap["body"]["quantity"] == 3
 
 
 def test_kalshi_account_snapshot_balance_and_positions():
