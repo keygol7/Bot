@@ -216,6 +216,28 @@ def test_maker_mode_confirms_depth_even_on_fresh_ws_book():
     assert fe.calls == []                 # phantom edge -> nothing armed
 
 
+def test_prime_and_sweep_fetches_concurrently():
+    # The watchlist prime must fetch legs in parallel (peak in-flight > 1), not one-by-one,
+    # so a ~140-leg refresh takes seconds rather than a minute.
+    inflight = [0]
+    peak = [0]
+
+    async def depth_fetch(venue, mid):
+        inflight[0] += 1
+        peak[0] = max(peak[0], inflight[0])
+        await asyncio.sleep(0.02)
+        inflight[0] -= 1
+        return q(venue, mid, yes_ask=0.40, ya=50, no_ask=0.65, na=50)
+
+    eng = StreamingEngine(
+        executor=FakeExec(), fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, clock=lambda: 0.0, depth_fetch=depth_fetch, prime_concurrency=8,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    asyncio.run(eng.prime_and_sweep())
+    assert peak[0] == 2          # both legs in flight at once (sequential would peak at 1)
+
+
 def test_persistence_filter_waits_for_edge_to_hold():
     # With edge_persist_secs set, a freshly-appeared edge must hold continuously for the
     # window before the engine acts — separating a real venue-lag from a flicker artifact.

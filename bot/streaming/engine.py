@@ -75,6 +75,7 @@ class StreamingEngine:
         maker_mode: bool = False,
         edge_snapshot_top: int = 5,
         edge_persist_secs: float = 0.0,
+        prime_concurrency: int = 8,
     ) -> None:
         self.executor = executor
         self.fee_models = fee_models or {}
@@ -103,6 +104,9 @@ class StreamingEngine:
         # Require an edge to persist this many seconds before acting (distinguishes a real
         # venue-lag from a fleeting cross-feed timing artifact). 0 = act on first sighting.
         self.edge_persist_secs = edge_persist_secs
+        # Max concurrent REST snapshot fetches in prime_and_sweep (the rest are paced by
+        # the per-venue rate limiters). Higher = faster watchlist refresh.
+        self.prime_concurrency = prime_concurrency
         self._maker_inflight: set = set()
         # Async callable depth_fetch(venue, market_id) -> sized MarketQuote | None.
         # WS ticker feeds carry no size (Kalshi), so before firing on a price edge we
@@ -415,16 +419,26 @@ class StreamingEngine:
         """
         if self.depth_fetch is None:
             return
+        items = list(self._index)
+        # Fetch the snapshots CONCURRENTLY (bounded) instead of one-at-a-time: a sequential
+        # sweep of ~140 legs takes >a minute, which both delays picking up newly-listed
+        # markets and widens the window where the book is half-primed. Concurrency collapses
+        # it to seconds; the per-venue rate limiters still pace the actual HTTP.
+        sem = asyncio.Semaphore(max(1, self.prime_concurrency))
+
+        async def _one(venue, market):
+            async with sem:
+                try:
+                    return venue, market, await self.depth_fetch(venue, market)
+                except Exception:
+                    return venue, market, None
+
         primed = 0
-        for (venue, market) in list(self._index):
-            try:
-                q = await self.depth_fetch(venue, market)
-            except Exception:
-                continue
+        for _venue, _market, q in await asyncio.gather(*(_one(v, m) for (v, m) in items)):
             if q is not None:
                 self.livebook.update(q)
                 primed += 1
-        log.info("primed live book with %d/%d market snapshots", primed, len(self._index))
+        log.info("primed live book with %d/%d market snapshots", primed, len(items))
         for key in list(self._pairs):
             await self._act_on_pair(key)
 

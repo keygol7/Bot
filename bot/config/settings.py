@@ -156,6 +156,13 @@ class Settings:
     # real venue-lag edge holds for seconds. So this filters skew-phantoms without a slow
     # REST confirm. 0 = act on first sighting (off). ~0.75 is a reasonable in-play value.
     stream_edge_persist_secs: float = 0.0
+    # Streaming slow-loop cadence (s): how often the watchlist is rebuilt + re-primed. Lower
+    # = newly-listed markets enter the watchlist sooner, at the cost of more REST traffic.
+    # The prime is now concurrent (below), so a lower value is feasible.
+    stream_refresh_secs: float = 300.0
+    # Max concurrent REST snapshots when re-priming the watchlist each cycle (the rest are
+    # paced by the per-venue rate limiters). Higher = faster refresh (seconds vs >a minute).
+    stream_prime_concurrency: int = 8
     # Price cushion reserved for the hedge (second) leg so it fills through book
     # movement WITHOUT unwinding. The bot only fires when the edge can pay this AND
     # still lock RISK_MIN_EDGE, so thin edges that would unwind never fire. Effective
@@ -251,6 +258,8 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         stream_min_leg_price=_env_float("STREAM_MIN_LEG_PRICE", 0.02),
         stream_edge_snapshot_top=int(_env_float("STREAM_EDGE_SNAPSHOT_TOP", 5)),
         stream_edge_persist_secs=_env_float("STREAM_EDGE_PERSIST_SECS", 0.0),
+        stream_refresh_secs=_env_float("STREAM_REFRESH_SECS", 300.0),
+        stream_prime_concurrency=int(_env_float("STREAM_PRIME_CONCURRENCY", 8)),
         exec_hedge_buffer=_env_float("EXEC_HEDGE_BUFFER", 0.03),
         exec_maker_mode=(env("EXEC_MAKER_MODE", "false") or "false").lower() == "true",
         exec_maker_timeout=_env_float("EXEC_MAKER_TIMEOUT", 5.0),

@@ -605,6 +605,7 @@ async def stream(
         maker_mode=settings.exec_maker_mode,
         edge_snapshot_top=settings.stream_edge_snapshot_top,
         edge_persist_secs=settings.stream_edge_persist_secs,
+        prime_concurrency=settings.stream_prime_concurrency,
     )
 
     # Discovery (embedding shortlist + LLM confirm) only feeds match_verdicts, which the
@@ -1616,7 +1617,8 @@ def main(argv: list[str] | None = None) -> None:
         threshold = 0.65 if (args.embed or args.stream) else 0.5
 
     if args.stream:
-        interval = args.interval if args.interval != 15.0 else 300.0  # streaming default 5m
+        # --interval overrides; otherwise the configured streaming default (STREAM_REFRESH_SECS).
+        interval = args.interval if args.interval != 15.0 else load_settings().stream_refresh_secs
         asyncio.run(stream(
             refresh_interval=interval, limit=args.limit, use_llm=True, use_embed=True,
             match_threshold=threshold, min_edge=args.min_edge,
