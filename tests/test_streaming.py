@@ -188,6 +188,34 @@ def test_fresh_ws_book_skips_rest_depth_fetch():
     assert len(fe.calls) == 1 and fetched == []      # executed off WS, no REST fetch
 
 
+def test_maker_mode_confirms_depth_even_on_fresh_ws_book():
+    # In MAKER mode a fresh WS edge must still be REST-confirmed before resting a maker:
+    # resting on a phantom WS top (real book has no edge) just gets cancelled and backs the
+    # pair off. Here the real book kills the edge -> nothing is armed, despite a fresh quote.
+    import time as _time
+
+    fe = FakeExec()
+    fetched = []
+
+    async def depth_fetch(venue, mid):
+        fetched.append((venue, mid))
+        return q(venue, mid, yes_ask=0.99, ya=1, no_ask=0.99, na=1)   # real book: no edge
+
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, depth_fetch=depth_fetch,
+        max_ws_quote_age=2.0, maker_mode=True,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    now = _time.time()
+    ka = q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100); ka.timestamp = now
+    pa = q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60); pa.timestamp = now
+    asyncio.run(eng.on_quote(ka))
+    asyncio.run(eng.on_quote(pa))
+    assert fetched != []                  # confirmed real depth despite the fresh WS book
+    assert fe.calls == []                 # phantom edge -> nothing armed
+
+
 def test_stale_ws_quote_still_uses_rest_depth_fetch():
     # An old WS quote (beyond max_ws_quote_age) must fall back to the REST confirm.
     fe = FakeExec()

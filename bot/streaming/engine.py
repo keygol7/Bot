@@ -257,7 +257,11 @@ class StreamingEngine:
         # sizes). If the live book is fresh + sized, trust it and fire — no REST round
         # trip. Otherwise re-fetch the real book (covers sizeless/stale/primed quotes);
         # the executor's bounded-aggressive limits absorb any residual move.
-        if self.depth_fetch is not None and not self._ws_book_fresh(yq, nq):
+        # MAKER mode ALWAYS confirms first: resting a maker on a phantom WS edge just gets
+        # cancelled by the drift guard and then backs the pair off for cooldowns — wasteful
+        # on volatile in-play books where the WS top can briefly lead the real book. The
+        # per-pair cooldown (set above) bounds this to one REST round-trip per cooldown.
+        if self.depth_fetch is not None and (self.maker_mode or not self._ws_book_fresh(yq, nq)):
             log.info("STREAM %s: price edge %.4f -> confirming real depth", p.event_key, edge)
             ev = await self._confirm_depth(p)
             if ev is None:
