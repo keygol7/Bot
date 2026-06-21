@@ -567,7 +567,7 @@ class KalshiVenue:
 
     async def place_order(
         self, market_id: str, side: Side, action: str, price: float, contracts: float,
-        *, tif: str = "fill_or_kill",
+        *, tif: str = "fill_or_kill", post_only: bool = False, expiration_ts: int | None = None,
     ) -> OrderResult:
         """Place an order via the V2 /portfolio/events/orders endpoint.
 
@@ -577,6 +577,10 @@ class KalshiVenue:
           (YES, buy)  -> bid @ price          (NO, buy)  -> ask @ 1 - price
           (YES, sell) -> ask @ price          (NO, sell) -> bid @ 1 - price
         ``price`` is the cost/price of the requested ``side`` (dollars 0.01-0.99).
+
+        ``post_only`` rests a MAKER order (rejected if it would cross), and
+        ``expiration_ts`` (Unix seconds) auto-cancels it — so a maker that doesn't fill
+        cleans itself up. A resting (unfilled) maker returns status ``RESTING``.
         Prices/counts are fixed-point dollar strings. Requires credentials.
         """
         if not self.authenticated:
@@ -591,16 +595,20 @@ class KalshiVenue:
         # Round to the cent (Kalshi tick) and clamp to a valid 0.01-0.99 quote.
         yes_px = min(max(round(yes_px, 2), 0.01), 0.99)
         count = float(contracts)
+        # A maker rests, so it must be GTC (with an expiration to self-cancel).
+        tif_v2 = "good_till_canceled" if post_only else self._TIF_V2.get(tif, "fill_or_kill")
         body: dict[str, Any] = {
             "ticker": market_id,
             "client_order_id": str(uuid.uuid4()),
             "side": book_side,                       # bid = buy YES, ask = sell YES
             "count": f"{count:.2f}",                 # contracts as a fixed-point string
             "price": f"{yes_px:.4f}",                # YES-side price, fixed-point dollars
-            "time_in_force": self._TIF_V2.get(tif, "fill_or_kill"),
+            "time_in_force": tif_v2,
             "self_trade_prevention_type": "taker_at_cross",
-            "post_only": False,
+            "post_only": bool(post_only),
         }
+        if expiration_ts is not None:
+            body["expiration_time"] = int(expiration_ts)
 
         endpoint = "/portfolio/events/orders"
         await self._limiter.wait()
@@ -620,15 +628,20 @@ class KalshiVenue:
         # average_fill_price is the YES-side price; for a NO trade the cost is 1 - that.
         if avg_price is not None and side is Side.NO:
             avg_price = round(1.0 - avg_price, 4)
-        status = (
-            OrderStatus.FILLED if filled >= count - 1e-9
-            else OrderStatus.KILLED if filled <= 1e-9
-            else OrderStatus.PARTIAL
-        )
+        order_id = data.get("order_id")
+        if filled >= count - 1e-9 and count > 0:
+            status = OrderStatus.FILLED
+        elif post_only and filled <= 1e-9 and order_id:
+            # Accepted maker, nothing filled yet -> resting on the book (NOT killed).
+            status = OrderStatus.RESTING
+        elif filled <= 1e-9:
+            status = OrderStatus.KILLED
+        else:
+            status = OrderStatus.PARTIAL
         return OrderResult(
             venue=VENUE, market_id=market_id, side=side, action=action,
             requested=count, filled=filled, avg_price=avg_price,
-            order_id=data.get("order_id"), status=status, raw=data,
+            order_id=order_id, status=status, raw=data,
         )
 
     async def cancel_order(self, order_id: str) -> dict:

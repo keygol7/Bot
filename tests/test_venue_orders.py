@@ -60,6 +60,26 @@ def test_kalshi_buy_no_v2_sells_yes_at_one_minus_price():
     assert r.status.value == "FILLED" and r.avg_price == 0.55
 
 
+def test_kalshi_maker_order_rests():
+    # post_only + expiration -> a resting maker (GTC); 0 fill with an order_id = RESTING.
+    cap = {}
+
+    def handler(req):
+        cap["body"] = json.loads(req.content)
+        return httpx.Response(201, json={
+            "order_id": "m1", "fill_count": "0.00", "remaining_count": "37.00"})
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    r = asyncio.run(v.place_order("KT", Side.NO, "buy", 0.72, 37,
+                                  tif="gtc", post_only=True, expiration_ts=1782300000))
+    assert cap["body"]["post_only"] is True
+    assert cap["body"]["time_in_force"] == "good_till_canceled"
+    assert cap["body"]["expiration_time"] == 1782300000
+    assert r.status.value == "RESTING" and r.order_id == "m1" and r.filled == 0.0
+
+
 def test_kalshi_v2_fok_no_fill_is_killed():
     def handler(req):
         return httpx.Response(201, json={

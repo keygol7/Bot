@@ -408,6 +408,67 @@ def test_edge_observations_logged_for_fire_and_settling_skip():
     assert any(o not in ("skip_settling", "edge_gone_after_depth") for o in outcomes)
 
 
+def test_maker_mode_dispatches_off_the_quote_loop():
+    from bot.execution.executor import ExecStatus, ExecutionReport
+
+    class MakerExec:
+        def __init__(self):
+            self.calls = []
+
+        async def execute_maker(self, opp):
+            self.calls.append(opp)
+            return ExecutionReport(ExecStatus.SUCCESS, "locked")
+
+    fe = MakerExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, maker_mode=True)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    async def driver():
+        await eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
+        r = await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60))
+        assert r is None                          # dispatched in background, not awaited inline
+        await asyncio.gather(*list(eng._inflight))
+
+    asyncio.run(driver())
+    assert len(fe.calls) == 1
+    assert eng._maker_inflight == set()           # cleared after completion
+
+
+def test_maker_mode_one_resting_maker_per_pair():
+    from bot.execution.executor import ExecStatus, ExecutionReport
+
+    release = asyncio.Event()
+
+    class SlowMaker:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute_maker(self, opp):
+            self.calls += 1
+            await release.wait()
+            return ExecutionReport(ExecStatus.SUCCESS, "x")
+
+    fe = SlowMaker()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=0.0, clock=lambda: 0.0, maker_mode=True)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    async def driver():
+        await eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
+        await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60))  # dispatch
+        await asyncio.sleep(0)                     # let the maker task start (then it blocks)
+        await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60))  # in-flight -> skip
+        assert fe.calls == 1                       # second did NOT post a duplicate maker
+        release.set()
+        await asyncio.gather(*list(eng._inflight))
+
+    asyncio.run(driver())
+    assert fe.calls == 1
+
+
 def test_consume_counts_ws_quotes_for_health():
     # The WS-health heartbeat: _consume must count each tick per venue so the run
     # loop can report whether a venue's WebSocket is actually delivering data.

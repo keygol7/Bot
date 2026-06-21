@@ -19,6 +19,7 @@ class OrderStatus(str, Enum):
     KILLED = "KILLED"        # FoK/IOC, nothing filled (no resulting position)
     PARTIAL = "PARTIAL"      # partially filled (shouldn't happen with FoK)
     REJECTED = "REJECTED"    # exchange rejected
+    RESTING = "RESTING"      # maker order accepted and resting on the book (not yet filled)
     ERROR = "ERROR"          # network/parse error — treat position as UNKNOWN
 
 

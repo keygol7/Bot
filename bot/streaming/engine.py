@@ -72,6 +72,7 @@ class StreamingEngine:
         max_ws_quote_age: float = 2.0,
         min_leg_price: float = 0.0,
         store=None,
+        maker_mode: bool = False,
     ) -> None:
         self.executor = executor
         self.fee_models = fee_models or {}
@@ -92,6 +93,10 @@ class StreamingEngine:
         # Optional Store: log each actionable edge (post-cooldown) + its outcome, so a
         # soak measures how often/how big real edges actually are.
         self.store = store
+        # Maker mode: rest the fee-heavy leg as a maker and complete it asynchronously
+        # (so a pending maker doesn't block the quote loop). One maker per pair at a time.
+        self.maker_mode = maker_mode
+        self._maker_inflight: set = set()
         # Async callable depth_fetch(venue, market_id) -> sized MarketQuote | None.
         # WS ticker feeds carry no size (Kalshi), so before firing on a price edge we
         # re-fetch real order-book depth (which also re-validates the price).
@@ -235,6 +240,8 @@ class StreamingEngine:
         p = self._pairs.get(key)
         if p is None:
             return None
+        if self.maker_mode and key in self._maker_inflight:
+            return None                           # already resting a maker for this pair
         ev = self._best_direction(p)
         if ev is None:
             return None
@@ -284,6 +291,15 @@ class StreamingEngine:
                 self._observe(p, edge, yq, nq, size, "skip_settling")
                 return None
         opp = self._build_opp(p, edge, yq, nq, size)
+        if self.maker_mode:
+            # Rest a maker and complete it asynchronously so a pending maker doesn't
+            # block the quote loop (it may wait seconds to fill). Tracked + shielded.
+            self._maker_inflight.add(key)
+            log.info("STREAM edge %.4f sz %g on %s -> resting maker", edge, size, p.event_key)
+            task = asyncio.ensure_future(self._run_maker(key, p, opp, edge, yq, nq, size))
+            self._inflight.add(task)
+            task.add_done_callback(self._inflight.discard)
+            return None
         log.info("STREAM edge %.4f sz %g on %s -> executing", edge, size, p.event_key)
         report = await self._execute_guarded(opp)
         log.info("STREAM exec %s | %s", p.event_key, report)
@@ -291,6 +307,20 @@ class StreamingEngine:
         self._observe(p, edge, yq, nq, size, status.value if status is not None else "executed")
         self._note_outcome(key, p, report)
         return report
+
+    async def _run_maker(self, key, p, opp, edge, yq, nq, size) -> None:
+        """Run a maker execution to completion off the quote loop, then log + book it."""
+        try:
+            report = await self.executor.execute_maker(opp)
+            log.info("STREAM maker %s | %s", p.event_key, report)
+            status = getattr(report, "status", None)
+            self._observe(p, edge, yq, nq, size,
+                          ("maker_" + status.value) if status is not None else "maker")
+            self._note_outcome(key, p, report)
+        except Exception as exc:
+            log.warning("maker run failed for %s: %s", p.event_key, exc)
+        finally:
+            self._maker_inflight.discard(key)
 
     def _note_outcome(self, key, p, report) -> None:
         """Escalating backoff for a pair whose orders keep failing (e.g. a venue that

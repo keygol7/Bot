@@ -22,8 +22,10 @@ venues have trading credentials. Validate against sandbox/demo first.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -88,6 +90,7 @@ class Executor:
         depth_safety: float = 1.0,
         first_venue: str = "kalshi",
         hedge_buffer: float = 0.0,
+        maker_timeout: float = 5.0,
     ) -> None:
         self.venues = venues
         self.risk = risk
@@ -121,6 +124,10 @@ class Executor:
         # book movement — and we ONLY fire when the edge can pay it AND still lock the
         # floor, so a thin edge that would just unwind never fires. 0 = no cushion.
         self.hedge_buffer = hedge_buffer
+        # Maker mode: how long (s) a resting maker order may wait to fill before it
+        # auto-expires (and we give up on that arb). The taker hedge fires the instant
+        # the maker fills, so the naked window is ~one round-trip, not this whole time.
+        self.maker_timeout = maker_timeout
 
     def set_balances(self, snapshots) -> None:
         """Seed available cash per venue from account snapshots (startup/refresh)."""
@@ -362,6 +369,103 @@ class Executor:
             f"leg2 ambiguous ({leg2.status.value}: {_reject_reason(leg2)}) — manual reconcile",
             [leg1, leg2],
         )
+
+    async def execute_maker(self, opp: ArbOpportunity) -> ExecutionReport:
+        """Capture an edge by RESTING the fee-heavy leg (``first_venue``, e.g. Kalshi)
+        as a maker — no slippage, lower fee — then TAKING the deep leg (Polymarket) the
+        instant the maker fills. Lets THIN edges be captured (we capture the spread
+        instead of paying it). The maker self-expires if unfilled, so an uncrossed quote
+        is a clean no-trade. The naked window is just the maker-fill -> taker round trip.
+        """
+        if self.risk.is_killed:
+            return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
+        if self.fill_confirmer is None:
+            return ExecutionReport(ExecStatus.SKIPPED, "maker mode needs a fill confirmer")
+        if self.min_leg_depth > 0 and opp.max_contracts < self.min_leg_depth:
+            return ExecutionReport(
+                ExecStatus.SKIPPED,
+                f"thin book: depth {opp.max_contracts:g} < min {self.min_leg_depth:g}")
+
+        size, caps = self._max_size(opp)
+        if size < 1:
+            binding = min(caps, key=caps.get)
+            return ExecutionReport(
+                ExecStatus.SKIPPED, f"size < 1 (binding: {binding}={caps[binding]:.3f})")
+
+        floor = self.min_lock_edge if self.min_lock_edge is not None else self.risk.limits.min_edge
+        if opp.edge_per_contract < floor - 1e-9:   # maker mode handles thin edges: just lock the floor
+            return ExecutionReport(
+                ExecStatus.SKIPPED, f"edge {opp.edge_per_contract:.3f} < lock {floor:.3f}")
+
+        # Maker leg = the first_venue (fee-heavy) side; taker = the deep, cheap side.
+        if opp.buy_no_venue == self.first_venue:
+            maker = (opp.buy_no_venue, opp.buy_no_market, Side.NO, opp.no_price)
+            taker = (opp.buy_yes_venue, opp.buy_yes_market, Side.YES, opp.yes_price)
+        elif opp.buy_yes_venue == self.first_venue:
+            maker = (opp.buy_yes_venue, opp.buy_yes_market, Side.YES, opp.yes_price)
+            taker = (opp.buy_no_venue, opp.buy_no_market, Side.NO, opp.no_price)
+        else:
+            return await self.execute(opp)   # neither leg on the maker venue -> taker path
+
+        maker_venue = self.venues.get(maker[0])
+        taker_venue = self.venues.get(taker[0])
+        if maker_venue is None or taker_venue is None:
+            return ExecutionReport(ExecStatus.SKIPPED, "venue not available")
+
+        notional = size * (opp.yes_price + opp.no_price)
+        decision = self.risk.check(f"{opp.buy_yes_venue}:{opp.buy_yes_market}", notional)
+        if not decision.allowed:
+            return ExecutionReport(ExecStatus.SKIPPED, f"risk: {decision.reason}")
+
+        self._audit("maker_start", opp, size=size)
+
+        # ----- Rest the maker (post-only, self-expiring) -----
+        try:
+            m = await maker_venue.place_order(
+                maker[1], maker[2], "buy", maker[3], size,
+                tif="gtc", post_only=True, expiration_ts=int(time.time() + self.maker_timeout))
+        except Exception as exc:
+            return ExecutionReport(ExecStatus.SKIPPED, f"maker placement failed: {exc}")
+        if m.status is OrderStatus.REJECTED:   # post-only would have crossed -> no position
+            return ExecutionReport(
+                ExecStatus.SKIPPED, f"maker would cross / rejected ({_reject_reason(m)})", [m])
+        if m.status is OrderStatus.ERROR:
+            left = await self._position_after_error(maker_venue, maker[1])
+            if left is False:
+                return ExecutionReport(ExecStatus.SKIPPED, f"maker ERROR but flat ({_reject_reason(m)})")
+            return self._halt(f"maker ERROR — fill state unknown ({_reject_reason(m)})", [m])
+        log.info("maker %s", m)
+
+        # ----- Wait for the maker to fill (per-order, via the private WS) or expire -----
+        filled = m.filled
+        avg = m.avg_price
+        if m.status is OrderStatus.RESTING and m.order_id:
+            # Confirm timeout slightly past the maker's expiry, so by the time it returns
+            # the order is terminal and ``filled`` is final (no late top-up fills).
+            _, filled, avg = await self.fill_confirmer.confirm(
+                m.venue, m.order_id, size, self.maker_timeout + 1.5)
+        if filled <= 1e-9:
+            return ExecutionReport(ExecStatus.SKIPPED, "maker unfilled — expired, no trade", [m])
+
+        # ----- Maker filled -> take the deep hedge immediately (IOC) -----
+        maker_leg = OrderResult(
+            venue=m.venue, market_id=maker[1], side=maker[2], action="buy",
+            requested=filled, filled=filled,
+            avg_price=avg if avg is not None else maker[3],
+            order_id=m.order_id, status=OrderStatus.FILLED)
+        taker_limit = min(0.99, round(taker[3] + self.hedge_buffer, 4))
+        hedge = await self._place(
+            taker_venue, taker[1], taker[2], "buy", taker_limit, filled, "immediate_or_cancel")
+        log.info("maker-hedge %s", hedge)
+        if hedge.status is OrderStatus.FILLED and hedge.filled_fully:
+            return self._settle_success(opp, filled, [maker_leg, hedge])
+        if hedge.status in (OrderStatus.KILLED, OrderStatus.REJECTED) and hedge.filled <= 1e-9:
+            log.warning("maker hedge %s — %s", hedge.status.value, _reject_reason(hedge))
+            return await self._unwind(
+                opp, maker_leg, hedge, reason=f"maker hedge {hedge.status.value} ({_reject_reason(hedge)})")
+        return self._halt(
+            f"maker hedge ambiguous ({hedge.status.value}: {_reject_reason(hedge)})",
+            [maker_leg, hedge])
 
     # ---- outcomes ----
     def _settle_success(self, opp, size, legs) -> ExecutionReport:

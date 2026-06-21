@@ -140,7 +140,14 @@ class Settings:
     # movement WITHOUT unwinding. The bot only fires when the edge can pay this AND
     # still lock RISK_MIN_EDGE, so thin edges that would unwind never fire. Effective
     # firing threshold = RISK_MIN_EDGE + this. 0 = off (chase thin edges, may unwind).
+    # Ignored in maker mode (the maker captures the spread, so thin edges need no buffer).
     exec_hedge_buffer: float = 0.03
+    # Maker mode: capture THIN edges by RESTING the fee-heavy (Kalshi) leg as a maker
+    # (no slippage / lower fee), then TAKING the deep (Polymarket) leg the instant it
+    # fills. The firing threshold drops to just RISK_MIN_EDGE (no hedge buffer needed).
+    exec_maker_mode: bool = False
+    # How long (s) a resting maker may wait to fill before it self-expires (no trade).
+    exec_maker_timeout: float = 5.0
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -203,4 +210,6 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_depth_fraction=_env_float("EXEC_DEPTH_FRACTION", 0.85),
         stream_min_leg_price=_env_float("STREAM_MIN_LEG_PRICE", 0.02),
         exec_hedge_buffer=_env_float("EXEC_HEDGE_BUFFER", 0.03),
+        exec_maker_mode=(env("EXEC_MAKER_MODE", "false") or "false").lower() == "true",
+        exec_maker_timeout=_env_float("EXEC_MAKER_TIMEOUT", 5.0),
     )
