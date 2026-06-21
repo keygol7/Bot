@@ -255,6 +255,40 @@ def test_execute_maker_no_drift_still_fills():
     assert report.status is ExecStatus.SUCCESS and kalshi.cancelled == []
 
 
+def test_maker_depth_guards_on_hedge_leg_not_min():
+    # Maker (kalshi NO) leg is thin (5) but the HEDGE (poly YES) leg is deep (200). The
+    # resting maker adds liquidity, so its own thin book is irrelevant — the guard must
+    # check the hedge leg (200 >= 10) and proceed, sizing against the hedge depth.
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 5, 0.40)])
+    risk = RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({v.name: v for v in [kalshi, poly]}, risk,
+                  fee_models={v.name: ZeroFeeModel() for v in [kalshi, poly]},
+                  max_order_contracts=0, min_leg_depth=10,
+                  fill_confirmer=FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.54)}),
+                  maker_timeout=0.01)
+    o = opp(yv="poly", nv="kalshi", max_contracts=5, yes_price=0.40, no_price=0.55)
+    o.yes_size, o.no_size = 200, 5            # hedge (poly YES) deep, maker (kalshi NO) thin
+    report = asyncio.run(ex.execute_maker(o))
+    assert report.status is ExecStatus.SUCCESS            # NOT skipped for thin book
+    assert kalshi.calls[0][4] == 200                      # sized against the hedge depth, not 5
+
+
+def test_maker_depth_falls_back_to_min_when_sizes_unknown():
+    # Without per-leg sizes (both 0), the guard falls back to max_contracts — old behavior.
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly = FakeVenue("poly", [])
+    risk = RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({v.name: v for v in [kalshi, poly]}, risk,
+                  fee_models={v.name: ZeroFeeModel() for v in [kalshi, poly]},
+                  max_order_contracts=0, min_leg_depth=10,
+                  fill_confirmer=FakeConfirmer({}), maker_timeout=0.01)
+    o = opp(yv="poly", nv="kalshi", max_contracts=5, yes_price=0.40, no_price=0.55)  # sizes default 0
+    report = asyncio.run(ex.execute_maker(o))
+    assert report.status is ExecStatus.SKIPPED and "thin hedge book" in report.reason
+    assert kalshi.calls == []
+
+
 def test_execute_maker_thin_edge_below_cushion_skips():
     # A sub-cushion edge must NOT arm a maker: while it rests the taker can drift against
     # it, and the post-fill hedge is forced — a thin edge that drifts locks a guaranteed

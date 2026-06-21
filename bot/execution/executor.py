@@ -213,10 +213,13 @@ class Executor:
                 return True
         return False
 
-    def _max_size(self, opp: ArbOpportunity) -> tuple[int, dict[str, float]]:
+    def _max_size(self, opp: ArbOpportunity,
+                  depth_override: float | None = None) -> tuple[int, dict[str, float]]:
         """Largest whole-contract size that fits every hard limit at once:
 
-          * available order-book depth (can't fill more than is quoted),
+          * available order-book depth (can't fill more than is quoted) — or
+            ``depth_override`` when the binding depth isn't ``max_contracts`` (maker mode
+            sizes against the HEDGE leg, since the resting leg adds liquidity),
           * funded cash on each leg's venue (YES leg needs cash on the YES venue at
             ``yes_price``; NO leg needs cash on the NO venue at ``no_price``),
           * the per-market and total exposure risk caps,
@@ -227,7 +230,8 @@ class Executor:
         """
         label = f"{opp.buy_yes_venue}:{opp.buy_yes_market}"
         # Trade only a fraction of shown depth (headroom for a thinning book on FOK).
-        caps: dict[str, float] = {"depth": float(opp.max_contracts) * self.depth_safety}
+        depth = depth_override if depth_override is not None else float(opp.max_contracts)
+        caps: dict[str, float] = {"depth": depth * self.depth_safety}
 
         yb, nb = self._balance(opp.buy_yes_venue), self._balance(opp.buy_no_venue)
         if yb is not None and opp.yes_price > 0:
@@ -444,12 +448,28 @@ class Executor:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
         if self.fill_confirmer is None:
             return ExecutionReport(ExecStatus.SKIPPED, "maker mode needs a fill confirmer")
-        if self.min_leg_depth > 0 and opp.max_contracts < self.min_leg_depth:
+
+        # Maker leg = the first_venue (fee-heavy) side; taker = the deep, cheap side. The
+        # HEDGE (taker) leg's depth is what binds in maker mode: the resting maker ADDS
+        # liquidity (its own book depth doesn't constrain us), but we must cross the taker
+        # to hedge a fill. So guard/size on the taker leg's own depth, not min(both legs).
+        if opp.buy_no_venue == self.first_venue:
+            maker = (opp.buy_no_venue, opp.buy_no_market, Side.NO, opp.no_price)
+            taker = (opp.buy_yes_venue, opp.buy_yes_market, Side.YES, opp.yes_price)
+            hedge_depth = opp.yes_size or opp.max_contracts
+        elif opp.buy_yes_venue == self.first_venue:
+            maker = (opp.buy_yes_venue, opp.buy_yes_market, Side.YES, opp.yes_price)
+            taker = (opp.buy_no_venue, opp.buy_no_market, Side.NO, opp.no_price)
+            hedge_depth = opp.no_size or opp.max_contracts
+        else:
+            return await self.execute(opp)   # neither leg on the maker venue -> taker path
+
+        if self.min_leg_depth > 0 and hedge_depth < self.min_leg_depth:
             return ExecutionReport(
                 ExecStatus.SKIPPED,
-                f"thin book: depth {opp.max_contracts:g} < min {self.min_leg_depth:g}")
+                f"thin hedge book: depth {hedge_depth:g} < min {self.min_leg_depth:g}")
 
-        size, caps = self._max_size(opp)
+        size, caps = self._max_size(opp, depth_override=hedge_depth)
         if size < 1:
             binding = min(caps, key=caps.get)
             return ExecutionReport(
@@ -466,16 +486,6 @@ class Executor:
                 ExecStatus.SKIPPED,
                 f"edge {opp.edge_per_contract:.3f} < lock {floor:.3f} + maker cushion "
                 f"{self.maker_arm_cushion:.3f} — would risk an adverse-fill loss")
-
-        # Maker leg = the first_venue (fee-heavy) side; taker = the deep, cheap side.
-        if opp.buy_no_venue == self.first_venue:
-            maker = (opp.buy_no_venue, opp.buy_no_market, Side.NO, opp.no_price)
-            taker = (opp.buy_yes_venue, opp.buy_yes_market, Side.YES, opp.yes_price)
-        elif opp.buy_yes_venue == self.first_venue:
-            maker = (opp.buy_yes_venue, opp.buy_yes_market, Side.YES, opp.yes_price)
-            taker = (opp.buy_no_venue, opp.buy_no_market, Side.NO, opp.no_price)
-        else:
-            return await self.execute(opp)   # neither leg on the maker venue -> taker path
 
         maker_venue = self.venues.get(maker[0])
         taker_venue = self.venues.get(taker[0])

@@ -243,6 +243,7 @@ class StreamingEngine:
             yes_price=yq.yes_ask, no_price=nq.no_ask, gross_cost=gross,
             fee_per_pair=max(0.0, 1.0 - gross - edge), edge_per_contract=edge,
             max_contracts=size, total_fees=0.0, total_profit=edge * size, notional=gross * size,
+            yes_size=yq.yes_ask_size, no_size=nq.no_ask_size,
         )
 
     async def _act_on_pair(self, key):

@@ -44,6 +44,8 @@ class ArbOpportunity:
     total_fees: float          # fees at max_contracts (size-scaled, accurate)
     total_profit: float        # max_contracts * (1 - gross_cost) - total_fees
     notional: float            # capital deployed = gross_cost * max_contracts
+    yes_size: float = 0.0      # YES leg's own top-of-book depth (0 = unknown)
+    no_size: float = 0.0       # NO leg's own top-of-book depth (0 = unknown)
 
     @property
     def is_single_venue(self) -> bool:
