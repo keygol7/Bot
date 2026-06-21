@@ -102,6 +102,7 @@ async def run_cycle(
     use_fingerprint: bool = False,
     fingerprint_metrics=None,
     close_within_days: float = 0.0,
+    match_cross_venue: bool = True,
 ) -> CycleResult:
     result = CycleResult()
 
@@ -166,7 +167,12 @@ async def run_cycle(
             return []
 
     confirmed_lite: list[tuple[MarketQuote, MarketQuote]] = []
-    names = list(quotes_by_venue)
+    # Skip the cross-venue match loop (embedding shortlist + LLM confirm) when discovery is
+    # off: the fingerprint sweep builds the watchlist straight from the scanned markets, so
+    # this pass would only refresh the unused match_verdicts cache. Empty names = no loop.
+    names = list(quotes_by_venue) if match_cross_venue else []
+    if not match_cross_venue:
+        log.info("cross-venue discovery skipped (fingerprint sweep is authoritative)")
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             for c in shortlist(quotes_by_venue[names[i]], quotes_by_venue[names[j]]):
@@ -599,8 +605,11 @@ async def stream(
         maker_mode=settings.exec_maker_mode,
     )
 
-    complete_fn = make_complete_fn(settings.llm) if use_llm else None
-    embed_fn = make_embed_fn(settings.llm) if use_embed else None
+    # Discovery (embedding shortlist + LLM confirm) only feeds match_verdicts, which the
+    # fingerprint sweep ignores — so skip the clients entirely when it's off.
+    discover = settings.stream_discovery
+    complete_fn = make_complete_fn(settings.llm) if (use_llm and discover) else None
+    embed_fn = make_embed_fn(settings.llm) if (use_embed and discover) else None
 
     async def refresh_balances():
         # Re-read available cash per venue so each arb is sized against what's actually
@@ -629,6 +638,7 @@ async def stream(
             use_fingerprint=settings.match_use_fingerprint,
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             close_within_days=settings.scan_close_within_days,
+            match_cross_venue=discover,
         )
         await refresh_balances()
         cached = store.confirmed_pairs(
@@ -697,6 +707,9 @@ async def stream(
     log.warning("matching mode: fingerprint=%s metrics=%s (MATCH_USE_FINGERPRINT)",
                 settings.match_use_fingerprint,
                 sorted(settings.match_fingerprint_metrics) or "all")
+    log.warning("discovery: %s (STREAM_DISCOVERY)",
+                "embedding+LLM pass each cycle -> match_verdicts" if settings.stream_discovery
+                else "OFF — scan + fingerprint sweep only (no embedding/LLM calls)")
     log.warning("scan window: %s (SCAN_CLOSE_WITHIN_DAYS)",
                 f"markets closing within {settings.scan_close_within_days:g} days"
                 if settings.scan_close_within_days > 0 else "all open markets (no window)")

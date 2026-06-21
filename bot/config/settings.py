@@ -122,6 +122,13 @@ class Settings:
     # date (not updated_at), so it's independent of scan cadence. 1 day keeps today's and
     # in-progress games. 0 = disabled (sweep regardless of event date).
     match_sweep_past_days: float = 1.0
+    # Per-cycle cross-venue discovery (embedding shortlist + LLM confirm -> match_verdicts).
+    # When the fingerprint sweep is authoritative (MATCH_USE_FINGERPRINT), the streamer
+    # builds its watchlist directly from the scanned markets and IGNORES match_verdicts, so
+    # this discovery pass is dead weight on the live path (it only feeds --inspect-matches /
+    # --compare-filters). Off = skip it (faster cycles, no embedding/LLM calls); the scan
+    # still populates the markets table the sweep needs.
+    stream_discovery: bool = True
     # Targeted scan: only scan markets closing within this many days (the live/imminent
     # set), so today's games are always covered without a huge --limit (the matcher
     # embeds every scanned title, so scan size is the cost). 0 = disabled (scan all).
@@ -230,6 +237,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         ),
         scan_close_within_days=_env_float("SCAN_CLOSE_WITHIN_DAYS", 0.0),
         match_sweep_past_days=_env_float("MATCH_SWEEP_PAST_DAYS", 1.0),
+        stream_discovery=(env("STREAM_DISCOVERY", "true") or "true").lower() == "true",
         exec_min_leg_depth=_env_float("EXEC_MIN_LEG_DEPTH", 0.0),
         stream_max_ws_quote_age=_env_float("STREAM_MAX_WS_QUOTE_AGE", 2.0),
         exec_depth_fraction=_env_float("EXEC_DEPTH_FRACTION", 0.85),

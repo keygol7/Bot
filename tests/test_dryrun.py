@@ -96,6 +96,27 @@ def test_max_confirms_caps_llm_calls_per_cycle():
     assert len(calls) == 2                    # the model was called exactly twice
 
 
+def test_discovery_off_skips_matching_but_still_scans():
+    # match_cross_venue=False: no embedding/LLM discovery (the fingerprint sweep is
+    # authoritative), but the scan still upserts markets so the sweep has data.
+    kalshi = {f"K{i}": mq("kalshi", f"K{i}", f"Team{i} game", yes_ask=0.40, yes_ask_size=100, no_ask=0.65, no_ask_size=100) for i in range(3)}
+    poly = {f"P{i}": mq("polymarket_us", f"P{i}", f"Team{i} game", yes_ask=0.62, yes_ask_size=100, no_ask=0.55, no_ask_size=60) for i in range(3)}
+    calls = []
+    fake = lambda p: (calls.append(1), '{"same_event": true, "confidence": 0.9}')[1]
+    store = Store(":memory:")
+    result = asyncio.run(run_cycle(
+        [StubVenue("kalshi", kalshi), StubVenue("polymarket_us", poly)],
+        store=store, risk=generous_risk(),
+        fee_models={"kalshi": ZeroFeeModel(), "polymarket_us": ZeroFeeModel()},
+        min_edge=0.01, match_threshold=0.3, complete_fn=fake, limit=50,
+        match_cross_venue=False,
+    ))
+    assert calls == []                                # the LLM was never called
+    assert result.candidate_pairs == 0                # no cross-venue matching ran
+    assert store.conn.execute(                        # markets still scanned + upserted
+        "SELECT COUNT(*) c FROM markets").fetchone()["c"] == 6
+
+
 def test_embedding_matcher_pairs_reworded_titles():
     # Lexically dissimilar titles, but the embedder maps them to the same vector.
     ka = mq("kalshi", "K1", "Fed lowers its benchmark rate by March", yes_ask=0.40, yes_ask_size=100, no_ask=0.65, no_ask_size=100)
