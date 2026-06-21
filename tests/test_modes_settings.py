@@ -22,7 +22,7 @@ def test_load_settings_defaults(tmp_path, monkeypatch):
     for key in (
         "BOT_RUN_MODE", "RISK_MAX_DAILY_LOSS", "RISK_MIN_EDGE",
         "RISK_MAX_POSITION_PER_MARKET", "RISK_MAX_TOTAL_EXPOSURE",
-        "SCAN_CLOSE_WITHIN_DAYS", "EXEC_MIN_LEG_DEPTH",
+        "SCAN_CLOSE_WITHIN_DAYS", "EXEC_MIN_LEG_DEPTH", "STREAM_MAX_WS_QUOTE_AGE",
     ):
         monkeypatch.delenv(key, raising=False)
     settings = load_settings(dotenv_path=str(tmp_path / "nonexistent.env"))
@@ -34,6 +34,7 @@ def test_load_settings_defaults(tmp_path, monkeypatch):
     assert settings.qcex.is_trading_configured is False  # no creds by default
     assert settings.scan_close_within_days == 0.0         # targeted scan off by default
     assert settings.exec_min_leg_depth == 0.0             # liquidity guard off by default
+    assert settings.stream_max_ws_quote_age == 2.0        # trust WS book within 2s
 
 
 def test_load_settings_reads_scan_close_within_days(tmp_path, monkeypatch):

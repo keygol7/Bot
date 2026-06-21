@@ -147,12 +147,14 @@ def is_multivariate(ticker: str) -> bool:
 
 
 def parse_ticker(message: dict[str, Any]) -> MarketQuote | None:
-    """Normalize a Kalshi WS ``ticker`` message into a top-of-book quote.
+    """Normalize a Kalshi WS ``ticker`` message into a SIZED top-of-book quote.
 
-    ``msg`` carries ``market_ticker`` and ``yes_bid_dollars`` / ``yes_ask_dollars``.
-    ``yes_ask`` is the cost to buy YES; the NO ask is ``1 - yes_bid``. The ticker
-    channel has no depth, so sizes are 0 (depth comes from orderbook_delta or a REST
-    fetch on shortlisted markets).
+    ``msg`` carries ``yes_bid_dollars`` / ``yes_ask_dollars`` AND the top-of-book sizes
+    ``yes_bid_size_fp`` / ``yes_ask_size_fp`` (contracts at the best bid/ask). To buy
+    YES you cross the best ask (``yes_ask``; size = ``yes_ask_size_fp``); to buy NO you
+    cross the best YES bid, so ``no_ask = 1 - yes_bid`` and its size is the YES-bid size
+    ``yes_bid_size_fp``. The ticker fires on any field change, so this is a fresh,
+    sized top-of-book over the WS — no order-book-delta bookkeeping needed.
     """
     m = message.get("msg", message)
     ticker = m.get("market_ticker")
@@ -162,13 +164,17 @@ def parse_ticker(message: dict[str, Any]) -> MarketQuote | None:
     def _px(v: Any) -> float | None:
         return float(v) if v not in (None, "") else None
 
+    def _sz(v: Any) -> float:
+        return float(v) if v not in (None, "") else 0.0
+
     yes_ask = _px(m.get("yes_ask_dollars"))
     yes_bid = _px(m.get("yes_bid_dollars"))
     return MarketQuote(
         venue=VENUE, market_id=ticker, title="",
-        yes_ask=yes_ask, yes_ask_size=0.0,
+        yes_ask=yes_ask, yes_ask_size=_sz(m.get("yes_ask_size_fp")),
         no_ask=round(1.0 - yes_bid, 4) if yes_bid is not None else None,
-        no_ask_size=0.0, timestamp=time.time(),
+        no_ask_size=_sz(m.get("yes_bid_size_fp")),
+        timestamp=time.time(),
     )
 
 
@@ -417,7 +423,13 @@ class KalshiVenue:
                 async with websockets.connect(
                     self.cfg.ws_base, additional_headers=headers, open_timeout=10
                 ) as ws:
-                    params: dict[str, Any] = {"channels": ["ticker"]}
+                    params: dict[str, Any] = {
+                        "channels": ["ticker"],
+                        # Get an immediate sized top-of-book on subscribe instead of
+                        # waiting for the first field change (which could be a while on a
+                        # quiet market) — primes the live book over the WS itself.
+                        "send_initial_snapshot": True,
+                    }
                     if market_ids:
                         params["market_tickers"] = market_ids
                     await ws.send(json.dumps({"id": 1, "cmd": "subscribe", "params": params}))

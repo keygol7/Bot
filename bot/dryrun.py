@@ -582,6 +582,7 @@ async def stream(
 
     engine = StreamingEngine(
         executor=executor, fee_models=fee_models, min_edge=min_edge, depth_fetch=depth_fetch,
+        max_ws_quote_age=settings.stream_max_ws_quote_age,
     )
 
     complete_fn = make_complete_fn(settings.llm) if use_llm else None
@@ -665,6 +666,9 @@ async def stream(
     log.warning("liquidity guard: %s (EXEC_MIN_LEG_DEPTH)",
                 f"both legs need >= {settings.exec_min_leg_depth:g} contracts of depth"
                 if settings.exec_min_leg_depth > 0 else "off (will trade any depth)")
+    log.warning("WS depth trust: %s (STREAM_MAX_WS_QUOTE_AGE)",
+                f"fire off live book when both legs sized & < {settings.stream_max_ws_quote_age:g}s old"
+                if settings.stream_max_ws_quote_age > 0 else "off (always REST re-fetch)")
     ceiling = (f"{settings.risk.max_order_contracts:g} ct/order"
                if settings.risk.max_order_contracts and settings.risk.max_order_contracts > 0
                else "no per-order ceiling — sized to balances/depth")

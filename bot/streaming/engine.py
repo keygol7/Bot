@@ -64,6 +64,7 @@ class StreamingEngine:
         livebook: LiveBook | None = None,
         clock=time.monotonic,
         depth_fetch=None,
+        max_ws_quote_age: float = 2.0,
     ) -> None:
         self.executor = executor
         self.fee_models = fee_models or {}
@@ -71,6 +72,11 @@ class StreamingEngine:
         self.cooldown = cooldown
         self.livebook = livebook or LiveBook()
         self.clock = clock
+        # If both crossing legs have a WS quote with real size no older than this many
+        # seconds, fire off the live book and skip the per-fire REST depth re-fetch.
+        # 0 disables (always re-fetch). Quote timestamps are wall-clock (time.time()),
+        # so freshness is checked against time.time(), not the monotonic ``clock``.
+        self.max_ws_quote_age = max_ws_quote_age
         # Async callable depth_fetch(venue, market_id) -> sized MarketQuote | None.
         # WS ticker feeds carry no size (Kalshi), so before firing on a price edge we
         # re-fetch real order-book depth (which also re-validates the price).
@@ -127,6 +133,22 @@ class StreamingEngine:
             self.livebook.get(p.venue_b, p.market_b),
         )
 
+    def _ws_book_fresh(self, yq, nq) -> bool:
+        """True when BOTH crossing legs have a recent, sized WS quote — so the live
+        book is trustworthy enough to fire on without a REST depth re-fetch. Only
+        WS-fed quotes carry a timestamp (REST-primed quotes don't), so primed/stale
+        snapshots correctly fall through to the re-fetch path."""
+        if self.max_ws_quote_age <= 0:
+            return False
+        if yq.yes_ask_size <= 0 or nq.no_ask_size <= 0:
+            return False
+        now = time.time()
+        for quote in (yq, nq):
+            ts = getattr(quote, "timestamp", 0.0) or 0.0
+            if ts <= 0 or now - ts > self.max_ws_quote_age:
+                return False
+        return True
+
     async def _confirm_depth(self, p: ConfirmedPair):
         """Re-fetch real order-book depth for both legs and recompute the best
         direction with true sizes + fresh prices. Returns the eval tuple or None."""
@@ -174,20 +196,25 @@ class StreamingEngine:
         if self.clock() - self._last_acted.get(key, -1e9) < self.cooldown:
             return None
         self._last_acted[key] = self.clock()      # cooldown set now to avoid REST storms
-        log.info("STREAM %s: price edge %.4f -> confirming real depth", p.event_key, edge)
-        # Re-fetch the real order book right before firing so size AND price are as fresh
-        # as possible (WS quotes lag on fast in-play markets, and Kalshi's ticker carries
-        # no depth at all). The executor's bounded-aggressive limits absorb any residual
-        # move during the order itself.
-        if self.depth_fetch is not None:
+        # Both legs now stream a sized top-of-book (Polymarket full book + Kalshi ticker
+        # sizes). If the live book is fresh + sized, trust it and fire — no REST round
+        # trip. Otherwise re-fetch the real book (covers sizeless/stale/primed quotes);
+        # the executor's bounded-aggressive limits absorb any residual move.
+        if self.depth_fetch is not None and not self._ws_book_fresh(yq, nq):
+            log.info("STREAM %s: price edge %.4f -> confirming real depth", p.event_key, edge)
             ev = await self._confirm_depth(p)
             if ev is None:
                 return None
             edge, yq, nq, size = ev
-        if edge <= self.min_edge or size < 1:
-            log.info("STREAM edge gone after depth check on %s (edge %.4f sz %g)",
-                     p.event_key, edge, size)
+            if edge <= self.min_edge or size < 1:
+                log.info("STREAM edge gone after depth check on %s (edge %.4f sz %g)",
+                         p.event_key, edge, size)
+                return None
+        elif size < 1:
             return None
+        else:
+            log.info("STREAM %s: edge %.4f from fresh WS book (sz %g) -> executing",
+                     p.event_key, edge, size)
         opp = self._build_opp(p, edge, yq, nq, size)
         log.info("STREAM edge %.4f sz %g on %s -> executing", edge, size, p.event_key)
         report = await self._execute_guarded(opp)

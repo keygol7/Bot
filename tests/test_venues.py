@@ -12,12 +12,21 @@ from bot.venues.kalshi import (
 def test_kalshi_ws_ticker_parsing():
     msg = {"type": "ticker", "msg": {
         "market_ticker": "KXMLBGAME-X-LAA",
-        "yes_bid_dollars": "0.40", "yes_ask_dollars": "0.43"}}
+        "yes_bid_dollars": "0.40", "yes_ask_dollars": "0.43",
+        "yes_bid_size_fp": "300.00", "yes_ask_size_fp": "150.00"}}
     q = parse_ticker(msg)
     assert q.market_id == "KXMLBGAME-X-LAA"
-    assert q.yes_ask == 0.43
-    assert round(q.no_ask, 4) == 0.60          # 1 - yes_bid
+    assert q.yes_ask == 0.43 and q.yes_ask_size == 150     # contracts at best ask
+    assert round(q.no_ask, 4) == 0.60                      # 1 - yes_bid
+    assert q.no_ask_size == 300                            # contracts at best YES bid
     assert q.timestamp > 0
+
+
+def test_kalshi_ws_ticker_missing_sizes_default_zero():
+    msg = {"type": "ticker", "msg": {
+        "market_ticker": "X", "yes_bid_dollars": "0.40", "yes_ask_dollars": "0.43"}}
+    q = parse_ticker(msg)
+    assert q.yes_ask_size == 0.0 and q.no_ask_size == 0.0  # absent sizes -> 0
 
 
 def test_kalshi_ws_ticker_missing_ticker():

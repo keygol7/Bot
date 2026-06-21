@@ -124,6 +124,10 @@ class Settings:
     # executor fires. Thin books are where a leg rejects and can't be hedged/unwound;
     # skipping them means we should never have to unwind. 0 = disabled.
     exec_min_leg_depth: float = 0.0
+    # Trust the WS live book (and skip the per-fire REST depth re-fetch) when both legs
+    # have a sized quote no older than this many seconds. Both venues now stream a sized
+    # top-of-book, so this removes the round-trip on the hot path. 0 = always re-fetch.
+    stream_max_ws_quote_age: float = 2.0
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -182,4 +186,5 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         ),
         scan_close_within_days=_env_float("SCAN_CLOSE_WITHIN_DAYS", 0.0),
         exec_min_leg_depth=_env_float("EXEC_MIN_LEG_DEPTH", 0.0),
+        stream_max_ws_quote_age=_env_float("STREAM_MAX_WS_QUOTE_AGE", 2.0),
     )

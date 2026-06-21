@@ -162,6 +162,56 @@ def test_sizeless_ws_quote_triggers_depth_fetch_then_executes():
     assert fe.calls[0].max_contracts == 50          # real size came from the depth fetch
 
 
+def test_fresh_ws_book_skips_rest_depth_fetch():
+    # When both legs have a recent, sized WS quote, fire off the live book WITHOUT the
+    # REST depth re-fetch (the latency win once both venues stream sized depth).
+    import time as _time
+
+    fe = FakeExec()
+    fetched = []
+
+    async def depth_fetch(venue, mid):
+        fetched.append((venue, mid))                # must NOT be called on a fresh book
+        return q(venue, mid, yes_ask=0.99, ya=1, no_ask=0.99, na=1)  # would kill the edge
+
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, depth_fetch=depth_fetch,
+        max_ws_quote_age=2.0,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    now = _time.time()
+    ka = q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100); ka.timestamp = now
+    pa = q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60); pa.timestamp = now
+    asyncio.run(eng.on_quote(ka))
+    asyncio.run(eng.on_quote(pa))
+    assert len(fe.calls) == 1 and fetched == []      # executed off WS, no REST fetch
+
+
+def test_stale_ws_quote_still_uses_rest_depth_fetch():
+    # An old WS quote (beyond max_ws_quote_age) must fall back to the REST confirm.
+    fe = FakeExec()
+    deep = {("kalshi", "K1"): q("kalshi", "K1", yes_ask=0.40, ya=50, no_ask=0.65, na=50),
+            ("poly", "P1"): q("poly", "P1", yes_ask=0.62, ya=50, no_ask=0.55, na=50)}
+    calls = []
+
+    async def depth_fetch(venue, mid):
+        calls.append((venue, mid))
+        return deep.get((venue, mid))
+
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, depth_fetch=depth_fetch,
+        max_ws_quote_age=2.0,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    # timestamps left at 0.0 (ancient vs time.time()) -> not fresh -> REST fallback.
+    asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)))
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)))
+    assert len(fe.calls) == 1 and calls != []        # REST confirm ran
+    assert fe.calls[0].max_contracts == 50           # size from the depth fetch
+
+
 def test_depth_fetch_says_edge_gone_no_execute():
     # Price edge on the WS book, but the depth fetch shows the edge has evaporated.
     fe = FakeExec()

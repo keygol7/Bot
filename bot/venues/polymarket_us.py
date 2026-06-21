@@ -89,7 +89,9 @@ def parse_market_data(message: dict[str, Any]) -> MarketQuote | None:
     slug = md.get("marketSlug")
     if not slug:
         return None
-    return normalize_book(slug, "", md)
+    q = normalize_book(slug, "", md)
+    q.timestamp = time.time()   # stamp WS arrival so the engine can gate on freshness
+    return q
 
 
 # (side, action) -> order intent. Price is always quoted on the YES/long side.
