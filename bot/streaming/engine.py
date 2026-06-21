@@ -73,6 +73,7 @@ class StreamingEngine:
         min_leg_price: float = 0.0,
         store=None,
         maker_mode: bool = False,
+        edge_snapshot_top: int = 5,
     ) -> None:
         self.executor = executor
         self.fee_models = fee_models or {}
@@ -96,6 +97,8 @@ class StreamingEngine:
         # Maker mode: rest the fee-heavy leg as a maker and complete it asynchronously
         # (so a pending maker doesn't block the quote loop). One maker per pair at a time.
         self.maker_mode = maker_mode
+        # How many of the best edges the periodic snapshot logs each interval.
+        self.edge_snapshot_top = edge_snapshot_top
         self._maker_inflight: set = set()
         # Async callable depth_fetch(venue, market_id) -> sized MarketQuote | None.
         # WS ticker feeds carry no size (Kalshi), so before firing on a price edge we
@@ -464,7 +467,7 @@ class StreamingEngine:
                 log.info("WS health: %s quotes this interval", counts)
             await self.log_edge_snapshot()
 
-    def edge_snapshot(self, top: int = 5) -> list[tuple]:
+    def edge_snapshot(self, top: int | None = None) -> list[tuple]:
         """Current best edge per pair, computed from the live WS book.
 
         Returns ``[(edge, pair, yes_quote, no_quote, size), ...]`` sorted best-first,
@@ -479,9 +482,9 @@ class StreamingEngine:
             edge, yq, nq, size = ev
             rows.append((edge, p, yq, nq, size))
         rows.sort(key=lambda r: r[0], reverse=True)
-        return rows[:top]
+        return rows[: top if top is not None else self.edge_snapshot_top]
 
-    async def log_edge_snapshot(self, top: int = 5) -> None:
+    async def log_edge_snapshot(self, top: int | None = None) -> None:
         snap = self.edge_snapshot(top)
         priced = sum(1 for p in self._pairs.values() if self._best_direction(p) is not None)
         if not snap:

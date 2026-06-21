@@ -603,6 +603,7 @@ async def stream(
         max_ws_quote_age=settings.stream_max_ws_quote_age,
         min_leg_price=settings.stream_min_leg_price, store=store,
         maker_mode=settings.exec_maker_mode,
+        edge_snapshot_top=settings.stream_edge_snapshot_top,
     )
 
     # Discovery (embedding shortlist + LLM confirm) only feeds match_verdicts, which the

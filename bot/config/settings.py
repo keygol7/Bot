@@ -149,6 +149,8 @@ class Settings:
     # A binary at ~$0.01 is a settling/resolved market with phantom depth (no real
     # resting volume), so its "edge" is an artifact. 0 = disabled.
     stream_min_leg_price: float = 0.02
+    # How many of the best edges the periodic snapshot logs each refresh interval.
+    stream_edge_snapshot_top: int = 5
     # Price cushion reserved for the hedge (second) leg so it fills through book
     # movement WITHOUT unwinding. The bot only fires when the edge can pay this AND
     # still lock RISK_MIN_EDGE, so thin edges that would unwind never fire. Effective
@@ -242,6 +244,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         stream_max_ws_quote_age=_env_float("STREAM_MAX_WS_QUOTE_AGE", 2.0),
         exec_depth_fraction=_env_float("EXEC_DEPTH_FRACTION", 0.85),
         stream_min_leg_price=_env_float("STREAM_MIN_LEG_PRICE", 0.02),
+        stream_edge_snapshot_top=int(_env_float("STREAM_EDGE_SNAPSHOT_TOP", 5)),
         exec_hedge_buffer=_env_float("EXEC_HEDGE_BUFFER", 0.03),
         exec_maker_mode=(env("EXEC_MAKER_MODE", "false") or "false").lower() == "true",
         exec_maker_timeout=_env_float("EXEC_MAKER_TIMEOUT", 5.0),
