@@ -148,6 +148,9 @@ class Settings:
     exec_maker_mode: bool = False
     # How long (s) a resting maker may wait to fill before it self-expires (no trade).
     exec_maker_timeout: float = 5.0
+    # How far inside the ask to post the maker (>= one tick, so post-only doesn't reject
+    # it as crossing). Also captures this much extra edge on a fill. Kalshi tick = $0.01.
+    exec_maker_improvement: float = 0.01
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -212,4 +215,5 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_hedge_buffer=_env_float("EXEC_HEDGE_BUFFER", 0.03),
         exec_maker_mode=(env("EXEC_MAKER_MODE", "false") or "false").lower() == "true",
         exec_maker_timeout=_env_float("EXEC_MAKER_TIMEOUT", 5.0),
+        exec_maker_improvement=_env_float("EXEC_MAKER_IMPROVEMENT", 0.01),
     )

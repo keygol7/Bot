@@ -174,6 +174,7 @@ def test_execute_maker_fills_then_hedges_locks_arb():
     assert report.status is ExecStatus.SUCCESS
     assert round(report.realized_pnl, 4) == round(5 * (1 - 0.40 - 0.55), 4)
     assert kalshi.calls[0][6] is True              # the kalshi leg was a maker (post_only)
+    assert kalshi.calls[0][3] == 0.54              # posted one tick INSIDE the 0.55 ask
     assert poly.calls[0][2] == "buy"               # poly taken as the hedge
 
 

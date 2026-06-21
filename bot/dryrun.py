@@ -572,6 +572,7 @@ async def stream(
         depth_safety=settings.exec_depth_fraction,
         hedge_buffer=settings.exec_hedge_buffer,
         maker_timeout=settings.exec_maker_timeout,
+        maker_improvement=settings.exec_maker_improvement,
     )
 
     venue_by_name = {v.name: v for v in venues}

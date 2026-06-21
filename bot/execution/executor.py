@@ -91,6 +91,7 @@ class Executor:
         first_venue: str = "kalshi",
         hedge_buffer: float = 0.0,
         maker_timeout: float = 5.0,
+        maker_improvement: float = 0.01,
     ) -> None:
         self.venues = venues
         self.risk = risk
@@ -128,6 +129,9 @@ class Executor:
         # auto-expires (and we give up on that arb). The taker hedge fires the instant
         # the maker fills, so the naked window is ~one round-trip, not this whole time.
         self.maker_timeout = maker_timeout
+        # How far INSIDE the ask to post the maker (>= one tick so post-only doesn't
+        # reject it as crossing). Also captures this much extra edge on a fill.
+        self.maker_improvement = maker_improvement
 
     def set_balances(self, snapshots) -> None:
         """Seed available cash per venue from account snapshots (startup/refresh)."""
@@ -420,9 +424,13 @@ class Executor:
         self._audit("maker_start", opp, size=size)
 
         # ----- Rest the maker (post-only, self-expiring) -----
+        # Post one tick INSIDE the ask (a cheaper bid) so it rests instead of crossing
+        # (post-only rejects a marketable price). This also captures an extra tick of
+        # edge: our cost is maker_px < the quoted ask, so the locked edge only grows.
+        maker_px = max(0.01, round(maker[3] - self.maker_improvement, 4))
         try:
             m = await maker_venue.place_order(
-                maker[1], maker[2], "buy", maker[3], size,
+                maker[1], maker[2], "buy", maker_px, size,
                 tif="gtc", post_only=True, expiration_ts=int(time.time() + self.maker_timeout))
         except Exception as exc:
             return ExecutionReport(ExecStatus.SKIPPED, f"maker placement failed: {exc}")
