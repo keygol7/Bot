@@ -216,6 +216,45 @@ def test_maker_mode_confirms_depth_even_on_fresh_ws_book():
     assert fe.calls == []                 # phantom edge -> nothing armed
 
 
+def test_persistence_filter_waits_for_edge_to_hold():
+    # With edge_persist_secs set, a freshly-appeared edge must hold continuously for the
+    # window before the engine acts — separating a real venue-lag from a flicker artifact.
+    fe = FakeExec()
+    t = [0.0]
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=0.0, clock=lambda: t[0], edge_persist_secs=1.0,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    eng.livebook.update(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
+    tick = lambda: asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)))
+    tick()                       # t=0: first sighting -> wait
+    assert fe.calls == []
+    t[0] = 0.5; tick()           # still within the window -> wait
+    assert fe.calls == []
+    t[0] = 1.5; tick()           # held > 1s -> act
+    assert len(fe.calls) == 1
+
+
+def test_persistence_filter_resets_when_edge_vanishes():
+    # If the edge drops below threshold the persistence timer resets, so a later flicker
+    # has to hold the full window again (it can't accumulate across gaps).
+    fe = FakeExec()
+    t = [0.0]
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=0.0, clock=lambda: t[0], edge_persist_secs=1.0,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    eng.livebook.update(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)))  # edge, t=0
+    t[0] = 0.5  # both directions now > 1 (0.40+0.65 and 0.50+0.65) -> edge gone -> reset
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.50, ya=100, no_ask=0.65, na=60)))
+    t[0] = 1.2                   # > 1s since first sighting, but the timer was reset
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)))
+    assert fe.calls == []        # re-armed at t=1.2; not held a full second yet
+
+
 def test_confirm_depth_fetches_both_legs_concurrently():
     # The two confirm fetches must be in flight at once (asyncio.gather) so the edge is
     # sampled on a near-simultaneous snapshot. Each fetch here blocks until BOTH have

@@ -74,6 +74,7 @@ class StreamingEngine:
         store=None,
         maker_mode: bool = False,
         edge_snapshot_top: int = 5,
+        edge_persist_secs: float = 0.0,
     ) -> None:
         self.executor = executor
         self.fee_models = fee_models or {}
@@ -99,6 +100,9 @@ class StreamingEngine:
         self.maker_mode = maker_mode
         # How many of the best edges the periodic snapshot logs each interval.
         self.edge_snapshot_top = edge_snapshot_top
+        # Require an edge to persist this many seconds before acting (distinguishes a real
+        # venue-lag from a fleeting cross-feed timing artifact). 0 = act on first sighting.
+        self.edge_persist_secs = edge_persist_secs
         self._maker_inflight: set = set()
         # Async callable depth_fetch(venue, market_id) -> sized MarketQuote | None.
         # WS ticker feeds carry no size (Kalshi), so before firing on a price edge we
@@ -107,6 +111,7 @@ class StreamingEngine:
         self._pairs: dict[tuple, ConfirmedPair] = {}
         self._index: dict[tuple[str, str], set] = {}   # (venue,market) -> set of pair keys
         self._last_acted: dict[tuple, float] = {}
+        self._edge_since: dict[tuple, float] = {}   # when a pair's edge first crossed (persistence)
         self._ws_counts: dict[str, int] = {}   # venue -> quotes seen since last refresh
         self._inflight: set = set()             # in-flight execute() tasks (cancel-shielded)
         # Escalating backoff for pairs whose orders keep failing (e.g. a venue that
@@ -259,7 +264,20 @@ class StreamingEngine:
             return None
         edge, yq, nq, size = ev
         if edge <= self.min_edge:                # price-edge gate (size checked below)
+            self._edge_since.pop(key, None)      # edge gone -> reset persistence timer
             return None
+        # Persistence filter: a cross-feed timing artifact (one venue's WS leading the other
+        # for a beat) flickers — it appears for ~100ms and vanishes when the lagging leg
+        # catches up. A REAL venue-lag edge persists for the duration of the lag (seconds).
+        # So only act once the edge has held continuously for ``edge_persist_secs``, which
+        # separates genuine lag from skew without a slow REST round-trip. 0 = disabled.
+        if self.edge_persist_secs > 0:
+            first = self._edge_since.get(key)
+            if first is None:
+                self._edge_since[key] = self.clock()
+                return None                       # first sighting — wait for it to persist
+            if self.clock() - first < self.edge_persist_secs:
+                return None                       # not held long enough yet
         if self.clock() < self._backoff_until.get(key, 0.0):
             return None                           # market keeps rejecting -> backing off
         if self.clock() - self._last_acted.get(key, -1e9) < self.cooldown:
