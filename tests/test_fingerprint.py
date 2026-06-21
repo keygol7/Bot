@@ -193,6 +193,37 @@ def test_winner_same_team_different_game_not_complementary():
     assert are_complementary(k3, p3)
 
 
+def test_prop_cross_game_same_surname_not_complementary():
+    # A "Rodri" assists prop (Spain, ESP vs KSA) must NOT bind to a "Brian Rodriguez"
+    # assists prop (Uruguay, URU vs CPV) on the same day: same metric/threshold/date and
+    # the surname prefix-aligns, but the structured event codes are different games.
+    k = from_kalshi("KXWCAST-26JUN21ESPKSA-ESPRODR16-2", "Rodri: 2+ assists? - Rodri: 2+")
+    p = from_polymarket("astatc-fwc-uru-cpv-2026-06-21-a-fwcbrirod-gte2",
+                        "Will Brian Rodriguez record at least 2 assists in URU vs CPV? - Yes")
+    assert k.event == frozenset({"espksa"}) and p.event == frozenset({"uru", "cpv"})
+    assert not are_complementary(k, p)
+    # Same player, SAME game still matches (event codes overlap: beliri contains bel).
+    k2 = from_kalshi("KXWCGOAL-26JUN21BELIRI-BELLTROSS19-1", "Leandro Trossard: 1+ goals - Leandro Trossard: 1+")
+    p2 = from_polymarket("astatc-fwc-bel-irn-2026-06-21-g-fwcleatro-gte1",
+                         "Will Leandro Trossard record at least 1 goals in BEL vs IRN? - Yes")
+    assert are_complementary(k2, p2)
+
+
+def test_season_futures_winner_is_unmatchable():
+    # A season/championship futures ("Will Jen win Love Island USA Season 8?") has no
+    # single-game code in its ticker, so it's not a head-to-head winner -> unmatchable, and
+    # can't bind to an unrelated tennis match via a name collision (Jen ~ Jeng).
+    k = from_kalshi("KXLIUSAWINNERS-26-JEN", "Will Jen win Love Island USA Season 8? - Jen")
+    assert k.event == frozenset() and k.metric == "unmatchable"
+    p = from_polymarket("aec-itfwo-jujen-yekim-2026-06-21",
+                        "Who will win in the upcoming tennis event Ju-Yun Jeng vs Ye Eun "
+                        "Kim scheduled for June 21, 2026 at 5:30 AM UTC? - Ju-Yun Jeng")
+    assert not are_complementary(k, p)
+    # A real single-game winner keeps its game code and stays matchable.
+    kw = from_kalshi("KXWNBAGAME-26JUN21GSLV-GS", "Golden State vs Las Vegas winner? - Golden State")
+    assert kw.event == frozenset({"gslv"}) and kw.metric == "winner"
+
+
 def test_first_goal_metric_matches_and_is_distinct():
     # "record the first goal" <-> "first to score": same event, distinct from a goal-COUNT
     # prop (so it can't false-match an anytime/N+ goals market).

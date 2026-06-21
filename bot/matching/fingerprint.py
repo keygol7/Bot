@@ -188,6 +188,57 @@ def _outcome_from_title(title: str) -> str:
     return title.rsplit(" - ", 1)[1] if title and " - " in title else (title or "")
 
 
+# Structured event/teams code extracted from the venue's IDENTIFIER (not the free-text
+# title): Kalshi packs both teams into the ticker's date segment (BELIRI = BEL+IRI), and
+# Polymarket dash-separates them in the slug (bel-irn). Used to tell two DIFFERENT games
+# apart for PLAYER PROPS, which carry no opponent in their YES outcome (so a "Rodri"
+# prop with no Polymarket counterpart could otherwise bind to "Brian Rodriguez" in a
+# different game on the same day). Winners are disambiguated by ``matchup`` instead.
+_KALSHI_EVENT_RE = re.compile(r"\d{2}[A-Z]{3}\d{2}\d*([A-Z0-9]+)")  # date(+time) then game
+# Slug tokens that are the type/league prefix, not a team (astatc-fwc-<team>-<team>-date).
+_SLUG_NONTEAM = frozenset({
+    "astatc", "aec", "atc", "tsc", "aachc", "aat", "ac",
+    "fwc", "fifa", "ufc", "atp", "wta", "itf", "itfm", "itfw", "itfme", "itfwo",
+    "cod", "lol", "nhl", "nba", "wnba", "mlb", "nfl", "soccer", "esports", "tennis",
+})
+
+
+def _kalshi_event_codes(ticker: str) -> frozenset[str]:
+    """The concatenated game code from a Kalshi ticker's date segment (e.g. BELIRI), as a
+    single-token set. Empty for season/championship futures with no date-game segment
+    (KXLIUSAWINNERS-26-JEN), which is the tell that a 'winner' is not a single game."""
+    parts = (ticker or "").split("-")
+    if len(parts) < 2:
+        return frozenset()
+    m = _KALSHI_EVENT_RE.fullmatch(parts[1].upper())
+    return frozenset({m.group(1).lower()}) if m else frozenset()
+
+
+def _poly_event_codes(slug: str) -> frozenset[str]:
+    """Team codes from a Polymarket slug — the alpha tokens before the date, minus the
+    type/league prefix (astatc-fwc-bel-irn-2026-... -> {bel, irn})."""
+    out = []
+    for p in (slug or "").lower().split("-"):
+        if re.fullmatch(r"\d{4}", p):                # reached the date -> stop
+            break
+        if p.isalpha() and len(p) >= 2 and p not in _SLUG_NONTEAM:
+            out.append(p)
+    return frozenset(out)
+
+
+def _event_overlap(a: frozenset, b: frozenset) -> bool | None:
+    """Whether two event-code sets refer to the same game: some token of one is contained
+    in a token of the other (Kalshi's 6-char 'beliri' contains Polymarket's 'bel'). Returns
+    None when either side has no codes (unknown — defer to the other guards)."""
+    if not a or not b:
+        return None
+    for x in a:
+        for y in b:
+            if x == y or (min(len(x), len(y)) >= 3 and (x in y or y in x)):
+                return True
+    return False
+
+
 @dataclass(frozen=True)
 class ContractFingerprint:
     venue: str
@@ -198,6 +249,7 @@ class ContractFingerprint:
     date: float | None           # event date (epoch), if parseable
     league: str | None = None    # sport/league (valorant/soccer/...), if identifiable
     matchup: frozenset = frozenset()  # BOTH teams of a winner market (game disambiguation)
+    event: frozenset = frozenset()    # structured game/teams code from the venue identifier
 
     @property
     def matchable(self) -> bool:
@@ -229,11 +281,19 @@ def from_kalshi(ticker: str, title: str, yes_sub_title: str = "",
             except ValueError:
                 date = None
     subject = _subject_tokens(yes_sub_title) or _subject_tokens(_outcome_from_title(title))
+    event = _kalshi_event_codes(ticker)
+    # A 'winner' market with no single-game code in the ticker is a season/championship
+    # FUTURES (e.g. "Will Jen win Love Island USA Season 8?", KXLIUSAWINNERS-26-JEN), not a
+    # head-to-head — it has no clean cross-venue complement, so mark it unmatchable rather
+    # than let a name collision bind it to an unrelated match.
+    if metric == "winner" and not event:
+        metric = _UNMATCHABLE
     return ContractFingerprint(
         venue="kalshi", metric=metric, scope=_scope_only(title),
         threshold=_threshold_int(title), subject=subject, date=date,
         league=_league_of(kalshi_series(ticker)),
         matchup=_matchup_tokens(title) if metric == "winner" else frozenset(),
+        event=event,
     )
 
 
@@ -261,6 +321,7 @@ def from_polymarket(slug: str, title: str, end_date: str | None = None,
         threshold=_threshold_int(title), subject=subject, date=date,
         league=_league_of(slug),
         matchup=_matchup_tokens(title) if metric == "winner" else frozenset(),
+        event=_poly_event_codes(slug),
     )
 
 
@@ -337,6 +398,12 @@ def complement_reason(a: ContractFingerprint, b: ContractFingerprint,
     # date outright), so the date check alone can't separate them — this can.
     if a.metric == "winner" and a.matchup and b.matchup and _matchup_conflict(a.matchup, b.matchup):
         return f"matchup {sorted(a.matchup)}!={sorted(b.matchup)}"
+    # Player props carry no opponent in their YES outcome, so the subject alone can't tell
+    # two DIFFERENT same-day games apart (a "Rodri" prop in ESP-KSA vs a "Brian Rodriguez"
+    # prop in URU-CPV both align on the surname). Require the structured event codes to
+    # refer to the same game when both venues provide them.
+    if a.metric in _QUESTION_SUBJECT_METRICS and _event_overlap(a.event, b.event) is False:
+        return f"event {sorted(a.event)}!={sorted(b.event)}"
     if not _subjects_align(a.subject, b.subject):
         return f"subject {sorted(a.subject)}!={sorted(b.subject)}"
     return "ok"
