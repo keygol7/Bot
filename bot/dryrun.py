@@ -1064,6 +1064,82 @@ def recheck_matches(settings: Settings, *, limit: int = 100) -> int:
         store.close()
 
 
+def diagnose_event(settings: Settings, needle: str, limit: int = 80) -> int:
+    """Read-only root-cause for a MISSING match: why isn't event <needle> tradeable?
+
+    For every scanned market whose title/id contains <needle>, print its fingerprint,
+    then every cross-venue pair with the deterministic complement reason AND whether a
+    candidate verdict is cached. The three failure modes are then distinguishable:
+
+      * market absent on one venue  -> not scanned (out of window / venue doesn't list it)
+      * reason 'ok' but 'NOT cached' -> the embedding/lexical shortlist never proposed the
+        pair, so it never entered ``match_verdicts`` and the fingerprint (authoritative but
+        gated behind that shortlist) never sees it. This is the recall bottleneck.
+      * reason != 'ok'              -> the fingerprint itself rejects it (the reason says why)
+    """
+    from bot.matching.fingerprint import (
+        complement_reason, from_kalshi, from_polymarket,
+    )
+
+    store = Store(settings.db_path)
+    try:
+        like = f"%{needle.lower()}%"
+        rows = store.conn.execute(
+            """SELECT venue, market_id, title FROM markets
+               WHERE lower(title) LIKE ? OR lower(market_id) LIKE ?
+               ORDER BY venue, market_id LIMIT ?""",
+            (like, like, limit),
+        ).fetchall()
+        if not rows:
+            print(f"no scanned markets match '{needle}'. If you expected one, the market "
+                  f"isn't in the DB at all — it wasn't scanned (out of the imminent window, "
+                  f"or the venue doesn't list it). Widen --close-within-days / re-scan.")
+            return 0
+
+        by_venue: dict[str, list] = {}
+        for r in rows:
+            by_venue.setdefault(r["venue"], []).append(r)
+
+        def fp(venue, mid, title):
+            return (from_kalshi(mid, title) if venue == "kalshi"
+                    else from_polymarket(mid, title))
+
+        for venue, items in by_venue.items():
+            print(f"\n[{venue}] {len(items)} scanned market(s):")
+            for r in items:
+                f = fp(venue, r["market_id"], r["title"] or "")
+                print(f"  {r['market_id']}  {r['title']}")
+                print(f"      metric={f.metric} league={f.league} thr={f.threshold} "
+                      f"subj={sorted(f.subject)} matchup={sorted(f.matchup)} "
+                      f"matchable={f.matchable}")
+
+        venues = list(by_venue)
+        if len(venues) < 2:
+            print("\n  -> only ONE venue has markets for this event; the other side wasn't "
+                  "scanned, so nothing can pair. That's the miss: scan scope, not matching.")
+            return 0
+
+        print("\ncross-venue pairs (deterministic complement reason; ✓ ok = would match):")
+        for i in range(len(venues)):
+            for j in range(i + 1, len(venues)):
+                for ra in by_venue[venues[i]]:
+                    for rb in by_venue[venues[j]]:
+                        fa = fp(venues[i], ra["market_id"], ra["title"] or "")
+                        fb = fp(venues[j], rb["market_id"], rb["title"] or "")
+                        reason = complement_reason(fa, fb)
+                        v = store.get_verdict(
+                            venues[i], ra["market_id"], venues[j], rb["market_id"])
+                        cached = (f"cached same_event={v['same_event']}" if v else "NOT cached")
+                        mark = "✓" if reason == "ok" else "✗"
+                        print(f"  {mark} {reason:<30} [{cached}]")
+                        print(f"      {ra['market_id']}  /  {rb['market_id']}")
+        print("\n  legend: '✓ ok + NOT cached' = recall bottleneck (shortlist never "
+              "proposed it); '✗ <reason>' = fingerprint rejected it; one-sided = scan gap.")
+        return 0
+    finally:
+        store.close()
+
+
 def check_llm(settings: Settings) -> int:
     """Probe the configured local LLM and print a diagnosis. Returns an exit code."""
     from bot.matching.llm_client import LocalLLMClient
@@ -1351,6 +1427,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--fill", action="store_true",
                    help="with --test-order, actually buy 1 contract at the ask "
                         "(REAL money, REAL position you must close manually)")
+    p.add_argument("--diagnose-event", metavar="SUBSTR", default=None,
+                   help="root-cause a MISSING match: for every scanned market whose "
+                        "title/id contains SUBSTR, print its fingerprint and every "
+                        "cross-venue complement reason + whether it's cached (read-only)")
     p.add_argument("--show-rejected", action="store_true",
                    help="with --inspect-matches, also list rejected (non-match) pairs")
     p.add_argument("--tradeable-only", action="store_true",
@@ -1408,6 +1488,9 @@ def main(argv: list[str] | None = None) -> None:
             load_settings(), show_rejected=args.show_rejected,
             tradeable_only=args.tradeable_only, limit=args.limit,
         ))
+
+    if args.diagnose_event:
+        raise SystemExit(diagnose_event(load_settings(), args.diagnose_event, limit=args.limit))
 
     if args.count_markets:
         raise SystemExit(count_markets(load_settings()))
