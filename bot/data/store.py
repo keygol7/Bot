@@ -289,69 +289,79 @@ class Store:
            ``None`` to disable.
         """
         if use_fingerprint:
-            # Fingerprint is AUTHORITATIVE: consider every cached candidate pair (from
-            # the embedding shortlist), not just the LLM's same_event=1 set. The
-            # deterministic fingerprint (same matchable metric/scope/threshold/subject/
-            # date) is the matcher, so it recovers real pairs the over-conservative local
-            # LLM wrongly rejected (e.g. "record the first goal" vs "first to score").
-            rows = self.conn.execute(
-                """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b, v.event_key,
-                          ma.title AS title_a, mb.title AS title_b
-                   FROM match_verdicts v
-                   LEFT JOIN markets ma ON ma.venue=v.venue_a AND ma.market_id=v.market_a
-                   LEFT JOIN markets mb ON mb.venue=v.venue_b AND mb.market_id=v.market_b"""
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b, v.event_key,
-                          ma.title AS title_a, mb.title AS title_b
-                   FROM match_verdicts v
-                   LEFT JOIN markets ma ON ma.venue=v.venue_a AND ma.market_id=v.market_a
-                   LEFT JOIN markets mb ON mb.venue=v.venue_b AND mb.market_id=v.market_b
-                   WHERE v.same_event=1 AND v.confidence >= ?""",
-                (min_confidence,),
-            ).fetchall()
-        if use_fingerprint:
-            from bot.matching.fingerprint import (
-                are_complementary, from_kalshi, from_polymarket,
-            )
-
-            def _fp(venue, mid, title):
-                return (from_kalshi(mid, title) if venue == "kalshi"
-                        else from_polymarket(mid, title))
-
+            return self._fingerprint_sweep(fingerprint_metrics, max_fanout)
+        rows = self.conn.execute(
+            """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b, v.event_key,
+                      ma.title AS title_a, mb.title AS title_b
+               FROM match_verdicts v
+               LEFT JOIN markets ma ON ma.venue=v.venue_a AND ma.market_id=v.market_a
+               LEFT JOIN markets mb ON mb.venue=v.venue_b AND mb.market_id=v.market_b
+               WHERE v.same_event=1 AND v.confidence >= ?""",
+            (min_confidence,),
+        ).fetchall()
         pairs = []
         for r in rows:
             ta, tb = r["title_a"] or "", r["title_b"] or ""
-            if use_fingerprint:
-                # Structured complement match (validated via --compare-filters): admits
-                # any category whose fingerprints prove complementary, regardless of the
-                # series/title allowlists, and rejects winner<->method false positives
-                # the title whitelist lets through. Optionally restrict to specific
-                # metrics for a staged rollout.
-                fa = _fp(r["venue_a"], r["market_a"], ta)
-                fb = _fp(r["venue_b"], r["market_b"], tb)
-                if not are_complementary(fa, fb):
+            if drop_scope_mismatch and scope_mismatch(ta, tb):
+                continue
+            if safe_types_only:
+                if not (is_tradeable_market_type(ta) and is_tradeable_market_type(tb)):
                     continue
-                if fingerprint_metrics and fa.metric not in fingerprint_metrics:
+                # Kalshi series allowlist (more reliable than titles). The kalshi
+                # leg must be a vetted series; unknown/exotic series are excluded.
+                kalshi_mkt = (
+                    r["market_a"] if r["venue_a"] == "kalshi"
+                    else r["market_b"] if r["venue_b"] == "kalshi" else None
+                )
+                if kalshi_mkt is not None and not is_allowed_kalshi_series(kalshi_mkt):
                     continue
-            else:
-                if drop_scope_mismatch and scope_mismatch(ta, tb):
-                    continue
-                if safe_types_only:
-                    if not (is_tradeable_market_type(ta) and is_tradeable_market_type(tb)):
-                        continue
-                    # Kalshi series allowlist (more reliable than titles). The kalshi
-                    # leg must be a vetted series; unknown/exotic series are excluded.
-                    kalshi_mkt = (
-                        r["market_a"] if r["venue_a"] == "kalshi"
-                        else r["market_b"] if r["venue_b"] == "kalshi" else None
-                    )
-                    if kalshi_mkt is not None and not is_allowed_kalshi_series(kalshi_mkt):
-                        continue
             pairs.append(
                 (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], r["event_key"])
             )
+        if max_fanout is not None:
+            pairs = drop_fanout_pairs(pairs, max_fanout=max_fanout)
+        return pairs
+
+    def _fingerprint_sweep(
+        self, fingerprint_metrics: Optional[frozenset], max_fanout: Optional[int],
+    ) -> list[tuple]:
+        """Authoritative matcher: fingerprint EVERY scanned cross-venue market pair and
+        keep the provable complements — independent of the embedding/LLM shortlist, which
+        only ever proposed a fraction of true pairs (the recall bottleneck). The
+        deterministic fingerprint is the precision gate, so any structurally complementary
+        pair becomes tradeable the moment both legs are scanned. Pairs are blocked by metric
+        (a complement requires equal metric) so the sweep is O(sum of per-metric K*P), not a
+        full O(N^2). One leg is always Kalshi; same-venue pairs are never formed."""
+        from collections import defaultdict
+
+        from bot.matching.fingerprint import (
+            are_complementary, from_kalshi, from_polymarket,
+        )
+
+        rows = self.conn.execute(
+            "SELECT venue, market_id, title FROM markets"
+        ).fetchall()
+        # Fingerprint each market once; drop the unmatchable ones up front, then bucket by
+        # metric and Kalshi/other side so only plausible counterparties are compared.
+        by_metric: dict[str, dict[str, list]] = defaultdict(
+            lambda: {"kalshi": [], "other": []})
+        for m in rows:
+            venue = m["venue"]
+            f = (from_kalshi(m["market_id"], m["title"] or "") if venue == "kalshi"
+                 else from_polymarket(m["market_id"], m["title"] or ""))
+            if not f.matchable:
+                continue
+            side = "kalshi" if venue == "kalshi" else "other"
+            by_metric[f.metric][side].append((venue, m["market_id"], f))
+
+        pairs = []
+        for metric, sides in by_metric.items():
+            if fingerprint_metrics and metric not in fingerprint_metrics:
+                continue
+            for va, ma, fa in sides["kalshi"]:
+                for vb, mb, fb in sides["other"]:
+                    if are_complementary(fa, fb):
+                        pairs.append((va, ma, vb, mb, f"{va}:{ma}|{vb}:{mb}"))
         if max_fanout is not None:
             pairs = drop_fanout_pairs(pairs, max_fanout=max_fanout)
         return pairs

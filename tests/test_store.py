@@ -61,6 +61,38 @@ def test_confirmed_pairs_fingerprint_recovers_llm_rejected_complement():
     s.close()
 
 
+def test_fingerprint_sweep_recovers_uncached_complements():
+    # The recall bottleneck: the embedding/LLM shortlist only ever proposed (and cached) a
+    # fraction of the true complements for an event. The fingerprint sweep must trade EVERY
+    # scanned complementary pair regardless of whether a verdict row exists. Here NONE are
+    # cached, yet all four player-prop pairs (BEL vs IRN) must come back tradeable.
+    s = Store(":memory:")
+    props = [
+        ("BELJDOKU11-1", "Jeremy Doku: 1+ goals - Jeremy Doku: 1+",
+         "fwcjerdok-gte1", "Will Jeremy Doku record at least 1 goals in BEL vs IRN? - Yes"),
+        ("BELKDEBR11-2", "Kevin De Bruyne: 2+ goals - Kevin De Bruyne: 2+",
+         "fwckevbru-gte2", "Will Kevin De Bruyne record at least 2 goals in BEL vs IRN? - Yes"),
+        ("BELLTROSS19-1", "Leandro Trossard: 1+ assists - Leandro Trossard: 1+",
+         "fwcleatro-gte1", "Will Leandro Trossard record at least 1 assists in BEL vs IRN? - Yes"),
+        ("IRIMTAREM99-2", "Mehdi Taremi: 2+ goals - Mehdi Taremi: 2+",
+         "fwcmehtar-gte2", "Will Mehdi Taremi record at least 2 goals in BEL vs IRN? - Yes"),
+    ]
+    for suf, ktitle, psuf, ptitle in props:
+        metric = "a" if "assists" in ktitle else "g"
+        kid = f"KXWC{'AST' if metric == 'a' else 'GOAL'}-26JUN21BELIRI-{suf}"
+        pid = f"astatc-fwc-bel-irn-2026-06-21-{metric}-{psuf}"
+        s.upsert_market("kalshi", kid, ktitle)
+        s.upsert_market("polymarket_us", pid, ptitle)
+    # No cache_verdict calls at all -> the old verdict-gated path would return nothing.
+    assert s.confirmed_pairs() == []
+    fp = s.confirmed_pairs(use_fingerprint=True)
+    assert len(fp) == 4                       # every complement recovered, uncached
+    # Each Kalshi prop pairs with exactly its own Polymarket counterpart (no fan-out drop).
+    kalshi_ids = {p[1] for p in fp}
+    assert len(kalshi_ids) == 4
+    s.close()
+
+
 def test_verdict_cache_is_order_independent():
     s = Store(":memory:")
     s.cache_verdict(
