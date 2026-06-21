@@ -78,7 +78,14 @@ def _title_metric(title: str) -> str:
     for name, pat in _METRIC_RULES:
         if re.search(pat, t):
             return "ga" if name == "ga" else name
-    if re.search(r"\bwins?\b|\bbeat\b|\bdefeat|\bwinner\b|to win|\bdraw\b|\bno contest\b", t):
+    # Fight method/duration props ("go to a decision", "go the distance", "by KO/
+    # submission", "no contest") have NO clean cross-venue WINNER complement — a fighter
+    # can win by KO *or* decision — so they must never match a moneyline winner. Mark
+    # unmatchable (these phrasings don't occur in a soccer "draw" moneyline).
+    if re.search(r"\bdecision\b|go the distance|\bno contest\b|"
+                 r"by (ko|knockout|submission|tko)\b|method of", t):
+        return _UNMATCHABLE
+    if re.search(r"\bwins?\b|\bbeat\b|\bdefeat|\bwinner\b|to win|\bdraw\b", t):
         return "winner"
     # A bare "Team A vs Team B - Outcome" matchup with no stat/exotic scope is a
     # moneyline winner (Polymarket game titles carry no literal "win" word). Any

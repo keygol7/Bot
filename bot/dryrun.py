@@ -1109,10 +1109,13 @@ def inspect_matches(
                 (same_event, limit),
             ).fetchall()
 
-        tradeable_pairs = store.confirmed_pairs()
+        tradeable_pairs = store.confirmed_pairs(
+            use_fingerprint=settings.match_use_fingerprint,
+            fingerprint_metrics=settings.match_fingerprint_metrics or None,
+        )
         if tradeable_only:
             # Exactly what the streamer will trade — audit this before going live.
-            print(f"{len(tradeable_pairs)} TRADEABLE pairs (confidence+fan-out filtered):\n")
+            print(f"{len(tradeable_pairs)} TRADEABLE pairs (matches the live filter):\n")
             for (va, ma, vb, mb, _ek) in tradeable_pairs[:limit]:
                 # Show the market id alongside the title so it can be copied straight
                 # into --test-order VENUE:MARKET.
