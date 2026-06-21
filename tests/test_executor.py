@@ -178,6 +178,20 @@ def test_execute_maker_fills_then_hedges_locks_arb():
     assert poly.calls[0][2] == "buy"               # poly taken as the hedge
 
 
+def test_execute_maker_hedge_reprices_off_live_book():
+    # Poly moved while the maker rested: the hedge must cross the LIVE ask (0.50), not
+    # the stale opp price (0.40) — otherwise it kills and forces an unwind.
+    from bot.models import MarketQuote
+    moved = MarketQuote(venue="poly", market_id="K1", title="", yes_ask=0.50, no_ask=0.50)
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly = QuotingVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 5, 0.50)], moved)
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55)}))
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.SUCCESS
+    assert poly.calls[0][3] == 0.50                # crossed the live ask, not the stale 0.40
+
+
 def test_execute_maker_unfilled_is_no_trade():
     kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
     poly = FakeVenue("poly", [])                    # hedge must never be attempted

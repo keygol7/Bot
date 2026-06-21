@@ -461,7 +461,21 @@ class Executor:
             requested=filled, filled=filled,
             avg_price=avg if avg is not None else maker[3],
             order_id=m.order_id, status=OrderStatus.FILLED)
-        taker_limit = min(0.99, round(taker[3] + self.hedge_buffer, 4))
+        # Re-fetch the hedge venue's LIVE book and cross the current ask: the maker may
+        # have rested for seconds, so the opp's price is stale — a stale limit misses
+        # and forces an unwind. We're committed once the maker filled, so cross to fill.
+        taker_px = taker[3]
+        try:
+            fresh = await taker_venue.fetch_quote(
+                RawMarket(market_id=taker[1], title="", raw={}))
+        except Exception as exc:
+            log.warning("hedge book refetch failed for %s: %s", taker[1], exc)
+            fresh = None
+        if fresh is not None:
+            live_ask = fresh.yes_ask if taker[2] is Side.YES else fresh.no_ask
+            if live_ask is not None:
+                taker_px = live_ask
+        taker_limit = min(0.99, round(taker_px + self.hedge_buffer, 4))
         hedge = await self._place(
             taker_venue, taker[1], taker[2], "buy", taker_limit, filled, "immediate_or_cancel")
         log.info("maker-hedge %s", hedge)
