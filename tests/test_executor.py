@@ -192,6 +192,69 @@ def test_execute_maker_hedge_reprices_off_live_book():
     assert poly.calls[0][3] == 0.50                # crossed the live ask, not the stale 0.40
 
 
+class SlowConfirmer:
+    """Confirmer that returns a fixed terminal result after a delay — lets the drift
+    guard poll at least once before the maker resolves."""
+
+    def __init__(self, result, delay=0.0):
+        self._result = result
+        self._delay = delay
+
+    async def confirm(self, venue, order_id, requested, timeout):
+        await asyncio.sleep(self._delay)
+        return self._result
+
+
+class CancelVenue(FakeVenue):
+    """FakeVenue that records cancel_order calls (the maker venue in drift tests)."""
+
+    def __init__(self, name, responses):
+        super().__init__(name, responses)
+        self.cancelled = []
+
+    async def cancel_order(self, order_id):
+        self.cancelled.append(order_id)
+        return {"ok": True}
+
+
+def test_execute_maker_cancels_on_adverse_drift():
+    # While the maker rests, the taker (Poly YES) drifts up to 0.50 so the would-be hedge
+    # (NO 0.54 + YES 0.50 = 1.04) can no longer lock the floor -> cancel the maker before it
+    # fills. No hedge is ever taken, no loss locked.
+    from bot.models import MarketQuote
+    kalshi = CancelVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    drifted = MarketQuote(venue="poly", market_id="P1", title="", yes_ask=0.50, no_ask=0.50)
+    poly = QuotingVenue("poly", [], drifted)        # hedge place_order must never happen
+    risk = RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({v.name: v for v in [kalshi, poly]}, risk,
+                  fee_models={v.name: ZeroFeeModel() for v in [kalshi, poly]},
+                  max_order_contracts=0,
+                  fill_confirmer=SlowConfirmer((OrderStatus.KILLED, 0, None), delay=0.1),
+                  maker_timeout=0.5, maker_arm_cushion=0.0, maker_poll=0.01)
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.SKIPPED and "unfilled" in report.reason
+    assert kalshi.cancelled == ["o"]                # maker cancelled on drift
+    assert poly.calls == []                          # never hedged -> no loss
+
+
+def test_execute_maker_no_drift_still_fills():
+    # Taker stays put while resting -> guard never cancels, maker fills, hedge locks.
+    from bot.models import MarketQuote
+    steady = MarketQuote(venue="poly", market_id="P1", title="", yes_ask=0.40, no_ask=0.40)
+    kalshi = CancelVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly = QuotingVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 5, 0.40)], steady)
+    risk = RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({v.name: v for v in [kalshi, poly]}, risk,
+                  fee_models={v.name: ZeroFeeModel() for v in [kalshi, poly]},
+                  max_order_contracts=0,
+                  fill_confirmer=SlowConfirmer((OrderStatus.FILLED, 5, 0.54), delay=0.0),
+                  maker_timeout=0.5, maker_arm_cushion=0.0, maker_poll=0.05)
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.SUCCESS and kalshi.cancelled == []
+
+
 def test_execute_maker_thin_edge_below_cushion_skips():
     # A sub-cushion edge must NOT arm a maker: while it rests the taker can drift against
     # it, and the post-fill hedge is forced — a thin edge that drifts locks a guaranteed

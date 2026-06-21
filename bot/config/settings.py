@@ -165,6 +165,13 @@ class Settings:
     # at/above the typical taker drift over the maker timeout. 0 = no cushion (unsafe:
     # arms 1-2c edges that don't survive the rest window).
     exec_maker_arm_cushion: float = 0.04
+    # While a maker rests, re-poll the taker leg every this-many seconds and CANCEL the
+    # maker if the taker drifts so the hedge can no longer lock the edge floor — so a
+    # resting maker never fills into an adverse move. This is the dynamic guard that makes
+    # arming thin edges safe; with it on you can lower EXEC_MAKER_ARM_CUSHION. 0 = disabled
+    # (rest blindly until fill/expiry). Smaller = tighter (less fill-before-cancel race) but
+    # more REST polls per resting maker.
+    exec_maker_poll: float = 1.0
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -232,4 +239,5 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_maker_timeout=_env_float("EXEC_MAKER_TIMEOUT", 5.0),
         exec_maker_improvement=_env_float("EXEC_MAKER_IMPROVEMENT", 0.01),
         exec_maker_arm_cushion=_env_float("EXEC_MAKER_ARM_CUSHION", 0.04),
+        exec_maker_poll=_env_float("EXEC_MAKER_POLL", 1.0),
     )

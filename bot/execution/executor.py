@@ -93,6 +93,7 @@ class Executor:
         maker_timeout: float = 5.0,
         maker_improvement: float = 0.01,
         maker_arm_cushion: float = 0.0,
+        maker_poll: float = 0.0,
     ) -> None:
         self.venues = venues
         self.risk = risk
@@ -138,6 +139,12 @@ class Executor:
         # a 1-2c edge fills into an adverse move and the forced hedge locks a loss. Mirrors
         # hedge_buffer on the taker path, but for the maker's drift-while-resting risk.
         self.maker_arm_cushion = maker_arm_cushion
+        # While a maker rests, poll the taker leg every this-many seconds; if it drifts so
+        # the hedge could no longer lock the floor, CANCEL the maker before it fills into
+        # the adverse move. This is what makes arming THIN edges safe (the cushion is the
+        # static guard at fire time; this is the dynamic guard while resting). 0 = disabled
+        # (rest blindly until fill/expiry — only safe with a large arm cushion).
+        self.maker_poll = maker_poll
 
     def set_balances(self, snapshots) -> None:
         """Seed available cash per venue from account snapshots (startup/refresh)."""
@@ -380,6 +387,52 @@ class Executor:
             [leg1, leg2],
         )
 
+    async def _taker_ask(self, taker, taker_venue) -> float | None:
+        """Current ask for the taker (hedge) leg from its live book, or None on failure."""
+        try:
+            q = await taker_venue.fetch_quote(RawMarket(market_id=taker[1], title="", raw={}))
+        except Exception as exc:
+            log.warning("maker drift check: taker quote failed for %s: %s", taker[1], exc)
+            return None
+        return q.yes_ask if taker[2] is Side.YES else q.no_ask
+
+    async def _rest_with_drift_guard(
+        self, m, maker, taker, maker_venue, taker_venue, maker_px, size, floor,
+    ) -> tuple[float, float | None]:
+        """Wait for the resting maker to fill/expire while polling the taker leg. If the
+        taker drifts so the would-be hedge can no longer lock ``floor``, CANCEL the maker
+        before it fills into the adverse move — the only safe way to arm thin edges. Returns
+        ``(filled, avg_price)`` from the authoritative fill confirmation."""
+        confirm = asyncio.ensure_future(
+            self.fill_confirmer.confirm(m.venue, m.order_id, size, self.maker_timeout + 1.5))
+        deadline = time.time() + self.maker_timeout
+        try:
+            while not confirm.done() and time.time() < deadline:
+                done, _ = await asyncio.wait({confirm}, timeout=self.maker_poll)
+                if confirm in done:
+                    break
+                ask = await self._taker_ask(taker, taker_venue)
+                if ask is None:
+                    continue
+                fee = self._fee(maker[0]).fee(maker_px, size) + self._fee(taker[0]).fee(ask, size)
+                edge_now = (size * (1.0 - maker_px - ask) - fee) / size
+                if edge_now < floor - 1e-9:
+                    log.info(
+                        "maker adverse drift on %s: taker ask %.3f -> hedge edge %.3f < floor "
+                        "%.3f, cancelling maker before fill", maker[1], ask, edge_now, floor)
+                    try:
+                        await maker_venue.cancel_order(m.order_id)
+                    except Exception as exc:
+                        log.warning("maker cancel failed for %s: %s", m.order_id, exc)
+                    break
+        except asyncio.CancelledError:
+            confirm.cancel()
+            raise
+        # Whether we cancelled or not, the confirmation is authoritative: a cancel that
+        # raced a fill still reports the real filled amount (which we then hedge).
+        _, filled, avg = await confirm
+        return filled, avg
+
     async def execute_maker(self, opp: ArbOpportunity) -> ExecutionReport:
         """Capture an edge by RESTING the fee-heavy leg (``first_venue``, e.g. Kalshi)
         as a maker — no slippage, lower fee — then TAKING the deep leg (Polymarket) the
@@ -461,12 +514,19 @@ class Executor:
         filled = m.filled
         avg = m.avg_price
         if m.status is OrderStatus.RESTING and m.order_id:
-            # Confirm timeout slightly past the maker's expiry, so by the time it returns
-            # the order is terminal and ``filled`` is final (no late top-up fills).
-            _, filled, avg = await self.fill_confirmer.confirm(
-                m.venue, m.order_id, size, self.maker_timeout + 1.5)
+            if self.maker_poll > 0:
+                # Watch the taker while resting: cancel the maker if the taker drifts so the
+                # hedge could no longer lock the floor — don't let it fill into a loss.
+                filled, avg = await self._rest_with_drift_guard(
+                    m, maker, taker, maker_venue, taker_venue, maker_px, size, floor)
+            else:
+                # Confirm timeout slightly past the maker's expiry, so by the time it
+                # returns the order is terminal and ``filled`` is final.
+                _, filled, avg = await self.fill_confirmer.confirm(
+                    m.venue, m.order_id, size, self.maker_timeout + 1.5)
         if filled <= 1e-9:
-            return ExecutionReport(ExecStatus.SKIPPED, "maker unfilled — expired, no trade", [m])
+            return ExecutionReport(
+                ExecStatus.SKIPPED, "maker unfilled — expired/cancelled, no trade", [m])
 
         # ----- Maker filled -> take the deep hedge immediately (IOC) -----
         maker_leg = OrderResult(

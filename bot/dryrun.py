@@ -574,6 +574,7 @@ async def stream(
         maker_timeout=settings.exec_maker_timeout,
         maker_improvement=settings.exec_maker_improvement,
         maker_arm_cushion=settings.exec_maker_arm_cushion,
+        maker_poll=settings.exec_maker_poll,
     )
 
     venue_by_name = {v.name: v for v in venues}
@@ -711,11 +712,13 @@ async def stream(
                 "(STREAM_MIN_LEG_PRICE)", settings.stream_min_leg_price,
                 1.0 - settings.stream_min_leg_price)
     if settings.exec_maker_mode:
+        guard = (f"cancel-on-drift every {settings.exec_maker_poll:g}s"
+                 if settings.exec_maker_poll > 0 else "NO drift guard")
         log.warning("execution: MAKER mode — rest the %s leg as a maker (fire edges >= lock "
-                    "$%.2f + drift cushion $%.2f = $%.2f, %gs timeout), take the deep leg on "
-                    "fill (EXEC_MAKER_MODE/EXEC_MAKER_ARM_CUSHION)",
+                    "$%.2f + drift cushion $%.2f = $%.2f, %gs timeout, %s), take the deep leg "
+                    "on fill (EXEC_MAKER_MODE/EXEC_MAKER_ARM_CUSHION/EXEC_MAKER_POLL)",
                     "kalshi", min_edge, settings.exec_maker_arm_cushion, fire_threshold,
-                    settings.exec_maker_timeout)
+                    settings.exec_maker_timeout, guard)
     else:
         log.warning("execution: TAKER mode — only fire edges >= lock $%.2f + hedge $%.2f "
                     "= $%.2f; hedge leg gets $%.2f of fill room (EXEC_HEDGE_BUFFER)",
