@@ -140,6 +140,33 @@ def test_fight_decision_prop_not_a_winner():
     assert not are_complementary(k, p)
 
 
+def test_precision_rejects_cross_league_and_different_entities():
+    # Cross-league: a Valorant "Brazil" team is not the World Cup "Brazil".
+    kv = from_kalshi("KXVALORANTGAME-26JUN18TLELE-TL",
+                     "Will Team Liquid Brazil win the Valorant match? - Team Liquid Brazil")
+    pw = from_polymarket("atc-fwc-bra-hai-2026-06-19-bra",
+                         "Will Brazil win against Haiti in the World Cup match? - Brazil")
+    assert kv.league == "valorant" and pw.league == "soccer"
+    assert not are_complementary(kv, pw)
+    # Same surname, different first name (different player) -> reject.
+    k1 = from_kalshi("KXWCGOAL-26JUN15KSAURU-URURARAUJ4-1", "Ronald Araujo: 1+ goals - Ronald Araujo: 1+")
+    p1 = from_polymarket("astatc-fwc-ksa-uru-2026-06-15-goals-fwcmaxara-gte1",
+                         "Will Maximiliano Araujo record at least 1 goals in KSA vs URU? - Yes")
+    assert not are_complementary(k1, p1)
+    # Two teams sharing a dropped suffix ("Gaming") must not align.
+    kg = from_kalshi("KXDOTA2GAME-26JUN17LGDAMA-LGD", "Will LGD Gaming win - LGD Gaming")
+    pg = from_polymarket("aec-dota2-agm-lgd-2026-06-17", "Who will win ... Amaru Gaming vs LGD - Amaru Gaming")
+    assert not are_complementary(kg, pg)
+
+
+def test_precision_keeps_spelling_variant_same_player():
+    # Same player, surname spelled differently across venues -> still matches.
+    k = from_kalshi("KXWCGOAL-26JUN17X-UZBAFAYZ-1", "Abbosbek Fayzullaev: 1+ goals - Abbosbek Fayzullaev: 1+")
+    p = from_polymarket("astatc-fwc-x-2026-06-17-goals-y-gte1",
+                        "Will Abbosbek Fayzullayev record at least 1 goals in X vs Y? - Yes")
+    assert are_complementary(k, p)
+
+
 def test_first_goal_metric_matches_and_is_distinct():
     # "record the first goal" <-> "first to score": same event, distinct from a goal-COUNT
     # prop (so it can't false-match an anytime/N+ goals market).

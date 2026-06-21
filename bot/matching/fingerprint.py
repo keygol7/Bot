@@ -64,14 +64,42 @@ _KALSHI_SERIES_METRIC: list[tuple[str, str]] = [
     ("WINNER", "winner"), ("MONEYLINE", "winner"), ("RESULT", "winner"),
 ]
 
+# League/sport, extracted from the Kalshi series and the Polymarket slug. Two markets
+# in DIFFERENT leagues are not the same event even if they share a team token (a Valorant
+# "Brazil" team vs the World Cup "Brazil"; "Team Nemesis" in CS2 vs Dota2). First match
+# wins, so more specific needles precede generic ones.
+_LEAGUE_RULES: list[tuple[str, str]] = [
+    ("VALORANT", "valorant"), ("DOTA2", "dota2"), ("DOTA", "dota2"),
+    ("CS2", "cs2"), ("CSGO", "cs2"), ("LOL", "lol"), ("COD", "cod"),
+    ("UFC", "mma"), ("BELLATOR", "mma"), ("PFL", "mma"),
+    ("ATP", "tennis"), ("WTA", "tennis"), ("ITF", "tennis"), ("TENNIS", "tennis"),
+    ("WNBA", "basketball"), ("NBA", "basketball"),
+    ("MLB", "baseball"), ("NHL", "hockey"),
+    ("FWC", "soccer"), ("WCGOAL", "soccer"), ("WCAST", "soccer"), ("WCFTTS", "soccer"),
+    ("FIFA", "soccer"), ("SOCCER", "soccer"), ("WC", "soccer"),
+]
+
+
+def _league_of(text: str) -> str | None:
+    s = (text or "").upper()
+    for needle, league in _LEAGUE_RULES:
+        if needle in s:
+            return league
+    return None
+
+
 _DATE_IN_TICKER = re.compile(r"(\d{2}[A-Z]{3}\d{2})")     # e.g. 26JUN17
 _DATE_IN_SLUG = re.compile(r"(\d{4}-\d{2}-\d{2})")        # e.g. 2026-06-17
 _WORD = re.compile(r"[a-z0-9]+")
-# Very common stop-tokens in titles/outcomes that carry no entity signal.
+# Very common stop-tokens in titles/outcomes that carry no entity signal. Includes
+# generic org/club words ("gaming", "team", "fc", ...) that otherwise let two DIFFERENT
+# teams falsely align on a shared suffix (e.g. "LGD Gaming" vs "Amaru Gaming").
 _STOP = frozenset({
     "the", "to", "win", "wins", "winner", "vs", "v", "match", "game", "will",
     "score", "scores", "or", "and", "of", "a", "an", "at", "in", "on", "for",
     "yes", "no", "1", "2", "goals", "goal", "assist", "assists", "points", "point",
+    "be", "first",
+    "gaming", "esports", "team", "club", "fc", "sc", "cf", "united", "city", "afc",
 })
 
 
@@ -139,6 +167,7 @@ class ContractFingerprint:
     threshold: int | None        # player-prop count (1+, 2+) or None
     subject: frozenset           # normalized YES-outcome entity tokens
     date: float | None           # event date (epoch), if parseable
+    league: str | None = None    # sport/league (valorant/soccer/...), if identifiable
 
     @property
     def matchable(self) -> bool:
@@ -173,6 +202,7 @@ def from_kalshi(ticker: str, title: str, yes_sub_title: str = "",
     return ContractFingerprint(
         venue="kalshi", metric=metric, scope=_scope_only(title),
         threshold=_threshold_int(title), subject=subject, date=date,
+        league=_league_of(kalshi_series(ticker)),
     )
 
 
@@ -198,22 +228,44 @@ def from_polymarket(slug: str, title: str, end_date: str | None = None,
     return ContractFingerprint(
         venue="polymarket_us", metric=metric, scope=_scope_only(title),
         threshold=_threshold_int(title), subject=subject, date=date,
+        league=_league_of(slug),
     )
 
 
+def _common_prefix_len(x: str, y: str) -> int:
+    n = 0
+    for cx, cy in zip(x, y):
+        if cx != cy:
+            break
+        n += 1
+    return n
+
+
+def _token_matches(x: str, large: frozenset) -> bool:
+    """A token matches one in ``large`` if it's present, one is a >=3-char prefix of the
+    other (team-code vs full-name, 'nor'/'norway'), or they share a >=5-char common
+    prefix (spelling variants: 'fayzullaev'/'fayzullayev'). Different names with no shared
+    prefix ('ronald' vs 'maximiliano') do NOT match."""
+    for y in large:
+        if x == y:
+            return True
+        if len(x) >= 3 and (y.startswith(x) or x.startswith(y)):
+            return True
+        if _common_prefix_len(x, y) >= 5:
+            return True
+    return False
+
+
 def _subjects_align(a: frozenset, b: frozenset) -> bool:
-    """The YES outcomes refer to the same entity. Exact token overlap, or a shared
-    distinctive prefix (handles 'nor'/'norway', team-code vs full-name)."""
+    """The YES outcomes refer to the same entity. The SMALLER (cleaner) subject must be
+    fully covered by the larger — every one of its tokens matches. A single shared token
+    is NOT enough, so two different multi-token entities that share one word (different
+    players 'Ronald Araujo' vs 'Maximiliano Araujo', or teams sharing a dropped suffix)
+    no longer falsely align."""
     if not a or not b:
         return False
-    if a & b:
-        return True
-    for x in a:
-        for y in b:
-            lo, hi = (x, y) if len(x) <= len(y) else (y, x)
-            if len(lo) >= 3 and hi.startswith(lo):
-                return True
-    return False
+    small, large = (a, b) if len(a) <= len(b) else (b, a)
+    return all(_token_matches(x, large) for x in small)
 
 
 def complement_reason(a: ContractFingerprint, b: ContractFingerprint,
@@ -225,6 +277,8 @@ def complement_reason(a: ContractFingerprint, b: ContractFingerprint,
         return f"b-{b.metric}"
     if a.metric != b.metric:
         return f"metric {a.metric}!={b.metric}"
+    if a.league and b.league and a.league != b.league:
+        return f"league {a.league}!={b.league}"
     if a.scope != b.scope:
         return f"scope {sorted(a.scope)}!={sorted(b.scope)}"
     if a.threshold != b.threshold:
