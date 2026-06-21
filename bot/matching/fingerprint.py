@@ -42,6 +42,9 @@ _UNKNOWN = "unknown"
 # Player-prop stat metrics — these carry the entity in the question ("Will <Player>
 # record N+ <stat>"), so the Yes-outcome subject may be recovered from the question.
 _STAT_METRICS = frozenset({"goals", "assists", "ga", "points", "saves", "shots"})
+# Metrics whose YES subject lives in the QUESTION (not the Yes/No suffix): the stat
+# props plus first-to-score ("Will <Team> be the first to score a goal? - Yes").
+_QUESTION_SUBJECT_METRICS = _STAT_METRICS | {"first_goal"}
 
 # Kalshi encodes the market type in the series token (more reliable than the title).
 # Classify EVERY series into a canonical metric — including an explicit unmatchable
@@ -75,6 +78,11 @@ _STOP = frozenset({
 def _title_metric(title: str) -> str:
     """Metric inferred from a free-text title: a stat prop, else moneyline winner."""
     t = (title or "").lower()
+    # First-to-score: a DISTINCT metric, checked before the goal-count rules so "the
+    # first goal" isn't folded into "goals" (which would falsely match an anytime-goal
+    # or N+ goals prop). "Will <Team> record the first goal" / "be the first to score".
+    if re.search(r"\bfirst goal\b|first to score|record the first goal|opening goal", t):
+        return "first_goal"
     for name, pat in _METRIC_RULES:
         if re.search(pat, t):
             return "ga" if name == "ga" else name
@@ -145,6 +153,11 @@ def _threshold_int(title: str) -> int | None:
 def from_kalshi(ticker: str, title: str, yes_sub_title: str = "",
                 close_time: float | None = None) -> ContractFingerprint:
     metric = kalshi_metric(ticker)
+    # First-goal markets carry "GOAL" in the series (-> goals), but the title says "the
+    # first goal", which is a DIFFERENT proposition from a goal-count prop. The title is
+    # decisive here, so it overrides the series classification.
+    if _title_metric(title) == "first_goal":
+        metric = "first_goal"
     date = close_time
     if date is None:
         m = _DATE_IN_TICKER.search(ticker)
@@ -174,7 +187,7 @@ def from_polymarket(slug: str, title: str, end_date: str | None = None,
         if m:
             date = parse_iso8601(m.group(1))
     subject = _subject_tokens(outcome) or _subject_tokens(_outcome_from_title(title))
-    if not subject and metric in _STAT_METRICS:
+    if not subject and metric in _QUESTION_SUBJECT_METRICS:
         # Player props read "Will <Player> record N+ <stat> in A vs B? - Yes": the
         # entity is in the question, not the Yes/No suffix. Restricted to stat metrics:
         # a "A vs B end before round 3? - Yes" matchup has no clean YES side (the

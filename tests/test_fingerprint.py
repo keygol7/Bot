@@ -127,3 +127,29 @@ def test_unfingerprintable_fails_closed():
     p = from_polymarket("weird-slug", "unrelated novelty", end_date=None)
     assert not k.matchable and not p.matchable
     assert not are_complementary(k, p)
+
+
+def test_fight_decision_prop_not_a_winner():
+    # Kalshi "will X win" must NOT match Polymarket "go to a decision" (different event).
+    k = from_kalshi("KXUFCFIGHT-26JUN20BAGMAG-BAG",
+                    "Will Melsik Baghdasaryan win the fight? - Melsik Baghdasaryan")
+    p = from_polymarket("astatc-ufc-melbag-murmag-2026-06-20-rov-dec",
+                        "Will Melsik Baghdasaryan vs. Murtazali Magomedov go to a "
+                        "decision, draw, or no contest? - Yes")
+    assert k.metric == "winner" and p.metric == "unmatchable"
+    assert not are_complementary(k, p)
+
+
+def test_first_goal_metric_matches_and_is_distinct():
+    # "record the first goal" <-> "first to score": same event, distinct from a goal-COUNT
+    # prop (so it can't false-match an anytime/N+ goals market).
+    k = from_kalshi("KXFIRSTGOAL-26JUN18KORMEX-KOR",
+                    "Will Korea Republic record the first goal of the game? - Korea Republic")
+    p = from_polymarket("first-goal-kor-mex-2026-06-18",
+                        "Will Korea Republic be the first to score a goal? - Yes",
+                        end_date="2026-06-18")
+    assert k.metric == "first_goal" and p.metric == "first_goal"
+    assert are_complementary(k, p)
+    # Must differ from a 2+ goals count prop for the same team:
+    k2 = from_kalshi("KXWCGOAL-26JUN18KORMEX-KOR2", "Korea Republic: 2+ goals - Korea Republic: 2+")
+    assert not are_complementary(p, k2)

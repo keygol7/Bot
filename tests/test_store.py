@@ -45,6 +45,22 @@ def test_record_edge_observation():
     s.close()
 
 
+def test_confirmed_pairs_fingerprint_recovers_llm_rejected_complement():
+    # A real same-event winner pair the local LLM WRONGLY marked not-same-event. The
+    # fingerprint-as-matcher must recover it; the old LLM-gated filter drops it.
+    s = Store(":memory:")
+    s.upsert_market("kalshi", "KXDOTA2GAME-26JUN21MODUSNAVI-NAVI",
+                    "Will Natus Vincere win the MODUS vs. Natus Vincere Dota 2 match? - Natus Vincere")
+    s.upsert_market("polymarket_us", "aec-dota2-navi-modus-2026-06-21",
+                    "Who will win in the upcoming esports event Natus Vincere vs MODUS - Natus Vincere")
+    s.cache_verdict("kalshi", "KXDOTA2GAME-26JUN21MODUSNAVI-NAVI",
+                    "polymarket_us", "aec-dota2-navi-modus-2026-06-21",
+                    same_event=False, confidence=0.2)        # LLM said NOT same-event
+    assert s.confirmed_pairs() == []                          # LLM-gated filter drops it
+    assert len(s.confirmed_pairs(use_fingerprint=True)) == 1  # fingerprint recovers it
+    s.close()
+
+
 def test_verdict_cache_is_order_independent():
     s = Store(":memory:")
     s.cache_verdict(

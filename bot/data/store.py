@@ -288,15 +288,29 @@ class Store:
            market maps to many counterparties (see :func:`drop_fanout_pairs`). Pass
            ``None`` to disable.
         """
-        rows = self.conn.execute(
-            """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b, v.event_key,
-                      ma.title AS title_a, mb.title AS title_b
-               FROM match_verdicts v
-               LEFT JOIN markets ma ON ma.venue=v.venue_a AND ma.market_id=v.market_a
-               LEFT JOIN markets mb ON mb.venue=v.venue_b AND mb.market_id=v.market_b
-               WHERE v.same_event=1 AND v.confidence >= ?""",
-            (min_confidence,),
-        ).fetchall()
+        if use_fingerprint:
+            # Fingerprint is AUTHORITATIVE: consider every cached candidate pair (from
+            # the embedding shortlist), not just the LLM's same_event=1 set. The
+            # deterministic fingerprint (same matchable metric/scope/threshold/subject/
+            # date) is the matcher, so it recovers real pairs the over-conservative local
+            # LLM wrongly rejected (e.g. "record the first goal" vs "first to score").
+            rows = self.conn.execute(
+                """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b, v.event_key,
+                          ma.title AS title_a, mb.title AS title_b
+                   FROM match_verdicts v
+                   LEFT JOIN markets ma ON ma.venue=v.venue_a AND ma.market_id=v.market_a
+                   LEFT JOIN markets mb ON mb.venue=v.venue_b AND mb.market_id=v.market_b"""
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b, v.event_key,
+                          ma.title AS title_a, mb.title AS title_b
+                   FROM match_verdicts v
+                   LEFT JOIN markets ma ON ma.venue=v.venue_a AND ma.market_id=v.market_a
+                   LEFT JOIN markets mb ON mb.venue=v.venue_b AND mb.market_id=v.market_b
+                   WHERE v.same_event=1 AND v.confidence >= ?""",
+                (min_confidence,),
+            ).fetchall()
         if use_fingerprint:
             from bot.matching.fingerprint import (
                 are_complementary, from_kalshi, from_polymarket,
