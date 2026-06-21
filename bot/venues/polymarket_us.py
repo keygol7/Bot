@@ -358,6 +358,7 @@ def normalize_book(
         yes_ask_size=yes_ask_size,
         no_ask=no_ask,
         no_ask_size=no_ask_size,
+        state=market_data.get("state"),   # MARKET_STATE_OPEN / SUSPENDED / ... (for the gate)
     )
 
 

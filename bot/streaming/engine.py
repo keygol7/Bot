@@ -54,6 +54,11 @@ class LiveBook:
 
 
 class StreamingEngine:
+    # Only a market in this state is tradeable; anything else (suspended, halted,
+    # pre-open, closing auction, expired, terminated, or a Kalshi non-active lifecycle)
+    # would reject or settle against us, so we don't fire on it.
+    _OPEN_STATE = "MARKET_STATE_OPEN"
+
     def __init__(
         self,
         *,
@@ -92,6 +97,10 @@ class StreamingEngine:
         self._backoff_until: dict[tuple, float] = {}
         self._backoff_base = 60.0               # first penalty after a failed attempt
         self._backoff_cap = 1800.0              # max 30 min between retries
+        # Latest known market state per (venue, market_id): from Polymarket's marketData
+        # `state` (carried on the quote) and Kalshi's lifecycle channel. Used to skip
+        # firing into a non-OPEN (halted/suspended/pre-open/settled) market.
+        self._market_state: dict[tuple[str, str], str] = {}
 
     def _fee(self, venue: str) -> FeeModel:
         return self.fee_models.get(venue, ZeroFeeModel())
@@ -132,6 +141,22 @@ class StreamingEngine:
             self.livebook.get(p.venue_a, p.market_a),
             self.livebook.get(p.venue_b, p.market_b),
         )
+
+    def set_market_state(self, venue: str, market_id: str, state: str | None) -> None:
+        """Record a market's latest state (from a Polymarket quote or the Kalshi
+        lifecycle channel). ``None`` clears it back to unknown."""
+        if state:
+            self._market_state[(venue, market_id)] = state
+        else:
+            self._market_state.pop((venue, market_id), None)
+
+    def _quote_open(self, q) -> bool:
+        """Whether this leg's market is tradeable: OPEN, or unknown (no state seen yet
+        -> don't block, so a venue we lack state for still trades). A KNOWN non-OPEN
+        state blocks the fire. Prefers the quote's own state, falling back to the
+        last-seen state map (which the Kalshi lifecycle channel feeds)."""
+        state = getattr(q, "state", None) or self._market_state.get((q.venue, q.market_id))
+        return state is None or state == self._OPEN_STATE
 
     def _ws_book_fresh(self, yq, nq) -> bool:
         """True when BOTH crossing legs have a recent, sized WS quote — so the live
@@ -215,6 +240,13 @@ class StreamingEngine:
         else:
             log.info("STREAM %s: edge %.4f from fresh WS book (sz %g) -> executing",
                      p.event_key, edge, size)
+        # State guard: never fire into a non-OPEN market (halted/suspended/pre-open/
+        # closing-auction/settled) — it would reject or settle against us.
+        if not (self._quote_open(yq) and self._quote_open(nq)):
+            log.info("STREAM %s: skip — leg not OPEN (%s=%s %s=%s)", p.event_key,
+                     yq.venue, self._market_state.get((yq.venue, yq.market_id)) or yq.state,
+                     nq.venue, self._market_state.get((nq.venue, nq.market_id)) or nq.state)
+            return None
         opp = self._build_opp(p, edge, yq, nq, size)
         log.info("STREAM edge %.4f sz %g on %s -> executing", edge, size, p.event_key)
         report = await self._execute_guarded(opp)
@@ -264,6 +296,8 @@ class StreamingEngine:
         re-firing the same pair on every tick.
         """
         self.livebook.update(q)
+        if getattr(q, "state", None):
+            self._market_state[(q.venue, q.market_id)] = q.state
         report = None
         for key in self._index.get((q.venue, q.market_id), ()):
             r = await self._act_on_pair(key)

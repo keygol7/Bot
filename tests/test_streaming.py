@@ -324,6 +324,38 @@ def test_rejected_pair_backs_off_then_retries():
     assert fe.calls == 2
 
 
+def test_skips_when_a_leg_is_not_open():
+    # The Polymarket leg reports a non-OPEN state on its quote -> don't fire.
+    fe = FakeExec()
+    eng = make_engine(fe)
+    pa = q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)
+    pa.state = "MARKET_STATE_HALTED"
+    asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)))
+    asyncio.run(eng.on_quote(pa))
+    assert fe.calls == []                          # halted leg -> skipped
+
+
+def test_skips_when_lifecycle_marks_leg_not_open():
+    # Kalshi's ticker carries no state; the lifecycle channel feeds it via
+    # set_market_state. A terminated market must block the fire.
+    fe = FakeExec()
+    eng = make_engine(fe)
+    eng.set_market_state("kalshi", "K1", "MARKET_STATE_TERMINATED")
+    asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)))
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)))
+    assert fe.calls == []
+
+
+def test_open_state_still_trades():
+    fe = FakeExec()
+    eng = make_engine(fe)
+    pa = q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)
+    pa.state = "MARKET_STATE_OPEN"
+    asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)))
+    asyncio.run(eng.on_quote(pa))
+    assert len(fe.calls) == 1                       # OPEN (poly) + unknown (kalshi) -> trades
+
+
 def test_consume_counts_ws_quotes_for_health():
     # The WS-health heartbeat: _consume must count each tick per venue so the run
     # loop can report whether a venue's WebSocket is actually delivering data.

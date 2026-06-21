@@ -203,6 +203,7 @@ def test_polymarket_book_normalization_uses_real_qty():
     # Buy NO by crossing the best (highest) bid 0.55 -> no_ask = 0.45, size 1000.
     assert round(q.no_ask, 6) == 0.45 and q.no_ask_size == 1000
     assert q.event_key == "E9"
+    assert q.state == "MARKET_STATE_OPEN"          # captured for the state guard
 
 
 def test_polymarket_book_one_sided():
