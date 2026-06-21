@@ -436,7 +436,7 @@ class PolymarketUSVenue:
         self._gateway_client = None  # public reads
         self._api_client = None      # authenticated trading (later)
         self._key = None
-        self._limiter = AsyncRateLimiter(rate_per_min)
+        self._limiter = AsyncRateLimiter(getattr(cfg, "read_rate_per_min", None) or rate_per_min)
         # Per-slug order constraints (orderPriceMinTickSize / minimumTradeQty) captured
         # during scan_quotes, so place_order can round price/qty to valid increments
         # without a hot-path fetch. The docs warn NOT to infer these from slug/type.

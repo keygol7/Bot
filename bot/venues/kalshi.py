@@ -310,7 +310,7 @@ class KalshiVenue:
         self._client = None  # lazy httpx.AsyncClient
         self._private_key = None
         self._base_path = urlsplit(cfg.api_base).path.rstrip("/")  # e.g. /trade-api/v2
-        self._limiter = AsyncRateLimiter(rate_per_min)
+        self._limiter = AsyncRateLimiter(getattr(cfg, "read_rate_per_min", None) or rate_per_min)
 
     @property
     def authenticated(self) -> bool:

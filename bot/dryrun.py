@@ -460,35 +460,44 @@ async def build_watchlist(cached, scanned, venues, store=None):
         for (vn, mid) in ((va, ma), (vb, mb))
         if (vn, mid) not in live
     }
-    for (vn, mid) in to_probe:
+    # Probe the cached legs CONCURRENTLY (bounded): one-at-a-time is the dominant cost of a
+    # refresh cycle. The per-venue token-bucket limiter paces the actual HTTP, so this just
+    # overlaps the waiting. Each probe returns a verdict we apply after the gather.
+    _probe_sem = asyncio.Semaphore(16)
+
+    async def _probe(vn, mid):
         v = venue_by_name.get(vn)
         if v is None:
-            continue
-        is_open = getattr(v, "is_open", None)
-        if is_open is not None:
-            # Liveness by market STATUS, not book depth: keep open-but-illiquid
-            # pre-match markets (empty book now, two-sided near game time) and drop
-            # only CONFIRMED closed/settled ones. Unknown status -> keep (don't repeat
-            # the regression of dropping live markets on uncertainty).
-            try:
-                ok = await is_open(mid)
-            except Exception as exc:
-                log.info("watchlist status probe %s:%s failed (%s)", vn, mid, exc)
-                ok = None
-            if ok is False:
-                log.info("watchlist drop %s:%s — market closed/settled", vn, mid)
-                settled.append((vn, mid))
-                continue
-            live.add((vn, mid))
-        else:
+            return vn, mid, "skip"
+        async with _probe_sem:
+            is_open = getattr(v, "is_open", None)
+            if is_open is not None:
+                # Liveness by market STATUS, not book depth: keep open-but-illiquid
+                # pre-match markets (empty book now, two-sided near game time) and drop
+                # only CONFIRMED closed/settled ones. Unknown status -> keep (don't repeat
+                # the regression of dropping live markets on uncertainty).
+                try:
+                    ok = await is_open(mid)
+                except Exception as exc:
+                    log.info("watchlist status probe %s:%s failed (%s)", vn, mid, exc)
+                    ok = None
+                if ok is False:
+                    log.info("watchlist drop %s:%s — market closed/settled", vn, mid)
+                    return vn, mid, "settled"
+                return vn, mid, "live"
             # Fallback (venues without is_open): any answered quote counts as live.
             try:
                 q = await v.fetch_quote(RawMarket(market_id=mid, title="", raw={}))
             except Exception as exc:
                 log.info("watchlist probe %s:%s not live (%s)", vn, mid, exc)
-                continue
-            if q is not None:
-                live.add((vn, mid))
+                return vn, mid, "skip"
+            return vn, mid, ("live" if q is not None else "skip")
+
+    for vn, mid, status in await asyncio.gather(*(_probe(vn, mid) for (vn, mid) in to_probe)):
+        if status == "live":
+            live.add((vn, mid))
+        elif status == "settled":
+            settled.append((vn, mid))
 
     # Settled markets are terminal — prune them (and their verdicts) so the cache
     # stays focused on live events and we don't re-probe dead markets next cycle.

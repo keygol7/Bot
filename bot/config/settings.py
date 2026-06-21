@@ -61,6 +61,10 @@ class KalshiConfig:
     private_key_path: str = "secrets/kalshi_private_key.pem"
     api_base: str = "https://api.elections.kalshi.com/trade-api/v2"
     ws_base: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+    # Read request budget (req/min). Kalshi's basic tier allows ~10 reads/sec; 240 (4/s)
+    # is a safe default well under that. Raise toward your account's real tier for a faster
+    # watchlist refresh; lower it if you see HTTP 429s.
+    read_rate_per_min: float = 240.0
 
 
 @dataclass
@@ -75,6 +79,9 @@ class QcexConfig:
     secret_key: str = ""                                   # raw base64 secret (preferred)
     ed25519_private_key_path: str = "secrets/qcex_ed25519.pem"  # PEM fallback
     use_sandbox: bool = False
+    # Read request budget (req/min) for the public gateway. 300 (5/s) is a safe default;
+    # raise toward the gateway's real limit for a faster refresh, lower it on HTTP 429s.
+    read_rate_per_min: float = 300.0
 
     @property
     def is_trading_configured(self) -> bool:
@@ -206,6 +213,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
             private_key_path=env("KALSHI_API_PRIVATE_KEY_PATH", KalshiConfig.private_key_path),
             api_base=env("KALSHI_API_BASE", KalshiConfig.api_base),
             ws_base=env("KALSHI_WS_BASE", KalshiConfig.ws_base),
+            read_rate_per_min=_env_float("KALSHI_READ_RATE_PER_MIN", KalshiConfig.read_rate_per_min),
         ),
         qcex=QcexConfig(
             gateway_base=env("QCEX_GATEWAY_BASE", QcexConfig.gateway_base),
@@ -218,6 +226,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
                 "QCEX_ED25519_PRIVATE_KEY_PATH", QcexConfig.ed25519_private_key_path
             ),
             use_sandbox=(env("QCEX_USE_SANDBOX", "false") or "false").lower() == "true",
+            read_rate_per_min=_env_float("QCEX_READ_RATE_PER_MIN", QcexConfig.read_rate_per_min),
         ),
         llm=LLMConfig(
             base_url=env("LLM_BASE_URL", LLMConfig.base_url),
