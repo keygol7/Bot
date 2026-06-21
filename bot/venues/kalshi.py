@@ -19,12 +19,12 @@ import base64
 import logging
 import time
 import uuid
-from typing import Any, AsyncIterator, NamedTuple, Optional
+from typing import Any, AsyncIterator, ClassVar, NamedTuple, Optional
 from urllib.parse import urlsplit
 
 from bot.execution.orders import OrderResult, OrderStatus
 from bot.fees import KalshiFeeModel
-from bot.models import MarketQuote, PriceLevel, Side
+from bot.models import MarketQuote, Side
 from bot.timeutil import parse_iso8601
 from bot.venues.base import OrderNotPermitted, RawMarket
 from bot.venues.ratelimit import AsyncRateLimiter
@@ -526,7 +526,7 @@ class KalshiVenue:
                 backoff = min(backoff * 2, 30.0)
 
     # tif -> V2 time_in_force enum (GTT is internal-only and not a valid API value).
-    _TIF_V2 = {
+    _TIF_V2: ClassVar[dict[str, str]] = {
         "fill_or_kill": "fill_or_kill",
         "immediate_or_cancel": "immediate_or_cancel",
         "gtc": "good_till_canceled",

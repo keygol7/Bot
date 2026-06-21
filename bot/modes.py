@@ -29,4 +29,4 @@ class RunMode(str, Enum):
             raise ValueError(
                 f"Unknown run mode {value!r}; expected one of "
                 f"{', '.join(m.value for m in cls)}"
-            )
+            ) from None

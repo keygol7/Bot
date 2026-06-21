@@ -10,7 +10,7 @@ in-memory state, so it is fully unit-testable without network or credentials.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass

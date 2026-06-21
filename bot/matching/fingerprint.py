@@ -327,7 +327,7 @@ def from_polymarket(slug: str, title: str, end_date: str | None = None,
 
 def _common_prefix_len(x: str, y: str) -> int:
     n = 0
-    for cx, cy in zip(x, y):
+    for cx, cy in zip(x, y, strict=False):
         if cx != cy:
             break
         n += 1

@@ -244,7 +244,7 @@ class Executor:
         if self.max_order_contracts and self.max_order_contracts > 0:
             caps["order_cap"] = float(self.max_order_contracts)
 
-        return int(math.floor(max(0.0, min(caps.values())))), caps
+        return math.floor(max(0.0, min(caps.values()))), caps
 
     def _leg_limits(self, opp: ArbOpportunity, first_side, second_side) -> tuple[float, float]:
         """Limit prices for the (first, second) legs that may pay worse than the quoted
@@ -576,8 +576,8 @@ class Executor:
     # ---- outcomes ----
     def _settle_success(self, opp, size, legs) -> ExecutionReport:
         # Identify the legs by side (the placement order may put the NO leg first).
-        yes_leg = next(l for l in legs if l.side is Side.YES)
-        no_leg = next(l for l in legs if l.side is Side.NO)
+        yes_leg = next(leg for leg in legs if leg.side is Side.YES)
+        no_leg = next(leg for leg in legs if leg.side is Side.NO)
         ya = yes_leg.avg_price if yes_leg.avg_price is not None else opp.yes_price
         na = no_leg.avg_price if no_leg.avg_price is not None else opp.no_price
         fees = self._fee(yes_leg.venue).fee(ya, size) + self._fee(no_leg.venue).fee(na, size)
@@ -656,7 +656,7 @@ class Executor:
     def _halt(self, reason: str, legs: list[OrderResult]) -> ExecutionReport:
         self.risk.trip_kill_switch(f"executor halt: {reason}")
         if self.store is not None:
-            self.store.audit("execute_halt", {"reason": reason, "legs": [str(l) for l in legs]})
+            self.store.audit("execute_halt", {"reason": reason, "legs": [str(leg) for leg in legs]})
         log.critical("HALT: %s", reason)
         return ExecutionReport(ExecStatus.HALTED, reason, legs)
 

@@ -71,7 +71,7 @@ def candidate_pairs(
 
 def cosine(u: list[float], v: list[float]) -> float:
     """Cosine similarity of two vectors, in [-1, 1] (0 if either is zero-length)."""
-    dot = sum(a * b for a, b in zip(u, v))
+    dot = sum(a * b for a, b in zip(u, v, strict=False))
     nu = math.sqrt(sum(a * a for a in u))
     nv = math.sqrt(sum(b * b for b in v))
     if nu == 0 or nv == 0:

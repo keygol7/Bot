@@ -23,6 +23,26 @@ dev = [
     "pytest>=8",
 ]
 
+[tool.ruff]
+# The codebase deliberately uses wide, prose-heavy lines (explanatory comments inline
+# with money-critical logic). 100 matches the house style; without this, ruff's 88
+# default floods E501 false positives and hides the real findings.
+line-length = 100
+
+[tool.ruff.lint]
+# Defaults (E, F) plus a few high-signal bug/cleanliness families.
+extend-select = ["B", "SIM", "RUF", "C4", "PIE"]
+ignore = [
+    "RUF015",  # next(iter(x)) over x[0] — x[0] is clearer here
+    "SIM118",  # `k in dict.keys()` — explicit and readable
+    "RUF001",  # ambiguous unicode (the en dash in the scoreline regex is intentional)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately assign lambdas (fakes), import after a docstring-demo, use short
+# throwaway names, and build fixtures in ways the bug-bear rules dislike.
+"tests/*" = ["E731", "E402", "E741", "E702", "B", "SIM105", "RUF059"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

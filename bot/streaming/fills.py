@@ -9,6 +9,7 @@ of depending on the synchronous REST response shape.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 
 from bot.execution.orders import OrderStatus
@@ -70,10 +71,8 @@ class FillTracker:
             return st.terminal is not None or st.filled >= requested - 1e-9
 
         async with st.cond:
-            try:
+            with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(st.cond.wait_for(done), timeout)
-            except asyncio.TimeoutError:
-                pass
             return self._classify(st, requested), st.filled, st.avg_px
 
     @staticmethod

@@ -27,7 +27,7 @@ class FeeModel(Protocol):
 class ZeroFeeModel:
     """No trading fee (Polymarket US standard markets)."""
 
-    def fee(self, price: float, contracts: float) -> float:  # noqa: ARG002
+    def fee(self, price: float, contracts: float) -> float:
         return 0.0
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic

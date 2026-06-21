@@ -97,7 +97,6 @@ def test_fingerprint_sweep_drops_past_events():
     # Settled games linger in the table (never pruned). The sweep must drop a pair whose
     # EVENT date is in the past while keeping a future-dated live pair, using the
     # fingerprint's parsed date (not updated_at, which the streamer doesn't refresh).
-    import time as _t
     from datetime import datetime, timedelta, timezone
 
     s = Store(":memory:")

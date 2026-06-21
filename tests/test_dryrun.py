@@ -681,7 +681,6 @@ def test_compare_filters_reports_adds(capsys, tmp_path):
 def test_run_cycle_fingerprint_gate_skips_novelty(capsys):
     # With use_fingerprint, the discovery cycle must NOT confirm a KXWCMENTION novelty
     # cross-product (unmatchable metric), but MUST still confirm a real winner pair.
-    import asyncio as _asyncio
 
     mention_k = mq("kalshi", "KXWCMENTION-26JUN22NORSEN-SHUT",
                    "Norway vs Senegal - Shutout", yes_ask=0.21, yes_ask_size=100,

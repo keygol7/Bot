@@ -4,7 +4,7 @@ import asyncio
 
 from bot.fees import ZeroFeeModel
 from bot.models import MarketQuote
-from bot.streaming.engine import ConfirmedPair, LiveBook, StreamingEngine
+from bot.streaming.engine import ConfirmedPair, StreamingEngine
 
 
 class FakeExec:

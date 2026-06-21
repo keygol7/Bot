@@ -8,6 +8,7 @@ type also models PARTIAL/REJECTED/ERROR defensively.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -71,10 +72,8 @@ def order_error_result(venue, market_id, side, action, contracts, exc) -> "Order
     code = getattr(resp, "status_code", None)
     if isinstance(code, int) and 400 <= code < 500:
         body = None
-        try:
+        with contextlib.suppress(Exception):
             body = resp.text[:500]
-        except Exception:
-            pass
         return OrderResult(venue, market_id, side, action, contracts,
                            status=OrderStatus.REJECTED,
                            raw={"http_status": code, "body": body, "error": str(exc)})

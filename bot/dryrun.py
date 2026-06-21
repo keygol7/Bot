@@ -1208,7 +1208,7 @@ def diagnose_event(settings: Settings, needle: str, limit: int = 80) -> int:
             if not hits and not near:
                 print("    -> NO complement or same-metric market on the other venue "
                       "(coverage gap: the counterpart isn't scanned / doesn't exist)")
-            for reason, m in hits[:6]:
+            for _reason, m in hits[:6]:
                 v = store.get_verdict(a["venue"], a["market_id"], m["venue"], m["market_id"])
                 cached = (f"cached same_event={v['same_event']}" if v else "NOT cached")
                 print(f"    ✓ ok                  [{cached}]  [{m['venue']}] "
