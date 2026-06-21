@@ -154,6 +154,35 @@ def _subject_tokens(text: str) -> frozenset[str]:
     )
 
 
+# Template / sport / scheduling filler that surrounds the two teams in a matchup title
+# ("Who will win in the upcoming <sport> event A vs B scheduled for <Month> ... UTC?",
+# "Will <Y> win the A vs B professional MMA fight ...?"). Stripped so the matchup reduces
+# to just the team/player tokens. Tournament place-names can't all be listed, but the
+# subset alignment tolerates residue in the LARGER set, so only the common words matter.
+_MATCHUP_STOP = _STOP | {
+    "who", "upcoming", "event", "scheduled", "professional", "fight", "mma", "round",
+    "matches", "stage", "group", "qualifiers", "challenger", "final", "semifinal",
+    "quarterfinal", "playoff", "playoffs", "series", "leg",
+    "basketball", "tennis", "soccer", "football", "baseball", "hockey", "esports",
+    "dota", "valorant", "cod", "cs2", "lol", "mlb", "nba", "wnba", "nhl", "nfl", "ufc",
+    "utc", "et", "am", "pm", "edt", "est",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+}
+
+
+def _matchup_tokens(title: str) -> frozenset[str]:
+    """Both teams/players of a matchup title (pre-' - '), minus template/sport filler.
+    Used to tell two DIFFERENT games of the same team apart (same YES team, different
+    opponent), which the YES-only subject cannot."""
+    head = (title or "").rsplit(" - ", 1)[0]
+    return frozenset(
+        w for w in _WORD.findall(head.lower())
+        if w not in _MATCHUP_STOP and not w.isdigit() and len(w) > 1
+    )
+
+
 def _outcome_from_title(title: str) -> str:
     """The disambiguating outcome both venues append as ' - <outcome>'."""
     return title.rsplit(" - ", 1)[1] if title and " - " in title else (title or "")
@@ -168,6 +197,7 @@ class ContractFingerprint:
     subject: frozenset           # normalized YES-outcome entity tokens
     date: float | None           # event date (epoch), if parseable
     league: str | None = None    # sport/league (valorant/soccer/...), if identifiable
+    matchup: frozenset = frozenset()  # BOTH teams of a winner market (game disambiguation)
 
     @property
     def matchable(self) -> bool:
@@ -203,6 +233,7 @@ def from_kalshi(ticker: str, title: str, yes_sub_title: str = "",
         venue="kalshi", metric=metric, scope=_scope_only(title),
         threshold=_threshold_int(title), subject=subject, date=date,
         league=_league_of(kalshi_series(ticker)),
+        matchup=_matchup_tokens(title) if metric == "winner" else frozenset(),
     )
 
 
@@ -229,6 +260,7 @@ def from_polymarket(slug: str, title: str, end_date: str | None = None,
         venue="polymarket_us", metric=metric, scope=_scope_only(title),
         threshold=_threshold_int(title), subject=subject, date=date,
         league=_league_of(slug),
+        matchup=_matchup_tokens(title) if metric == "winner" else frozenset(),
     )
 
 
@@ -254,6 +286,19 @@ def _token_matches(x: str, large: frozenset) -> bool:
         if _common_prefix_len(x, y) >= 5:
             return True
     return False
+
+
+def _matchup_conflict(a: frozenset, b: frozenset) -> bool:
+    """Two winner matchups name DIFFERENT games. Both share the YES team; the discriminator
+    is the OPPONENT. Reject only on a clear, MUTUAL mismatch: each side has a substantial
+    (>=4 char) team token absent from the other. Short abbreviations ('NY', 'LA') are
+    ignored, so an abbreviated venue title ('Cloud9 NY') still matches its spelled-out
+    counterpart ('Cloud9 New York') — only full opponent names that genuinely differ
+    (Las Vegas vs Golden State) trip it. Biased toward KEEP; the date gate is the other
+    line of defense for different-day games."""
+    a_only = [x for x in a if not _token_matches(x, b) and len(x) >= 4]
+    b_only = [x for x in b if not _token_matches(x, a) and len(x) >= 4]
+    return bool(a_only) and bool(b_only)
 
 
 def _subjects_align(a: frozenset, b: frozenset) -> bool:
@@ -285,6 +330,13 @@ def complement_reason(a: ContractFingerprint, b: ContractFingerprint,
         return f"threshold {a.threshold}!={b.threshold}"
     if a.date is not None and b.date is not None and abs(a.date - b.date) > max_gap_days * 86400:
         return "date gap"
+    # Same team, different game: a winner market names BOTH sides ("A vs B"), so when both
+    # fingerprints carry a matchup with clearly different OPPONENTS, reject. The date
+    # tolerance (max_gap_days) that legit cross-venue matches need is wide enough to admit
+    # two different games of the same team within the window (and doubleheaders share a
+    # date outright), so the date check alone can't separate them — this can.
+    if a.metric == "winner" and a.matchup and b.matchup and _matchup_conflict(a.matchup, b.matchup):
+        return f"matchup {sorted(a.matchup)}!={sorted(b.matchup)}"
     if not _subjects_align(a.subject, b.subject):
         return f"subject {sorted(a.subject)}!={sorted(b.subject)}"
     return "ok"

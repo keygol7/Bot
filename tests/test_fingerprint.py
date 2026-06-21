@@ -167,6 +167,32 @@ def test_precision_keeps_spelling_variant_same_player():
     assert are_complementary(k, p)
 
 
+def test_winner_same_team_different_game_not_complementary():
+    # Same YES team (Dallas), DIFFERENT opponent -> different games, not a hedge. The
+    # date gap can be inside the tolerance window (and doubleheaders share a date), so the
+    # matchup (both teams) is what separates them.
+    k = from_kalshi("KXWNBAGAME-26JUN15DALLV-DAL",
+                    "Dallas Wings vs Las Vegas Aces - Dallas Wings", yes_sub_title="Dallas Wings")
+    p = from_polymarket("aec-wnba-dal-gs-2026-06-18",
+                        "Dallas Wings vs Golden State Valkyries - Dallas Wings", end_date="2026-06-18")
+    assert not are_complementary(k, p)
+    # Same game across venues still matches (matchups align).
+    k2 = from_kalshi("KXWNBAGAME-26JUN18GSLV-GS",
+                     "Golden State Valkyries vs Las Vegas Aces - Golden State Valkyries",
+                     yes_sub_title="Golden State Valkyries")
+    p2 = from_polymarket("aec-wnba-gs-lv-2026-06-18",
+                         "Golden State Valkyries vs Las Vegas Aces - Golden State Valkyries",
+                         end_date="2026-06-18")
+    assert are_complementary(k2, p2)
+    # Abbreviated team names ("Cloud9 NY" / "LA Thieves") must NOT trip the matchup check
+    # against their spelled-out counterparts -> the true winner match is kept.
+    k3 = from_kalshi("KXCODGAME-26JUN191630C9NYLAT-LAT",
+                     "Cloud9 NY vs LA Thieves - Los Angeles Thieves", yes_sub_title="Los Angeles Thieves")
+    p3 = from_polymarket("aec-cod-lat-c9ny-2026-06-19",
+                         "Cloud9 New York vs Los Angeles Thieves - Los Angeles Thieves", end_date="2026-06-19")
+    assert are_complementary(k3, p3)
+
+
 def test_first_goal_metric_matches_and_is_distinct():
     # "record the first goal" <-> "first to score": same event, distinct from a goal-COUNT
     # prop (so it can't false-match an anytime/N+ goals market).
