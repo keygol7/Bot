@@ -87,6 +87,7 @@ class Executor:
         min_leg_depth: float = 0.0,
         depth_safety: float = 1.0,
         first_venue: str = "kalshi",
+        hedge_buffer: float = 0.0,
     ) -> None:
         self.venues = venues
         self.risk = risk
@@ -113,10 +114,13 @@ class Executor:
         self.balance_buffer = balance_buffer       # leave headroom for fees/slippage
         self._balances: dict[str, float] = {}
         # Bounded-aggressive limit pricing: how much edge to preserve as locked profit
-        # (defaults to the risk min_edge floor), and how the spendable surplus is split
-        # toward the completing NO leg (which we most want to fill once leg 1 commits us).
+        # (defaults to the risk min_edge floor).
         self.min_lock_edge = min_lock_edge
         self.leg2_slippage_share = min(max(leg2_slippage_share, 0.0), 1.0)
+        # Price cushion reserved for the SECOND (hedge) leg so it fills through normal
+        # book movement — and we ONLY fire when the edge can pay it AND still lock the
+        # floor, so a thin edge that would just unwind never fires. 0 = no cushion.
+        self.hedge_buffer = hedge_buffer
 
     def set_balances(self, snapshots) -> None:
         """Seed available cash per venue from account snapshots (startup/refresh)."""
@@ -218,22 +222,28 @@ class Executor:
 
         return int(math.floor(max(0.0, min(caps.values())))), caps
 
-    def _aggressive_limits(self, opp: ArbOpportunity) -> tuple[float, float]:
-        """Per-leg limit prices that may pay worse than the quoted ask to fill on a
-        moving book, but never enough to drop the locked edge below the floor.
+    def _leg_limits(self, opp: ArbOpportunity, first_side, second_side) -> tuple[float, float]:
+        """Limit prices for the (first, second) legs that may pay worse than the quoted
+        ask to fill on a moving book, but never enough to drop the locked profit below
+        the floor.
 
-        The detected edge above the floor is the ``surplus`` we can spend on slippage;
-        it is split between the legs (favoring the completing NO leg). Worst case both
-        legs fill at their limits -> combined cost = gross + surplus = 1 - floor, so the
-        locked profit is >= floor by construction. Thin edges get ~no room (stay
-        conservative); fat edges get room to chase the fill."""
+        The buffer goes to the SECOND (hedge) leg: its failure forces an unwind, while a
+        first-leg failure is a clean skip — so the hedge gets up to ``hedge_buffer`` of
+        room to fill through adverse movement. Any leftover surplus (edge - floor -
+        hedge) widens the first leg (improves its fill at no unwind cost). Worst case
+        both fill at the limits -> combined cost = gross + surplus = 1 - floor, so the
+        locked profit is >= floor by construction."""
         floor = self.min_lock_edge if self.min_lock_edge is not None else self.risk.limits.min_edge
         surplus = max(0.0, opp.edge_per_contract - floor)
-        no_buf = surplus * self.leg2_slippage_share
-        yes_buf = surplus - no_buf
-        yes_limit = min(0.99, round(opp.yes_price + yes_buf, 4))
-        no_limit = min(0.99, round(opp.no_price + no_buf, 4))
-        return yes_limit, no_limit
+        hedge = min(self.hedge_buffer, surplus)
+        leftover = surplus - hedge
+
+        def px(side):
+            return opp.yes_price if side is Side.YES else opp.no_price
+
+        first_limit = min(0.99, round(px(first_side) + leftover, 4))
+        second_limit = min(0.99, round(px(second_side) + hedge, 4))
+        return first_limit, second_limit
 
     async def execute(self, opp: ArbOpportunity) -> ExecutionReport:
         if self.risk.is_killed:
@@ -260,23 +270,35 @@ class Executor:
                  opp.event_key, size, binding,
                  {k: round(v, 2) for k, v in caps.items()})
 
-        yes_limit, no_limit = self._aggressive_limits(opp)
-        notional = size * (yes_limit + no_limit)   # worst-case cost for the risk check
+        # Order the two legs so the rejection-prone venue (self.first_venue, e.g. Kalshi)
+        # goes FIRST: if it rejects, no other leg was taken -> a clean skip, no unwind.
+        # The SECOND (hedge) leg is the one whose failure forces an unwind.
+        if opp.buy_no_venue == self.first_venue and opp.buy_yes_venue != self.first_venue:
+            first_vn, first_m, first_side = opp.buy_no_venue, opp.buy_no_market, Side.NO
+            second_vn, second_m, second_side = opp.buy_yes_venue, opp.buy_yes_market, Side.YES
+        else:
+            first_vn, first_m, first_side = opp.buy_yes_venue, opp.buy_yes_market, Side.YES
+            second_vn, second_m, second_side = opp.buy_no_venue, opp.buy_no_market, Side.NO
+
+        # Don't fire an edge too thin to give the hedge leg a fill cushion — it would
+        # just unwind. We only fire when the edge can pay the hedge buffer AND still lock
+        # the floor, so the hedge fills through normal book movement (no unwind).
+        floor = self.min_lock_edge if self.min_lock_edge is not None else self.risk.limits.min_edge
+        if opp.edge_per_contract < floor + self.hedge_buffer - 1e-9:
+            return ExecutionReport(
+                ExecStatus.SKIPPED,
+                f"edge {opp.edge_per_contract:.3f} < lock {floor:.3f} + hedge "
+                f"{self.hedge_buffer:.3f} — would risk an unwind",
+            )
+        first_limit, second_limit = self._leg_limits(opp, first_side, second_side)
+        notional = size * (first_limit + second_limit)   # worst-case cost for the risk check
         label = f"{opp.buy_yes_venue}:{opp.buy_yes_market}"
         decision = self.risk.check(label, notional)
         if not decision.allowed:
             return ExecutionReport(ExecStatus.SKIPPED, f"risk: {decision.reason}")
 
-        # Order the two legs so the rejection-prone venue (self.first_venue) goes FIRST:
-        # if it rejects, there is no other leg to unwind (a clean skip, $0). Each leg is
-        # (venue_name, market, side, limit). Cross-venue, so one leg is on each venue.
-        yes_leg = (opp.buy_yes_venue, opp.buy_yes_market, Side.YES, yes_limit)
-        no_leg = (opp.buy_no_venue, opp.buy_no_market, Side.NO, no_limit)
-        if no_leg[0] == self.first_venue and yes_leg[0] != self.first_venue:
-            first, second = no_leg, yes_leg
-        else:
-            first, second = yes_leg, no_leg
-
+        first = (first_vn, first_m, first_side, first_limit)
+        second = (second_vn, second_m, second_side, second_limit)
         first_venue = self.venues.get(first[0])
         second_venue = self.venues.get(second[0])
         if first_venue is None or second_venue is None:

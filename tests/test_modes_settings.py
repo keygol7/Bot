@@ -23,7 +23,7 @@ def test_load_settings_defaults(tmp_path, monkeypatch):
         "BOT_RUN_MODE", "RISK_MAX_DAILY_LOSS", "RISK_MIN_EDGE",
         "RISK_MAX_POSITION_PER_MARKET", "RISK_MAX_TOTAL_EXPOSURE",
         "SCAN_CLOSE_WITHIN_DAYS", "EXEC_MIN_LEG_DEPTH", "STREAM_MAX_WS_QUOTE_AGE",
-        "EXEC_DEPTH_FRACTION", "STREAM_MIN_LEG_PRICE",
+        "EXEC_DEPTH_FRACTION", "STREAM_MIN_LEG_PRICE", "EXEC_HEDGE_BUFFER",
     ):
         monkeypatch.delenv(key, raising=False)
     settings = load_settings(dotenv_path=str(tmp_path / "nonexistent.env"))
@@ -38,6 +38,7 @@ def test_load_settings_defaults(tmp_path, monkeypatch):
     assert settings.stream_max_ws_quote_age == 2.0        # trust WS book within 2s
     assert settings.exec_depth_fraction == 0.85           # trade 85% of shown depth
     assert settings.stream_min_leg_price == 0.02          # skip settling-market extremes
+    assert settings.exec_hedge_buffer == 0.03             # hedge cushion / no-unwind gate
 
 
 def test_load_settings_reads_scan_close_within_days(tmp_path, monkeypatch):

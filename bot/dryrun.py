@@ -570,6 +570,7 @@ async def stream(
         max_order_contracts=settings.risk.max_order_contracts, fill_confirmer=tracker,
         min_leg_depth=settings.exec_min_leg_depth,
         depth_safety=settings.exec_depth_fraction,
+        hedge_buffer=settings.exec_hedge_buffer,
     )
 
     venue_by_name = {v.name: v for v in venues}
@@ -582,8 +583,11 @@ async def stream(
             return None
         return await v.fetch_quote(RawMarket(market_id=market_id, title="", raw={}))
 
+    # Only fire when the edge can pay the hedge cushion AND still lock min_edge — so the
+    # hedge leg fills through book movement instead of forcing an unwind.
+    fire_threshold = min_edge + settings.exec_hedge_buffer
     engine = StreamingEngine(
-        executor=executor, fee_models=fee_models, min_edge=min_edge, depth_fetch=depth_fetch,
+        executor=executor, fee_models=fee_models, min_edge=fire_threshold, depth_fetch=depth_fetch,
         max_ws_quote_age=settings.stream_max_ws_quote_age,
         min_leg_price=settings.stream_min_leg_price, store=store,
     )
@@ -699,6 +703,10 @@ async def stream(
     log.warning("settling guard: skip fires when a leg is <= $%.2f or >= $%.2f "
                 "(STREAM_MIN_LEG_PRICE)", settings.stream_min_leg_price,
                 1.0 - settings.stream_min_leg_price)
+    log.warning("no-unwind gate: only fire edges >= lock $%.2f + hedge $%.2f = $%.2f; "
+                "hedge leg gets $%.2f of fill room (EXEC_HEDGE_BUFFER)",
+                min_edge, settings.exec_hedge_buffer, fire_threshold,
+                settings.exec_hedge_buffer)
     ceiling = (f"{settings.risk.max_order_contracts:g} ct/order"
                if settings.risk.max_order_contracts and settings.risk.max_order_contracts > 0
                else "no per-order ceiling — sized to balances/depth")

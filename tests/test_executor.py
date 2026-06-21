@@ -433,36 +433,57 @@ def test_fill_confirmer_needs_order_id():
     assert report.status is ExecStatus.SKIPPED   # leg1 killed, no order id -> skip
 
 
-def test_aggressive_limits_preserve_edge_floor():
-    # Fat edge (0.05) with a 0.01 floor -> 0.04 surplus split toward the NO leg.
-    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])],
-                      limits=RiskLimits(min_edge=0.01))
-    o = opp(yes_price=0.40, no_price=0.55)            # gross 0.95, edge 0.05
-    yes_limit, no_limit = ex._aggressive_limits(o)
-    assert yes_limit > 0.40 and no_limit > 0.55       # both reach past the quoted ask
-    assert no_limit - 0.55 > yes_limit - 0.40         # NO (completing leg) gets more room
-    # Worst case (both fill at the limit) still locks >= the floor.
-    assert round(1 - (yes_limit + no_limit), 4) >= 0.01
+def test_leg_limits_buffer_goes_to_hedge_leg():
+    # Buffer goes to the SECOND (hedge) leg up to hedge_buffer; leftover widens the
+    # first. Here NO is the hedge (second) leg.
+    ex = Executor({"kalshi": FakeVenue("kalshi", []), "poly": FakeVenue("poly", [])},
+                  RiskManager(RiskLimits(min_edge=0.01)),
+                  fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+                  hedge_buffer=0.03)
+    o = opp(yes_price=0.40, no_price=0.55)             # edge 0.05, floor 0.01, surplus 0.04
+    first_limit, second_limit = ex._leg_limits(o, Side.YES, Side.NO)
+    assert round(second_limit - 0.55, 4) == 0.03       # hedge (NO) gets the full buffer
+    assert round(first_limit - 0.40, 4) == 0.01        # leftover 0.04-0.03 widens first
+    assert round(1 - (first_limit + second_limit), 4) >= 0.01   # still locks the floor
 
 
-def test_aggressive_limits_thin_edge_stays_conservative():
-    # Edge at the floor -> no surplus -> no slippage room (don't chase a thin edge).
-    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])],
-                      limits=RiskLimits(min_edge=0.05))
-    o = opp(yes_price=0.45, no_price=0.50)            # gross 0.95, edge 0.05 == floor
-    yes_limit, no_limit = ex._aggressive_limits(o)
-    assert yes_limit == 0.45 and no_limit == 0.50
+def test_leg_limits_thin_edge_no_room():
+    ex = Executor({"kalshi": FakeVenue("kalshi", []), "poly": FakeVenue("poly", [])},
+                  RiskManager(RiskLimits(min_edge=0.05)),
+                  fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+                  hedge_buffer=0.03)
+    o = opp(yes_price=0.45, no_price=0.50)             # edge 0.05 == floor -> no surplus
+    first_limit, second_limit = ex._leg_limits(o, Side.YES, Side.NO)
+    assert first_limit == 0.45 and second_limit == 0.50
 
 
-def test_aggressive_limits_used_in_execution():
-    # The legs are actually placed at the widened limits, not the bare quoted ask.
-    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
-    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
-    ex, _ = make_exec([yes, no], limits=RiskLimits(min_edge=0.01, max_position_per_market=1e9,
-                                                   max_total_exposure=1e12))
-    asyncio.run(ex.execute(opp(yes_price=0.40, no_price=0.55)))
-    assert yes.calls[0][3] > 0.40                     # leg1 limit widened past the ask
-    assert no.calls[0][3] > 0.55                      # leg2 limit widened past the ask
+def test_hedge_buffer_blocks_thin_edge():
+    # An edge below lock + hedge_buffer must NOT fire (it would just unwind).
+    yes = FakeVenue("kalshi", [])
+    no = FakeVenue("poly", [])
+    ex = Executor({"kalshi": yes, "poly": no},
+                  RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9,
+                                         max_total_exposure=1e12)),
+                  fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+                  max_order_contracts=0, hedge_buffer=0.03)
+    report = asyncio.run(ex.execute(opp(yes_price=0.47, no_price=0.51)))  # edge 0.02 < 0.04
+    assert report.status is ExecStatus.SKIPPED and "unwind" in report.reason
+    assert yes.calls == [] and no.calls == []
+
+
+def test_hedge_buffer_on_kalshi_first_buffers_the_poly_hedge():
+    # The exact live case: Kalshi is the NO leg (placed first); the Poly YES hedge is
+    # second and must get the buffer (not the first leg).
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.FILLED, 2, 0.55)])
+    poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    ex = Executor({"kalshi": kalshi, "poly": poly},
+                  RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9,
+                                         max_total_exposure=1e12)),
+                  fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+                  max_order_contracts=0, hedge_buffer=0.03)
+    asyncio.run(ex.execute(opp(yv="poly", nv="kalshi", yes_price=0.40, no_price=0.55)))
+    assert kalshi.calls[0][1] == "NO"                  # kalshi placed first
+    assert round(poly.calls[0][3] - 0.40, 4) == 0.03   # the Poly YES hedge got the buffer
 
 
 def test_order_error_result_classification():
