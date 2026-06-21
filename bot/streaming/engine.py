@@ -142,6 +142,11 @@ class StreamingEngine:
             self.livebook.get(p.venue_b, p.market_b),
         )
 
+    def watches(self, venue: str, market_id: str) -> bool:
+        """True if (venue, market_id) is a leg of a current confirmed pair — used to
+        filter the unfiltered Kalshi lifecycle firehose down to the watchlist."""
+        return (venue, market_id) in self._index
+
     def set_market_state(self, venue: str, market_id: str, state: str | None) -> None:
         """Record a market's latest state (from a Polymarket quote or the Kalshi
         lifecycle channel). ``None`` clears it back to unknown."""

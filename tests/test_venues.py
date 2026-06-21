@@ -5,8 +5,45 @@ from bot.venues.kalshi import (
     is_multivariate,
     normalize_orderbook,
     normalize_summary,
+    parse_lifecycle,
     parse_ticker,
 )
+
+
+def _lc(event_type, ticker="KXMLBGAME-X-LAA", **extra):
+    return {"type": "market_lifecycle_v2",
+            "msg": {"event_type": event_type, "market_ticker": ticker, **extra}}
+
+
+def test_kalshi_lifecycle_terminal_events_block_and_prune():
+    for ev in ("settled", "determined"):
+        out = parse_lifecycle(_lc(ev))
+        assert out.market_ticker == "KXMLBGAME-X-LAA"
+        assert out.state != "MARKET_STATE_OPEN" and out.terminal is True
+
+
+def test_kalshi_lifecycle_activate_deactivate():
+    assert parse_lifecycle(_lc("activated")).state == "MARKET_STATE_OPEN"
+    assert parse_lifecycle(_lc("activated")).terminal is False
+    out = parse_lifecycle(_lc("deactivated"))
+    assert out.state != "MARKET_STATE_OPEN" and out.terminal is False
+
+
+def test_kalshi_lifecycle_pause_flag_takes_precedence():
+    # is_deactivated is the pause/unpause signal on an open market.
+    assert parse_lifecycle(_lc("activated", is_deactivated=True)).state == "KALSHI_PAUSED"
+    assert parse_lifecycle(_lc("deactivated", is_deactivated=False)).state == "MARKET_STATE_OPEN"
+
+
+def test_kalshi_lifecycle_neutral_events_no_state_change():
+    # created/metadata/etc. don't change tradeability -> state None (leave as-is).
+    assert parse_lifecycle(_lc("created", open_ts=1)).state is None
+    assert parse_lifecycle(_lc("metadata_updated")).state is None
+
+
+def test_kalshi_lifecycle_ignores_other_messages():
+    assert parse_lifecycle({"type": "ticker", "msg": {}}) is None
+    assert parse_lifecycle(_lc("settled", ticker="")) is None    # no ticker
 
 
 def test_kalshi_ws_ticker_parsing():

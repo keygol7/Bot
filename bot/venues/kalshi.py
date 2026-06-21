@@ -19,7 +19,7 @@ import base64
 import logging
 import time
 import uuid
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, NamedTuple, Optional
 from urllib.parse import urlsplit
 
 from bot.execution.orders import OrderResult, OrderStatus
@@ -176,6 +176,53 @@ def parse_ticker(message: dict[str, Any]) -> MarketQuote | None:
         no_ask_size=_sz(m.get("yes_bid_size_fp")),
         timestamp=time.time(),
     )
+
+
+class LifecycleEvent(NamedTuple):
+    """A parsed market_lifecycle_v2 update. ``state`` is "MARKET_STATE_OPEN" when the
+    market is (re)tradeable, a non-open marker when paused/deactivated/closed, or None
+    when the event doesn't change tradeability. ``terminal`` is True for determined/
+    settled markets (prune them from the watchlist)."""
+
+    market_ticker: str
+    state: str | None
+    terminal: bool
+
+
+# Kalshi lifecycle event_type -> non-open state marker (anything != MARKET_STATE_OPEN
+# blocks the fire). created/close_date_updated/price_level/metadata don't change
+# tradeability (-> None, leave state as-is; unknown stays allowed).
+_LIFECYCLE_BLOCK = {
+    "deactivated": "KALSHI_DEACTIVATED",
+    "determined": "KALSHI_DETERMINED",
+    "settled": "KALSHI_SETTLED",
+}
+_LIFECYCLE_TERMINAL = {"determined", "settled"}
+
+
+def parse_lifecycle(message: dict[str, Any]) -> LifecycleEvent | None:
+    """Parse a ``market_lifecycle_v2`` message into a :class:`LifecycleEvent` (or None).
+
+    ``is_deactivated`` (pause/unpause on an open market) takes precedence when present:
+    True -> blocked, False -> open. Otherwise ``event_type`` decides: ``activated`` ->
+    open; ``deactivated``/``determined``/``settled`` -> blocked (the last two terminal).
+    """
+    if message.get("type") != "market_lifecycle_v2":
+        return None
+    m = message.get("msg", message)
+    ticker = m.get("market_ticker")
+    if not ticker:
+        return None
+    event = m.get("event_type")
+    is_deact = m.get("is_deactivated")
+    terminal = event in _LIFECYCLE_TERMINAL
+    if is_deact is not None:
+        state = "MARKET_STATE_OPEN" if not is_deact else "KALSHI_PAUSED"
+    elif event == "activated":
+        state = "MARKET_STATE_OPEN"
+    else:
+        state = _LIFECYCLE_BLOCK.get(event)  # None for created/metadata/etc. (no change)
+    return LifecycleEvent(ticker, state, terminal)
 
 
 def parse_fill(message: dict[str, Any]):
@@ -485,6 +532,38 @@ class KalshiVenue:
         "gtc": "good_till_canceled",
         "good_till_canceled": "good_till_canceled",
     }
+
+    async def stream_lifecycle(self):
+        """Stream ``market_lifecycle_v2`` events as :class:`LifecycleEvent`s.
+
+        The channel has no market filter (it carries every market's lifecycle), so the
+        consumer filters to the watchlist client-side. Reconnects with backoff.
+        """
+        import json
+
+        import websockets  # lazy
+
+        backoff = 1.0
+        while True:
+            try:
+                headers = self._ws_auth_headers()
+                async with websockets.connect(
+                    self.cfg.ws_base, additional_headers=headers, open_timeout=10
+                ) as ws:
+                    await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
+                                              "params": {"channels": ["market_lifecycle_v2"]}}))
+                    backoff = 1.0
+                    async for raw in ws:
+                        ev = parse_lifecycle(json.loads(raw))
+                        if ev is not None:
+                            yield ev
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("kalshi lifecycle ws disconnected (%s); reconnecting in %.0fs",
+                            exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
 
     async def place_order(
         self, market_id: str, side: Side, action: str, price: float, contracts: float,

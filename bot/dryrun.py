@@ -632,6 +632,27 @@ async def stream(
         except Exception as exc:
             log.warning("private stream %s ended: %s", v.name, exc)
 
+    async def feed_lifecycle(v):
+        # Kalshi market_lifecycle_v2: feed the engine's state guard (block non-OPEN
+        # legs) and prune settled/determined markets from the cache instantly, instead
+        # of waiting for the 5-min REST is_open probe. Filtered to the watchlist.
+        stream = getattr(v, "stream_lifecycle", None)
+        if stream is None:
+            return
+        try:
+            async for ev in stream():
+                if not engine.watches(v.name, ev.market_ticker):
+                    continue
+                if ev.state is not None:
+                    engine.set_market_state(v.name, ev.market_ticker, ev.state)
+                if ev.terminal:
+                    store.prune_market(v.name, ev.market_ticker)
+                    log.info("lifecycle: %s %s — blocked + pruned", v.name, ev.market_ticker)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("lifecycle stream %s ended: %s", v.name, exc)
+
     # Startup reconciliation: every trading venue must be funded and flat before a
     # single order can be placed. A leftover leg from a prior crash/abort would turn
     # a market-neutral arb into naked risk; this fails closed (kill switch) if so.
@@ -657,6 +678,7 @@ async def stream(
         apply_balance_caps(risk, guard.snapshots)
 
     private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
+    private_tasks += [asyncio.create_task(feed_lifecycle(v)) for v in venues]
     log.warning("matching mode: fingerprint=%s metrics=%s (MATCH_USE_FINGERPRINT)",
                 settings.match_use_fingerprint,
                 sorted(settings.match_fingerprint_metrics) or "all")
