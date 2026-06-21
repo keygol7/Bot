@@ -356,6 +356,32 @@ def test_open_state_still_trades():
     assert len(fe.calls) == 1                       # OPEN (poly) + unknown (kalshi) -> trades
 
 
+def test_skips_settling_market_at_price_extreme():
+    # A leg at ~$0.01 is a resolved/settling market (phantom depth) -> skip the fire.
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, min_leg_price=0.02,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    # poly YES @ 0.01 (extreme) + kalshi NO @ 0.90 -> 9c "edge" but it's settling.
+    asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.90, na=100)))
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.01, ya=100, no_ask=0.60, na=100)))
+    assert fe.calls == []                          # skipped: leg at price extreme
+
+
+def test_normal_prices_not_blocked_by_extreme_guard():
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, min_leg_price=0.02,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)))
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)))
+    assert len(fe.calls) == 1                       # 0.40/0.55 are not extreme -> trades
+
+
 def test_consume_counts_ws_quotes_for_health():
     # The WS-health heartbeat: _consume must count each tick per venue so the run
     # loop can report whether a venue's WebSocket is actually delivering data.

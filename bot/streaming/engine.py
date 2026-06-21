@@ -70,6 +70,7 @@ class StreamingEngine:
         clock=time.monotonic,
         depth_fetch=None,
         max_ws_quote_age: float = 2.0,
+        min_leg_price: float = 0.0,
     ) -> None:
         self.executor = executor
         self.fee_models = fee_models or {}
@@ -82,6 +83,11 @@ class StreamingEngine:
         # 0 disables (always re-fetch). Quote timestamps are wall-clock (time.time()),
         # so freshness is checked against time.time(), not the monotonic ``clock``.
         self.max_ws_quote_age = max_ws_quote_age
+        # Skip a fire if either crossing leg's ask is at a price extreme (<= this, or
+        # >= 1 - this). A binary leg at ~$0.01 is effectively resolved/settling: its
+        # "edge" is a phantom and it has no real resting volume (Kalshi then rejects the
+        # FOK). 0 = disabled.
+        self.min_leg_price = min_leg_price
         # Async callable depth_fetch(venue, market_id) -> sized MarketQuote | None.
         # WS ticker feeds carry no size (Kalshi), so before firing on a price edge we
         # re-fetch real order-book depth (which also re-validates the price).
@@ -252,6 +258,14 @@ class StreamingEngine:
                      yq.venue, self._market_state.get((yq.venue, yq.market_id)) or yq.state,
                      nq.venue, self._market_state.get((nq.venue, nq.market_id)) or nq.state)
             return None
+        # Price-extreme guard: a leg at ~$0.01/$0.99 is a settling/resolved market with
+        # phantom depth (no real resting volume) — its edge is an artifact. Skip it.
+        if self.min_leg_price > 0:
+            lo, hi = self.min_leg_price, 1.0 - self.min_leg_price
+            if not (lo <= yq.yes_ask <= hi and lo <= nq.no_ask <= hi):
+                log.info("STREAM %s: skip — leg at price extreme (yes=%.3f no=%.3f), "
+                         "likely settling", p.event_key, yq.yes_ask, nq.no_ask)
+                return None
         opp = self._build_opp(p, edge, yq, nq, size)
         log.info("STREAM edge %.4f sz %g on %s -> executing", edge, size, p.event_key)
         report = await self._execute_guarded(opp)

@@ -132,6 +132,10 @@ class Settings:
     # leg still fills if the book thins between the quote and the order (the cause of
     # Kalshi's "insufficient resting volume" rejections). 1.0 = use the full shown depth.
     exec_depth_fraction: float = 0.85
+    # Skip a fire if either leg's ask is at a price extreme (<= this or >= 1 - this).
+    # A binary at ~$0.01 is a settling/resolved market with phantom depth (no real
+    # resting volume), so its "edge" is an artifact. 0 = disabled.
+    stream_min_leg_price: float = 0.02
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -192,4 +196,5 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_min_leg_depth=_env_float("EXEC_MIN_LEG_DEPTH", 0.0),
         stream_max_ws_quote_age=_env_float("STREAM_MAX_WS_QUOTE_AGE", 2.0),
         exec_depth_fraction=_env_float("EXEC_DEPTH_FRACTION", 0.85),
+        stream_min_leg_price=_env_float("STREAM_MIN_LEG_PRICE", 0.02),
     )

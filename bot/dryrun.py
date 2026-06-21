@@ -585,6 +585,7 @@ async def stream(
     engine = StreamingEngine(
         executor=executor, fee_models=fee_models, min_edge=min_edge, depth_fetch=depth_fetch,
         max_ws_quote_age=settings.stream_max_ws_quote_age,
+        min_leg_price=settings.stream_min_leg_price,
     )
 
     complete_fn = make_complete_fn(settings.llm) if use_llm else None
@@ -695,6 +696,9 @@ async def stream(
                 if settings.stream_max_ws_quote_age > 0 else "off (always REST re-fetch)")
     log.warning("FOK protection: trade %g%% of shown depth, place %s leg first "
                 "(EXEC_DEPTH_FRACTION)", settings.exec_depth_fraction * 100, "kalshi")
+    log.warning("settling guard: skip fires when a leg is <= $%.2f or >= $%.2f "
+                "(STREAM_MIN_LEG_PRICE)", settings.stream_min_leg_price,
+                1.0 - settings.stream_min_leg_price)
     ceiling = (f"{settings.risk.max_order_contracts:g} ct/order"
                if settings.risk.max_order_contracts and settings.risk.max_order_contracts > 0
                else "no per-order ceiling — sized to balances/depth")
