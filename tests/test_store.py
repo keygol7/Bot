@@ -93,31 +93,35 @@ def test_fingerprint_sweep_recovers_uncached_complements():
     s.close()
 
 
-def test_fingerprint_sweep_drops_stale_markets():
-    # Settled markets linger in the table (never pruned) with an old updated_at. The sweep
-    # must not resurface them when a freshness window is given, or the streamer would probe
-    # hundreds of dead legs. A live pair (fresh) is kept; an identical-shape stale pair is
-    # dropped.
+def test_fingerprint_sweep_drops_past_events():
+    # Settled games linger in the table (never pruned). The sweep must drop a pair whose
+    # EVENT date is in the past while keeping a future-dated live pair, using the
+    # fingerprint's parsed date (not updated_at, which the streamer doesn't refresh).
     import time as _t
+    from datetime import datetime, timedelta, timezone
 
     s = Store(":memory:")
-    s.upsert_market("kalshi", "KXATPMATCH-26JUN21LIVE-A",
-                    "Will Player A win the A vs B: Round Of 32 match? - Player A")
-    s.upsert_market("polymarket_us", "aec-atp-a-b-2026-06-21", "Player A vs. Player B - Player A")
-    # Age out a settled pair by writing an old updated_at directly.
-    s.upsert_market("kalshi", "KXATPMATCH-26JUN14OLD-C",
-                    "Will Player C win the C vs D: Round Of 32 match? - Player C")
-    s.upsert_market("polymarket_us", "aec-atp-c-d-2026-06-14", "Player C vs. Player D - Player C")
-    old = _t.time() - 48 * 3600
-    s.conn.execute("UPDATE markets SET updated_at=? WHERE market_id LIKE '%OLD%' OR market_id LIKE '%c-d%'",
-                   (old,))
-    s.conn.commit()
+    today = datetime.now(timezone.utc)
+    soon = today + timedelta(days=1)
+    longago = today - timedelta(days=10)
 
-    fresh = s.confirmed_pairs(use_fingerprint=True, sweep_fresh_s=6 * 3600)
-    ids = {p[1] for p in fresh}
-    assert "KXATPMATCH-26JUN21LIVE-A" in ids
-    assert "KXATPMATCH-26JUN14OLD-C" not in ids       # stale -> dropped
-    # Without a window, both come back (whole-table sweep).
+    def ticker_date(d):
+        return d.strftime("%y%b%d").upper()      # e.g. 26JUN22
+
+    s.upsert_market("kalshi", f"KXATPMATCH-{ticker_date(soon)}LIVE-A",
+                    "Will Player A win the A vs B: Round Of 32 match? - Player A")
+    s.upsert_market("polymarket_us", f"aec-atp-a-b-{soon:%Y-%m-%d}",
+                    "Player A vs. Player B - Player A")
+    s.upsert_market("kalshi", f"KXATPMATCH-{ticker_date(longago)}OLD-C",
+                    "Will Player C win the C vs D: Round Of 32 match? - Player C")
+    s.upsert_market("polymarket_us", f"aec-atp-c-d-{longago:%Y-%m-%d}",
+                    "Player C vs. Player D - Player C")
+
+    live = s.confirmed_pairs(use_fingerprint=True, sweep_max_past_s=1 * 86400)
+    ids = {p[1] for p in live}
+    assert any("LIVE-A" in i for i in ids)
+    assert not any("OLD-C" in i for i in ids)         # past event -> dropped
+    # Disabled bound -> both come back regardless of event date.
     assert len(s.confirmed_pairs(use_fingerprint=True)) == 2
     s.close()
 

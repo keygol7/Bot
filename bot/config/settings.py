@@ -116,11 +116,12 @@ class Settings:
     # specific metrics (e.g. "winner") for a staged rollout; empty = all matchable.
     match_use_fingerprint: bool = False
     match_fingerprint_metrics: frozenset = field(default_factory=frozenset)
-    # Fingerprint sweep freshness: only pair markets the scanner has seen within this many
-    # hours. Settled markets stop being re-scanned, so their updated_at goes stale; without
-    # this bound the sweep resurfaces every market ever scanned (long-settled games). Must
-    # comfortably exceed the scan interval. 0 = disabled (sweep the whole markets table).
-    match_sweep_fresh_hours: float = 6.0
+    # Fingerprint sweep recency: drop markets whose EVENT date is more than this many days
+    # in the past. Settled games linger in the markets table (never pruned); without this
+    # the sweep resurfaces every long-settled match. Uses the fingerprint's parsed event
+    # date (not updated_at), so it's independent of scan cadence. 1 day keeps today's and
+    # in-progress games. 0 = disabled (sweep regardless of event date).
+    match_sweep_past_days: float = 1.0
     # Targeted scan: only scan markets closing within this many days (the live/imminent
     # set), so today's games are always covered without a huge --limit (the matcher
     # embeds every scanned title, so scan size is the cost). 0 = disabled (scan all).
@@ -213,7 +214,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
             if (tok := raw.strip().lower()) in _VALID_FINGERPRINT_METRICS
         ),
         scan_close_within_days=_env_float("SCAN_CLOSE_WITHIN_DAYS", 0.0),
-        match_sweep_fresh_hours=_env_float("MATCH_SWEEP_FRESH_HOURS", 6.0),
+        match_sweep_past_days=_env_float("MATCH_SWEEP_PAST_DAYS", 1.0),
         exec_min_leg_depth=_env_float("EXEC_MIN_LEG_DEPTH", 0.0),
         stream_max_ws_quote_age=_env_float("STREAM_MAX_WS_QUOTE_AGE", 2.0),
         exec_depth_fraction=_env_float("EXEC_DEPTH_FRACTION", 0.85),

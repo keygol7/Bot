@@ -267,7 +267,7 @@ class Store:
         self, min_confidence: float = 0.85, max_fanout: Optional[int] = 1,
         drop_scope_mismatch: bool = True, safe_types_only: bool = True,
         use_fingerprint: bool = False, fingerprint_metrics: Optional[frozenset] = None,
-        sweep_fresh_s: Optional[float] = None,
+        sweep_max_past_s: Optional[float] = None,
     ) -> list[tuple]:
         """Cached tradeable pairs: (venue_a, market_a, venue_b, market_b, event_key).
 
@@ -290,7 +290,7 @@ class Store:
            ``None`` to disable.
         """
         if use_fingerprint:
-            return self._fingerprint_sweep(fingerprint_metrics, max_fanout, sweep_fresh_s)
+            return self._fingerprint_sweep(fingerprint_metrics, max_fanout, sweep_max_past_s)
         rows = self.conn.execute(
             """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b, v.event_key,
                       ma.title AS title_a, mb.title AS title_b
@@ -325,7 +325,7 @@ class Store:
 
     def _fingerprint_sweep(
         self, fingerprint_metrics: Optional[frozenset], max_fanout: Optional[int],
-        fresh_within_s: Optional[float] = None,
+        max_past_s: Optional[float] = None,
     ) -> list[tuple]:
         """Authoritative matcher: fingerprint EVERY scanned cross-venue market pair and
         keep the provable complements — independent of the embedding/LLM shortlist, which
@@ -335,27 +335,25 @@ class Store:
         (a complement requires equal metric) so the sweep is O(sum of per-metric K*P), not a
         full O(N^2). One leg is always Kalshi; same-venue pairs are never formed.
 
-        ``fresh_within_s`` bounds the sweep to markets the scanner has seen within that many
-        seconds: settled markets stop being re-scanned, so their ``updated_at`` goes stale
-        and they drop out (otherwise the sweep resurfaces every long-settled game ever
-        scanned). ``None`` sweeps the whole table."""
+        ``max_past_s`` drops markets whose EVENT date is more than that many seconds in the
+        past: settled games linger in the table (never pruned), and the sweep would
+        otherwise resurface every long-settled match ever scanned. Event date comes from the
+        fingerprint (parsed from the ticker/slug), so this is independent of scan cadence —
+        unlike an updated_at bound, which assumes a tight re-scan that the streamer doesn't
+        do. Markets with no parseable date are kept (fail open). ``None`` keeps everything."""
         from collections import defaultdict
 
         from bot.matching.fingerprint import (
             are_complementary, from_kalshi, from_polymarket,
         )
 
-        if fresh_within_s is not None:
-            rows = self.conn.execute(
-                "SELECT venue, market_id, title FROM markets WHERE updated_at >= ?",
-                (time.time() - fresh_within_s,),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT venue, market_id, title FROM markets"
-            ).fetchall()
-        # Fingerprint each market once; drop the unmatchable ones up front, then bucket by
-        # metric and Kalshi/other side so only plausible counterparties are compared.
+        rows = self.conn.execute(
+            "SELECT venue, market_id, title FROM markets"
+        ).fetchall()
+        cutoff = (time.time() - max_past_s) if max_past_s is not None else None
+        # Fingerprint each market once; drop the unmatchable (and long-settled) ones up
+        # front, then bucket by metric and Kalshi/other side so only plausible
+        # counterparties are compared.
         by_metric: dict[str, dict[str, list]] = defaultdict(
             lambda: {"kalshi": [], "other": []})
         for m in rows:
@@ -364,6 +362,8 @@ class Store:
                  else from_polymarket(m["market_id"], m["title"] or ""))
             if not f.matchable:
                 continue
+            if cutoff is not None and f.date is not None and f.date < cutoff:
+                continue                              # event already happened -> settled
             side = "kalshi" if venue == "kalshi" else "other"
             by_metric[f.metric][side].append((venue, m["market_id"], f))
 
