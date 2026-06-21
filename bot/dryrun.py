@@ -585,7 +585,7 @@ async def stream(
     engine = StreamingEngine(
         executor=executor, fee_models=fee_models, min_edge=min_edge, depth_fetch=depth_fetch,
         max_ws_quote_age=settings.stream_max_ws_quote_age,
-        min_leg_price=settings.stream_min_leg_price,
+        min_leg_price=settings.stream_min_leg_price, store=store,
     )
 
     complete_fn = make_complete_fn(settings.llm) if use_llm else None
@@ -1183,6 +1183,44 @@ def probe_account(settings: Settings) -> int:
     return 0
 
 
+def edge_report(settings: Settings, *, hours: float = 24.0) -> int:
+    """Summarize logged edge observations (what the streamer saw + did) over a window.
+
+    Turns the soak into a distribution: how many actionable edges appeared, how big,
+    and what happened to them (executed / settling-phantom / edge-gone / not-open).
+    """
+    store = Store(settings.db_path)
+    try:
+        since = time.time() - hours * 3600
+        rows = store.conn.execute(
+            """SELECT outcome, COUNT(*) n, AVG(edge) avg_edge, MAX(edge) max_edge,
+                      AVG(size) avg_size
+               FROM edge_observations WHERE ts >= ? GROUP BY outcome ORDER BY n DESC""",
+            (since,),
+        ).fetchall()
+        total = sum(r["n"] for r in rows)
+        print(f"edge observations in the last {hours:g}h: {total}\n")
+        if not total:
+            print("  (none yet — let it soak, ideally across live games)")
+            return 0
+        print(f"  {'outcome':<26}{'count':>6}{'avg_edge':>10}{'max_edge':>10}{'avg_size':>10}")
+        for r in rows:
+            print(f"  {r['outcome']:<26}{r['n']:>6}{r['avg_edge']:>10.3f}"
+                  f"{r['max_edge']:>10.3f}{r['avg_size']:>10.1f}")
+        locked = store.conn.execute(
+            "SELECT COUNT(*) n FROM edge_observations WHERE ts>=? AND outcome='SUCCESS'",
+            (since,),
+        ).fetchone()["n"]
+        settling = sum(r["n"] for r in rows if r["outcome"] == "skip_settling")
+        print(f"\n  locked (SUCCESS): {locked}   settling-phantom: {settling}   "
+              f"other: {total - locked - settling}")
+        print("  -> 'skip_settling' + 'edge_gone_after_depth' are noise; SUCCESS/UNWOUND "
+              "are real fires. A healthy venue pair shows few genuine edges.")
+        return 0
+    finally:
+        store.close()
+
+
 def compare_filters(settings: Settings, limit: int = 40) -> int:
     """SHADOW report: the structured fingerprint matcher vs the live filter.
 
@@ -1280,6 +1318,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--compare-filters", action="store_true",
                    help="SHADOW: compare the structured fingerprint matcher vs the live "
                         "filter over cached verdicts (adds/removes); trades nothing")
+    p.add_argument("--edge-report", action="store_true",
+                   help="summarize logged edge observations (frequency/size/outcome) "
+                        "over the last --hours and exit")
+    p.add_argument("--hours", type=float, default=24.0,
+                   help="time window for --edge-report (default 24h)")
     p.add_argument("--show-book", metavar="VENUE:MARKET", default=None,
                    help="fetch and print one market's real order book (sized quote)")
     p.add_argument("--test-order", metavar="VENUE:MARKET", default=None,
@@ -1357,6 +1400,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.compare_filters:
         raise SystemExit(compare_filters(load_settings(), limit=args.limit))
+
+    if args.edge_report:
+        raise SystemExit(edge_report(load_settings(), hours=args.hours))
 
     if args.show_book:
         raise SystemExit(show_book(load_settings(), args.show_book))

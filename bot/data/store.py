@@ -69,6 +69,19 @@ CREATE TABLE IF NOT EXISTS opportunities (
     acted           INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS edge_observations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL NOT NULL,
+    event_key   TEXT,
+    yes_venue   TEXT,
+    no_venue    TEXT,
+    yes_price   REAL,
+    no_price    REAL,
+    edge        REAL,        -- per-contract edge after fees (can be negative post-depth)
+    size        REAL,        -- contracts available at top of book
+    outcome     TEXT         -- executed/unwound/skipped reason: the actionable result
+);
+
 CREATE TABLE IF NOT EXISTS fills (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          REAL NOT NULL,
@@ -183,6 +196,21 @@ class Store:
         )
         self.conn.commit()
         return int(cur.lastrowid)
+
+    def record_edge(
+        self, event_key: str, yes_venue: str, no_venue: str, yes_price: float,
+        no_price: float, edge: float, size: float, outcome: str,
+    ) -> None:
+        """Log one actionable edge observation (after the streaming guards) with its
+        outcome, so a soak builds a distribution of how often/how big real edges are."""
+        self.conn.execute(
+            """INSERT INTO edge_observations
+               (ts, event_key, yes_venue, no_venue, yes_price, no_price, edge, size, outcome)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (time.time(), event_key, yes_venue, no_venue, yes_price, no_price,
+             edge, size, outcome),
+        )
+        self.conn.commit()
 
     # ---- fills / pnl ----
     def record_fill(

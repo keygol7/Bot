@@ -34,6 +34,17 @@ def test_record_opportunity():
     s.close()
 
 
+def test_record_edge_observation():
+    s = Store(":memory:")
+    s.record_edge("E1", "kalshi", "polymarket_us", 0.40, 0.55, 0.05, 50, "SUCCESS")
+    s.record_edge("E1", "kalshi", "polymarket_us", 0.01, 0.90, 0.09, 0, "skip_settling")
+    rows = s.conn.execute(
+        "SELECT outcome, edge, size FROM edge_observations ORDER BY id").fetchall()
+    assert [r["outcome"] for r in rows] == ["SUCCESS", "skip_settling"]
+    assert rows[0]["edge"] == 0.05 and rows[0]["size"] == 50
+    s.close()
+
+
 def test_verdict_cache_is_order_independent():
     s = Store(":memory:")
     s.cache_verdict(

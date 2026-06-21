@@ -71,6 +71,7 @@ class StreamingEngine:
         depth_fetch=None,
         max_ws_quote_age: float = 2.0,
         min_leg_price: float = 0.0,
+        store=None,
     ) -> None:
         self.executor = executor
         self.fee_models = fee_models or {}
@@ -88,6 +89,9 @@ class StreamingEngine:
         # "edge" is a phantom and it has no real resting volume (Kalshi then rejects the
         # FOK). 0 = disabled.
         self.min_leg_price = min_leg_price
+        # Optional Store: log each actionable edge (post-cooldown) + its outcome, so a
+        # soak measures how often/how big real edges actually are.
+        self.store = store
         # Async callable depth_fetch(venue, market_id) -> sized MarketQuote | None.
         # WS ticker feeds carry no size (Kalshi), so before firing on a price edge we
         # re-fetch real order-book depth (which also re-validates the price).
@@ -204,6 +208,16 @@ class StreamingEngine:
                      p.event_key, p.venue_a, _fmt_q(da), p.venue_b, _fmt_q(db))
         return ev
 
+    def _observe(self, p, edge, yq, nq, size, outcome: str) -> None:
+        """Log one actionable edge (post-cooldown) + outcome for the soak distribution."""
+        if self.store is None:
+            return
+        try:
+            self.store.record_edge(
+                p.event_key, yq.venue, nq.venue, yq.yes_ask, nq.no_ask, edge, size, outcome)
+        except Exception as exc:
+            log.warning("edge log failed for %s: %s", p.event_key, exc)
+
     def _build_opp(self, p, edge, yq, nq, size) -> ArbOpportunity:
         gross = yq.yes_ask + nq.no_ask
         return ArbOpportunity(
@@ -245,6 +259,7 @@ class StreamingEngine:
             if edge <= self.min_edge or size < 1:
                 log.info("STREAM edge gone after depth check on %s (edge %.4f sz %g)",
                          p.event_key, edge, size)
+                self._observe(p, edge, yq, nq, size, "edge_gone_after_depth")
                 return None
         elif size < 1:
             return None
@@ -257,6 +272,7 @@ class StreamingEngine:
             log.info("STREAM %s: skip — leg not OPEN (%s=%s %s=%s)", p.event_key,
                      yq.venue, self._market_state.get((yq.venue, yq.market_id)) or yq.state,
                      nq.venue, self._market_state.get((nq.venue, nq.market_id)) or nq.state)
+            self._observe(p, edge, yq, nq, size, "skip_not_open")
             return None
         # Price-extreme guard: a leg at ~$0.01/$0.99 is a settling/resolved market with
         # phantom depth (no real resting volume) — its edge is an artifact. Skip it.
@@ -265,11 +281,14 @@ class StreamingEngine:
             if not (lo <= yq.yes_ask <= hi and lo <= nq.no_ask <= hi):
                 log.info("STREAM %s: skip — leg at price extreme (yes=%.3f no=%.3f), "
                          "likely settling", p.event_key, yq.yes_ask, nq.no_ask)
+                self._observe(p, edge, yq, nq, size, "skip_settling")
                 return None
         opp = self._build_opp(p, edge, yq, nq, size)
         log.info("STREAM edge %.4f sz %g on %s -> executing", edge, size, p.event_key)
         report = await self._execute_guarded(opp)
         log.info("STREAM exec %s | %s", p.event_key, report)
+        status = getattr(report, "status", None)
+        self._observe(p, edge, yq, nq, size, status.value if status is not None else "executed")
         self._note_outcome(key, p, report)
         return report
 

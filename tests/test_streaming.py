@@ -382,6 +382,32 @@ def test_normal_prices_not_blocked_by_extreme_guard():
     assert len(fe.calls) == 1                       # 0.40/0.55 are not extreme -> trades
 
 
+class RecordingStore:
+    def __init__(self):
+        self.edges = []
+
+    def record_edge(self, event_key, yes_venue, no_venue, yes_price, no_price, edge, size, outcome):
+        self.edges.append((event_key, edge, size, outcome))
+
+
+def test_edge_observations_logged_for_fire_and_settling_skip():
+    fe = FakeExec()
+    st = RecordingStore()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=0.0, clock=lambda: 0.0, min_leg_price=0.02, store=st,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    # A genuine, mid-priced edge -> executes -> logged with the exec outcome.
+    asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)))
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)))
+    # A settling-market phantom edge (poly YES @ 0.01) -> skipped -> logged as settling.
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.01, ya=100, no_ask=0.60, na=100)))
+    outcomes = [e[3] for e in st.edges]
+    assert "skip_settling" in outcomes
+    assert any(o not in ("skip_settling", "edge_gone_after_depth") for o in outcomes)
+
+
 def test_consume_counts_ws_quotes_for_health():
     # The WS-health heartbeat: _consume must count each tick per venue so the run
     # loop can report whether a venue's WebSocket is actually delivering data.
