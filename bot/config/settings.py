@@ -128,6 +128,10 @@ class Settings:
     # have a sized quote no older than this many seconds. Both venues now stream a sized
     # top-of-book, so this removes the round-trip on the hot path. 0 = always re-fetch.
     stream_max_ws_quote_age: float = 2.0
+    # Fraction of shown top-of-book depth to actually trade — headroom so a fill-or-kill
+    # leg still fills if the book thins between the quote and the order (the cause of
+    # Kalshi's "insufficient resting volume" rejections). 1.0 = use the full shown depth.
+    exec_depth_fraction: float = 0.85
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -187,4 +191,5 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         scan_close_within_days=_env_float("SCAN_CLOSE_WITHIN_DAYS", 0.0),
         exec_min_leg_depth=_env_float("EXEC_MIN_LEG_DEPTH", 0.0),
         stream_max_ws_quote_age=_env_float("STREAM_MAX_WS_QUOTE_AGE", 2.0),
+        exec_depth_fraction=_env_float("EXEC_DEPTH_FRACTION", 0.85),
     )

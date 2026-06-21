@@ -233,6 +233,45 @@ def test_unwind_crosses_real_bid():
     assert yes.calls[1][3] == 0.05            # crossed the real bid, not the 0.35 haircut
 
 
+def test_places_kalshi_leg_first_when_kalshi_is_no():
+    # Buy YES on poly + NO on kalshi: kalshi (the rejection-prone venue) is the NO leg,
+    # so it's placed FIRST. If it rejects, poly is never touched -> clean skip, no unwind.
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.REJECTED, 0, None)])
+    poly = FakeVenue("poly", [])                       # must never be called
+    ex, risk = make_exec([kalshi, poly])
+    report = asyncio.run(ex.execute(opp(yv="poly", nv="kalshi")))
+    assert report.status is ExecStatus.SKIPPED
+    assert poly.calls == [] and kalshi.calls != []     # kalshi first, poly skipped
+    assert kalshi.calls[0][1] == "NO"                  # the NO leg went first
+    assert not risk.is_killed                          # no position -> no halt, no unwind
+
+
+def test_unwinds_first_leg_when_kalshi_no_filled_then_poly_fails():
+    # Kalshi NO fills first; poly YES then fails -> unwind the NO leg (sell NO back).
+    kalshi = FakeVenue("kalshi", [
+        res("kalshi", Side.NO, OrderStatus.FILLED, 5, 0.55),
+        res("kalshi", Side.NO, OrderStatus.FILLED, 5, 0.53, action="sell"),
+    ])
+    poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.KILLED, 0, None)])
+    ex, risk = make_exec([kalshi, poly])
+    report = asyncio.run(ex.execute(opp(yv="poly", nv="kalshi", max_contracts=5)))
+    assert report.status is ExecStatus.UNWOUND and not risk.is_killed
+    assert kalshi.calls[0][2] == "buy" and kalshi.calls[1][2] == "sell"
+    assert kalshi.calls[1][1] == "NO"                  # unwound the NO side it bought
+
+
+def test_depth_safety_trims_size():
+    # depth_safety < 1 trades only a fraction of shown depth (FOK headroom).
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 8, 0.40)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 8, 0.55)])
+    risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({v.name: v for v in [yes, no]}, risk,
+                  fee_models={v.name: ZeroFeeModel() for v in [yes, no]},
+                  max_order_contracts=0, depth_safety=0.8)
+    asyncio.run(ex.execute(opp(max_contracts=10)))     # 10 * 0.8 = 8
+    assert yes.calls[0][4] == 8                         # contracts requested = trimmed depth
+
+
 def test_skips_when_kill_switch_active():
     yes = FakeVenue("kalshi", [])
     no = FakeVenue("poly", [])

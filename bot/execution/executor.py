@@ -85,6 +85,8 @@ class Executor:
         min_lock_edge: float | None = None,
         leg2_slippage_share: float = 0.6,
         min_leg_depth: float = 0.0,
+        depth_safety: float = 1.0,
+        first_venue: str = "kalshi",
     ) -> None:
         self.venues = venues
         self.risk = risk
@@ -98,6 +100,12 @@ class Executor:
         # are where a leg rejects and the other can't be hedged/unwound — skipping them
         # means we should never have to unwind. 0 = disabled.
         self.min_leg_depth = min_leg_depth
+        # Fraction of shown top-of-book depth to actually trade (headroom so a FOK still
+        # fills if the book thins between the quote and the order). 1.0 = use it all.
+        self.depth_safety = depth_safety
+        # The rejection-prone venue (Kalshi: thinner books / FOK insufficient resting
+        # volume) is placed FIRST, so if it rejects there's no other leg to unwind.
+        self.first_venue = first_venue
         self.fill_confirmer = fill_confirmer       # optional FillTracker (private WS)
         self.confirm_timeout = confirm_timeout
         # Available cash per venue, seeded from the startup snapshot and decremented as
@@ -173,7 +181,8 @@ class Executor:
         (for logging why a size was chosen).
         """
         label = f"{opp.buy_yes_venue}:{opp.buy_yes_market}"
-        caps: dict[str, float] = {"depth": float(opp.max_contracts)}
+        # Trade only a fraction of shown depth (headroom for a thinning book on FOK).
+        caps: dict[str, float] = {"depth": float(opp.max_contracts) * self.depth_safety}
 
         yb, nb = self._balance(opp.buy_yes_venue), self._balance(opp.buy_no_venue)
         if yb is not None and opp.yes_price > 0:
@@ -241,21 +250,32 @@ class Executor:
         if not decision.allowed:
             return ExecutionReport(ExecStatus.SKIPPED, f"risk: {decision.reason}")
 
-        yes_venue = self.venues.get(opp.buy_yes_venue)
-        no_venue = self.venues.get(opp.buy_no_venue)
-        if yes_venue is None or no_venue is None:
+        # Order the two legs so the rejection-prone venue (self.first_venue) goes FIRST:
+        # if it rejects, there is no other leg to unwind (a clean skip, $0). Each leg is
+        # (venue_name, market, side, limit). Cross-venue, so one leg is on each venue.
+        yes_leg = (opp.buy_yes_venue, opp.buy_yes_market, Side.YES, yes_limit)
+        no_leg = (opp.buy_no_venue, opp.buy_no_market, Side.NO, no_limit)
+        if no_leg[0] == self.first_venue and yes_leg[0] != self.first_venue:
+            first, second = no_leg, yes_leg
+        else:
+            first, second = yes_leg, no_leg
+
+        first_venue = self.venues.get(first[0])
+        second_venue = self.venues.get(second[0])
+        if first_venue is None or second_venue is None:
             return ExecutionReport(ExecStatus.SKIPPED, "venue not available")
 
         self._audit("execute_start", opp, size=size)
 
-        # ----- Leg 1: buy YES (fill-or-kill) -----
+        # ----- Leg 1: the rejection-prone leg, fill-or-kill -----
         leg1 = await self._place(
-            yes_venue, opp.buy_yes_market, Side.YES, "buy", yes_limit, size, "fill_or_kill"
+            first_venue, first[1], first[2], "buy", first[3], size, "fill_or_kill"
         )
         log.info("leg1 %s", leg1)
         if leg1.status is OrderStatus.ERROR:
             return self._halt(f"leg1 ERROR — fill state unknown ({_reject_reason(leg1)})", [leg1])
         if not leg1.left_a_position:
+            # Clean: the first leg didn't fill, so NO position was taken — just skip.
             return ExecutionReport(
                 ExecStatus.SKIPPED,
                 f"leg1 not filled ({leg1.status.value}: {_reject_reason(leg1)})", [leg1])
@@ -266,14 +286,14 @@ class Executor:
             log.warning("leg1 PARTIAL %g/%g — unwinding the filled portion", leg1.filled, size)
             return await self._unwind(opp, leg1, None, reason="leg1 partial fill")
 
-        # ----- Leg 2: buy NO (fill-or-kill) -----
+        # ----- Leg 2: the hedge, fill-or-kill -----
         leg2 = await self._place(
-            no_venue, opp.buy_no_market, Side.NO, "buy", no_limit, size, "fill_or_kill"
+            second_venue, second[1], second[2], "buy", second[3], size, "fill_or_kill"
         )
         log.info("leg2 %s", leg2)
 
         if leg2.status is OrderStatus.FILLED and leg2.filled_fully:
-            return self._settle_success(opp, size, leg1, leg2)
+            return self._settle_success(opp, size, [leg1, leg2])
 
         if leg2.status in (OrderStatus.KILLED, OrderStatus.REJECTED) and leg2.filled <= 1e-9:
             # Definitively no leg-2 position -> safe to unwind leg 1. Carry WHY leg2
@@ -292,47 +312,58 @@ class Executor:
         )
 
     # ---- outcomes ----
-    def _settle_success(self, opp, size, leg1, leg2) -> ExecutionReport:
-        ya = leg1.avg_price if leg1.avg_price is not None else opp.yes_price
-        na = leg2.avg_price if leg2.avg_price is not None else opp.no_price
-        fees = self._fee(leg1.venue).fee(ya, size) + self._fee(leg2.venue).fee(na, size)
+    def _settle_success(self, opp, size, legs) -> ExecutionReport:
+        # Identify the legs by side (the placement order may put the NO leg first).
+        yes_leg = next(l for l in legs if l.side is Side.YES)
+        no_leg = next(l for l in legs if l.side is Side.NO)
+        ya = yes_leg.avg_price if yes_leg.avg_price is not None else opp.yes_price
+        na = no_leg.avg_price if no_leg.avg_price is not None else opp.no_price
+        fees = self._fee(yes_leg.venue).fee(ya, size) + self._fee(no_leg.venue).fee(na, size)
         pnl = size * (1.0 - ya - na) - fees
 
-        self.risk.record_fill(f"{leg1.venue}:{leg1.market_id}", ya * size)
+        self.risk.record_fill(f"{yes_leg.venue}:{yes_leg.market_id}", ya * size)
         self.risk.record_pnl(pnl)
         # Decrement tracked cash so the next arb sizes against what's actually left.
-        self._spend(leg1.venue, ya * size)
-        self._spend(leg2.venue, na * size)
+        self._spend(yes_leg.venue, ya * size)
+        self._spend(no_leg.venue, na * size)
         if self.store is not None:
-            self.store.record_fill(leg1.venue, leg1.market_id, "YES", ya, size)
-            self.store.record_fill(leg2.venue, leg2.market_id, "NO", na, size)
+            self.store.record_fill(yes_leg.venue, yes_leg.market_id, "YES", ya, size)
+            self.store.record_fill(no_leg.venue, no_leg.market_id, "NO", na, size)
             self.store.record_pnl(pnl, note="arb locked")
             self.store.record_opportunity(opp, acted=True)
         self._audit("execute_success", opp, pnl=pnl)
         log.info("ARB LOCKED %s | pnl=%+.2f", opp.event_key, pnl)
-        return ExecutionReport(ExecStatus.SUCCESS, "both legs filled", [leg1, leg2], pnl)
+        return ExecutionReport(ExecStatus.SUCCESS, "both legs filled", list(legs), pnl)
 
     async def _unwind(self, opp, leg1, leg2, *, reason: str = "leg2 failed") -> ExecutionReport:
-        """Sell the filled leg-1 quantity back (IOC, slippage-tolerant) to return to
-        flat. Used both when leg 2 cleanly fails and when leg 1 itself partial-fills
-        (``leg2`` is then ``None``)."""
+        """Sell the filled first leg back (IOC, slippage-tolerant) to return to flat.
+        Used when the second leg cleanly fails and when the first leg partial-fills
+        (``leg2`` is then ``None``). Works for whichever side leg 1 bought (the
+        rejection-prone leg may be the NO leg when Kalshi is the NO venue)."""
         venue = self.venues[leg1.venue]
-        buy_px = leg1.avg_price if leg1.avg_price is not None else opp.yes_price
-        # Cross the REAL best bid so the IOC actually fills (a fixed haircut off the buy
-        # price can sit above a thin book's bid and never fill -> stuck naked + halt).
-        # The YES bid = 1 - no_ask from the live book; floor at $0.01. Fall back to the
-        # haircut only if the book can't be read.
+        side = leg1.side
+        ref_price = opp.yes_price if side is Side.YES else opp.no_price
+        buy_px = leg1.avg_price if leg1.avg_price is not None else ref_price
+        # Cross the REAL best bid for that side so the IOC actually fills (a fixed haircut
+        # off the buy price can sit above a thin book's bid and never fill -> stuck naked
+        # + halt). YES bid = 1 - no_ask; NO bid = 1 - yes_ask. Floor at $0.01; fall back
+        # to the haircut only if the book can't be read.
         sell_px = max(0.01, round(buy_px - self.unwind_slippage, 4))
         try:
             q = await venue.fetch_quote(RawMarket(market_id=leg1.market_id, title="", raw={}))
         except Exception as exc:
             log.warning("unwind book fetch failed for %s: %s", leg1.market_id, exc)
             q = None
-        if q is not None and q.no_ask is not None:
-            yes_bid = round(1.0 - q.no_ask, 4)
-            sell_px = max(0.01, min(sell_px, yes_bid))   # take the bid, never above it
+        if q is not None:
+            bid = None
+            if side is Side.YES and q.no_ask is not None:
+                bid = round(1.0 - q.no_ask, 4)
+            elif side is Side.NO and q.yes_ask is not None:
+                bid = round(1.0 - q.yes_ask, 4)
+            if bid is not None:
+                sell_px = max(0.01, min(sell_px, bid))    # take the bid, never above it
         unwind = await self._place(
-            venue, leg1.market_id, Side.YES, "sell", sell_px, leg1.filled, "immediate_or_cancel"
+            venue, leg1.market_id, side, "sell", sell_px, leg1.filled, "immediate_or_cancel"
         )
         log.warning("unwind %s", unwind)
 
@@ -352,8 +383,9 @@ class Executor:
         # Net cash effect of buying leg1 then selling it back (a small loss).
         self._spend(leg1.venue, (buy_px - sell_avg) * leg1.filled)
         if self.store is not None:
-            self.store.record_fill(leg1.venue, leg1.market_id, "YES", buy_px, leg1.filled)
-            self.store.record_fill(unwind.venue, unwind.market_id, "YES_SELL", sell_avg, unwind.filled)
+            self.store.record_fill(leg1.venue, leg1.market_id, side.value, buy_px, leg1.filled)
+            self.store.record_fill(
+                unwind.venue, unwind.market_id, f"{side.value}_SELL", sell_avg, unwind.filled)
             self.store.record_pnl(pnl, note=f"unwind ({reason})")
         self._audit("execute_unwound", opp, pnl=pnl)
         log.warning("UNWOUND %s (%s) | pnl=%+.2f", opp.event_key, reason, pnl)

@@ -382,6 +382,7 @@ async def run(
             fee_models=fee_models, store=store,
             max_order_contracts=settings.risk.max_order_contracts,
             min_leg_depth=settings.exec_min_leg_depth,
+            depth_safety=settings.exec_depth_fraction,
         )
         log.warning(
             "LIVE EXECUTION ENABLED (mode=%s) — placing REAL orders, max %s contracts/order, "
@@ -568,6 +569,7 @@ async def stream(
         {v.name: v for v in venues}, risk, fee_models=fee_models, store=store,
         max_order_contracts=settings.risk.max_order_contracts, fill_confirmer=tracker,
         min_leg_depth=settings.exec_min_leg_depth,
+        depth_safety=settings.exec_depth_fraction,
     )
 
     venue_by_name = {v.name: v for v in venues}
@@ -691,6 +693,8 @@ async def stream(
     log.warning("WS depth trust: %s (STREAM_MAX_WS_QUOTE_AGE)",
                 f"fire off live book when both legs sized & < {settings.stream_max_ws_quote_age:g}s old"
                 if settings.stream_max_ws_quote_age > 0 else "off (always REST re-fetch)")
+    log.warning("FOK protection: trade %g%% of shown depth, place %s leg first "
+                "(EXEC_DEPTH_FRACTION)", settings.exec_depth_fraction * 100, "kalshi")
     ceiling = (f"{settings.risk.max_order_contracts:g} ct/order"
                if settings.risk.max_order_contracts and settings.risk.max_order_contracts > 0
                else "no per-order ceiling — sized to balances/depth")
