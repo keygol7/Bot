@@ -573,6 +573,7 @@ async def stream(
         hedge_buffer=settings.exec_hedge_buffer,
         maker_timeout=settings.exec_maker_timeout,
         maker_improvement=settings.exec_maker_improvement,
+        maker_arm_cushion=settings.exec_maker_arm_cushion,
     )
 
     venue_by_name = {v.name: v for v in venues}
@@ -588,7 +589,8 @@ async def stream(
     # Maker mode captures the spread (no slippage), so thin edges need no hedge buffer —
     # fire at just min_edge. Taker mode requires the buffer (fire at min_edge + buffer)
     # so the hedge fills through movement instead of unwinding.
-    fire_threshold = min_edge if settings.exec_maker_mode else min_edge + settings.exec_hedge_buffer
+    fire_threshold = (min_edge + settings.exec_maker_arm_cushion if settings.exec_maker_mode
+                      else min_edge + settings.exec_hedge_buffer)
     engine = StreamingEngine(
         executor=executor, fee_models=fee_models, min_edge=fire_threshold, depth_fetch=depth_fetch,
         max_ws_quote_age=settings.stream_max_ws_quote_age,
@@ -709,9 +711,11 @@ async def stream(
                 "(STREAM_MIN_LEG_PRICE)", settings.stream_min_leg_price,
                 1.0 - settings.stream_min_leg_price)
     if settings.exec_maker_mode:
-        log.warning("execution: MAKER mode — rest the %s leg as a maker (fire edges >= "
-                    "$%.2f, %gs timeout), take the deep leg on fill (EXEC_MAKER_MODE)",
-                    "kalshi", fire_threshold, settings.exec_maker_timeout)
+        log.warning("execution: MAKER mode — rest the %s leg as a maker (fire edges >= lock "
+                    "$%.2f + drift cushion $%.2f = $%.2f, %gs timeout), take the deep leg on "
+                    "fill (EXEC_MAKER_MODE/EXEC_MAKER_ARM_CUSHION)",
+                    "kalshi", min_edge, settings.exec_maker_arm_cushion, fire_threshold,
+                    settings.exec_maker_timeout)
     else:
         log.warning("execution: TAKER mode — only fire edges >= lock $%.2f + hedge $%.2f "
                     "= $%.2f; hedge leg gets $%.2f of fill room (EXEC_HEDGE_BUFFER)",

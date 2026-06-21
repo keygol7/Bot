@@ -92,6 +92,7 @@ class Executor:
         hedge_buffer: float = 0.0,
         maker_timeout: float = 5.0,
         maker_improvement: float = 0.01,
+        maker_arm_cushion: float = 0.0,
     ) -> None:
         self.venues = venues
         self.risk = risk
@@ -132,6 +133,11 @@ class Executor:
         # How far INSIDE the ask to post the maker (>= one tick so post-only doesn't
         # reject it as crossing). Also captures this much extra edge on a fill.
         self.maker_improvement = maker_improvement
+        # Edge required ABOVE the lock floor before RESTING a maker. The resting leg is
+        # exposed to the taker drifting against it (adverse selection); without a cushion
+        # a 1-2c edge fills into an adverse move and the forced hedge locks a loss. Mirrors
+        # hedge_buffer on the taker path, but for the maker's drift-while-resting risk.
+        self.maker_arm_cushion = maker_arm_cushion
 
     def set_balances(self, snapshots) -> None:
         """Seed available cash per venue from account snapshots (startup/refresh)."""
@@ -397,9 +403,16 @@ class Executor:
                 ExecStatus.SKIPPED, f"size < 1 (binding: {binding}={caps[binding]:.3f})")
 
         floor = self.min_lock_edge if self.min_lock_edge is not None else self.risk.limits.min_edge
-        if opp.edge_per_contract < floor - 1e-9:   # maker mode handles thin edges: just lock the floor
+        # Arm only when the edge clears the lock floor PLUS a drift cushion: the maker
+        # rests exposed to the taker moving against it, and the post-fill hedge is forced
+        # (we hold the maker fill), so a sub-cushion edge that drifts locks a guaranteed
+        # loss. The cushion is the maker analog of the taker path's hedge buffer.
+        arm = floor + self.maker_arm_cushion
+        if opp.edge_per_contract < arm - 1e-9:
             return ExecutionReport(
-                ExecStatus.SKIPPED, f"edge {opp.edge_per_contract:.3f} < lock {floor:.3f}")
+                ExecStatus.SKIPPED,
+                f"edge {opp.edge_per_contract:.3f} < lock {floor:.3f} + maker cushion "
+                f"{self.maker_arm_cushion:.3f} — would risk an adverse-fill loss")
 
         # Maker leg = the first_venue (fee-heavy) side; taker = the deep, cheap side.
         if opp.buy_no_venue == self.first_venue:
@@ -475,6 +488,17 @@ class Executor:
             live_ask = fresh.yes_ask if taker[2] is Side.YES else fresh.no_ask
             if live_ask is not None:
                 taker_px = live_ask
+        # The maker has already filled — we hold a one-sided position, so we MUST hedge
+        # (holding it naked is directional risk, not arbitrage). But if the taker drifted
+        # past break-even while the maker rested, this hedge locks a guaranteed loss. Bound
+        # it (hedging caps the loss; naked does not) but log it loudly — a recurring forced
+        # loss means the arming cushion (maker_arm_cushion) is too small for the drift.
+        maker_cost = maker_leg.avg_price if maker_leg.avg_price is not None else maker[3]
+        if maker_cost + taker_px >= 1.0:
+            log.warning(
+                "maker FORCED-LOSS hedge on %s: maker filled %s@%.3f, taker ask now %.3f "
+                "(combined %.3f > 1) — hedging to bound the loss; raise EXEC_MAKER_ARM_CUSHION",
+                opp.event_key, maker[2].value, maker_cost, taker_px, maker_cost + taker_px)
         taker_limit = min(0.99, round(taker_px + self.hedge_buffer, 4))
         hedge = await self._place(
             taker_venue, taker[1], taker[2], "buy", taker_limit, filled, "immediate_or_cancel")

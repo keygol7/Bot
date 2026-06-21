@@ -192,6 +192,39 @@ def test_execute_maker_hedge_reprices_off_live_book():
     assert poly.calls[0][3] == 0.50                # crossed the live ask, not the stale 0.40
 
 
+def test_execute_maker_thin_edge_below_cushion_skips():
+    # A sub-cushion edge must NOT arm a maker: while it rests the taker can drift against
+    # it, and the post-fill hedge is forced — a thin edge that drifts locks a guaranteed
+    # loss. The maker is never even placed.
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly = FakeVenue("poly", [])
+    risk = RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({v.name: v for v in [kalshi, poly]}, risk,
+                  fee_models={v.name: ZeroFeeModel() for v in [kalshi, poly]},
+                  max_order_contracts=0, fill_confirmer=FakeConfirmer({}),
+                  maker_timeout=0.01, maker_arm_cushion=0.05)
+    # edge 0.02 (0.45 + 0.53) < floor 0.01 + cushion 0.05 = 0.06 -> skip, no order.
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.45, no_price=0.53)))
+    assert report.status is ExecStatus.SKIPPED and "cushion" in report.reason
+    assert kalshi.calls == []                       # never rested a maker
+
+
+def test_execute_maker_fat_edge_above_cushion_arms():
+    # The cushion only blocks thin edges: an edge clearing floor+cushion still arms.
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 5, 0.40)])
+    risk = RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({v.name: v for v in [kalshi, poly]}, risk,
+                  fee_models={v.name: ZeroFeeModel() for v in [kalshi, poly]},
+                  max_order_contracts=0, fill_confirmer=FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.50)}),
+                  maker_timeout=0.01, maker_arm_cushion=0.05)
+    # edge 0.10 (0.40 + 0.50) >= floor 0.01 + cushion 0.05 -> arms and locks.
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.40, no_price=0.50)))
+    assert report.status is ExecStatus.SUCCESS and kalshi.calls[0][6] is True
+
+
 def test_execute_maker_unfilled_is_no_trade():
     kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
     poly = FakeVenue("poly", [])                    # hedge must never be attempted

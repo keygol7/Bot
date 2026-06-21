@@ -157,6 +157,14 @@ class Settings:
     # How far inside the ask to post the maker (>= one tick, so post-only doesn't reject
     # it as crossing). Also captures this much extra edge on a fill. Kalshi tick = $0.01.
     exec_maker_improvement: float = 0.01
+    # Maker arming cushion: a resting maker is exposed to the TAKER leg drifting against
+    # it while it waits to fill (adverse selection — it tends to fill exactly when the
+    # market moves). If the taker drifts past the edge before the maker fills, the forced
+    # hedge locks a guaranteed loss. So require this much edge ABOVE the lock floor before
+    # arming a maker — a drift cushion analogous to the taker path's hedge buffer. Set it
+    # at/above the typical taker drift over the maker timeout. 0 = no cushion (unsafe:
+    # arms 1-2c edges that don't survive the rest window).
+    exec_maker_arm_cushion: float = 0.04
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -223,4 +231,5 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_maker_mode=(env("EXEC_MAKER_MODE", "false") or "false").lower() == "true",
         exec_maker_timeout=_env_float("EXEC_MAKER_TIMEOUT", 5.0),
         exec_maker_improvement=_env_float("EXEC_MAKER_IMPROVEMENT", 0.01),
+        exec_maker_arm_cushion=_env_float("EXEC_MAKER_ARM_CUSHION", 0.04),
     )
