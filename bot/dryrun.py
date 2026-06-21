@@ -1067,14 +1067,17 @@ def recheck_matches(settings: Settings, *, limit: int = 100) -> int:
 def diagnose_event(settings: Settings, needle: str, limit: int = 80) -> int:
     """Read-only root-cause for a MISSING match: why isn't event <needle> tradeable?
 
-    For every scanned market whose title/id contains <needle>, print its fingerprint,
-    then every cross-venue pair with the deterministic complement reason AND whether a
-    candidate verdict is cached. The three failure modes are then distinguishable:
+    The two venues spell teams differently (Kalshi 'BELIRI'/'Belgium', Polymarket
+    'bel-irn'/'BEL'), so a single substring can't catch both sides. Instead this ANCHORS
+    on every scanned market whose title/id contains <needle>, then scans the ENTIRE
+    opposite-venue table for a fingerprint complement — encoding-agnostic. For each
+    matchable anchor it prints the best complements (and same-metric near-misses) with the
+    deterministic reason AND whether the pair is cached, so the failure mode is clear:
 
-      * market absent on one venue  -> not scanned (out of window / venue doesn't list it)
+      * no complement at all        -> the other venue doesn't list it (real scan/coverage gap)
       * reason 'ok' but 'NOT cached' -> the embedding/lexical shortlist never proposed the
-        pair, so it never entered ``match_verdicts`` and the fingerprint (authoritative but
-        gated behind that shortlist) never sees it. This is the recall bottleneck.
+        pair, so it never entered ``match_verdicts``; the authoritative fingerprint, gated
+        behind that shortlist, never sees it. This is the recall bottleneck.
       * reason != 'ok'              -> the fingerprint itself rejects it (the reason says why)
     """
     from bot.matching.fingerprint import (
@@ -1084,57 +1087,59 @@ def diagnose_event(settings: Settings, needle: str, limit: int = 80) -> int:
     store = Store(settings.db_path)
     try:
         like = f"%{needle.lower()}%"
-        rows = store.conn.execute(
+        anchors = store.conn.execute(
             """SELECT venue, market_id, title FROM markets
                WHERE lower(title) LIKE ? OR lower(market_id) LIKE ?
                ORDER BY venue, market_id LIMIT ?""",
             (like, like, limit),
         ).fetchall()
-        if not rows:
-            print(f"no scanned markets match '{needle}'. If you expected one, the market "
-                  f"isn't in the DB at all — it wasn't scanned (out of the imminent window, "
-                  f"or the venue doesn't list it). Widen --close-within-days / re-scan.")
+        if not anchors:
+            print(f"no scanned markets match '{needle}'. If you expected one, it isn't in "
+                  f"the DB — not scanned (out of the imminent window, or the venue doesn't "
+                  f"list it). Widen --close-within-days / re-scan.")
             return 0
-
-        by_venue: dict[str, list] = {}
-        for r in rows:
-            by_venue.setdefault(r["venue"], []).append(r)
+        all_markets = store.conn.execute(
+            "SELECT venue, market_id, title FROM markets"
+        ).fetchall()
 
         def fp(venue, mid, title):
             return (from_kalshi(mid, title) if venue == "kalshi"
                     else from_polymarket(mid, title))
 
-        for venue, items in by_venue.items():
-            print(f"\n[{venue}] {len(items)} scanned market(s):")
-            for r in items:
-                f = fp(venue, r["market_id"], r["title"] or "")
-                print(f"  {r['market_id']}  {r['title']}")
-                print(f"      metric={f.metric} league={f.league} thr={f.threshold} "
-                      f"subj={sorted(f.subject)} matchup={sorted(f.matchup)} "
-                      f"matchable={f.matchable}")
+        # Pre-compute the opposite-venue fingerprints once.
+        others = [(m, fp(m["venue"], m["market_id"], m["title"] or "")) for m in all_markets]
 
-        venues = list(by_venue)
-        if len(venues) < 2:
-            print("\n  -> only ONE venue has markets for this event; the other side wasn't "
-                  "scanned, so nothing can pair. That's the miss: scan scope, not matching.")
-            return 0
-
-        print("\ncross-venue pairs (deterministic complement reason; ✓ ok = would match):")
-        for i in range(len(venues)):
-            for j in range(i + 1, len(venues)):
-                for ra in by_venue[venues[i]]:
-                    for rb in by_venue[venues[j]]:
-                        fa = fp(venues[i], ra["market_id"], ra["title"] or "")
-                        fb = fp(venues[j], rb["market_id"], rb["title"] or "")
-                        reason = complement_reason(fa, fb)
-                        v = store.get_verdict(
-                            venues[i], ra["market_id"], venues[j], rb["market_id"])
-                        cached = (f"cached same_event={v['same_event']}" if v else "NOT cached")
-                        mark = "✓" if reason == "ok" else "✗"
-                        print(f"  {mark} {reason:<30} [{cached}]")
-                        print(f"      {ra['market_id']}  /  {rb['market_id']}")
-        print("\n  legend: '✓ ok + NOT cached' = recall bottleneck (shortlist never "
-              "proposed it); '✗ <reason>' = fingerprint rejected it; one-sided = scan gap.")
+        matchable_anchors = 0
+        for a in anchors:
+            fa = fp(a["venue"], a["market_id"], a["title"] or "")
+            if not fa.matchable:
+                continue                          # unmatchable by design — skip the noise
+            matchable_anchors += 1
+            print(f"\n[{a['venue']}] {a['market_id']}  {a['title']}")
+            print(f"    metric={fa.metric} league={fa.league} thr={fa.threshold} "
+                  f"subj={sorted(fa.subject)} matchup={sorted(fa.matchup)}")
+            hits, near = [], []
+            for m, fb in others:
+                if m["venue"] == a["venue"] or not fb.matchable:
+                    continue
+                reason = complement_reason(fa, fb)
+                if reason == "ok":
+                    hits.append((reason, m))
+                elif fa.metric == fb.metric:      # same metric, just failed a later gate
+                    near.append((reason, m))
+            if not hits and not near:
+                print("    -> NO complement or same-metric market on the other venue "
+                      "(coverage gap: the counterpart isn't scanned / doesn't exist)")
+            for reason, m in hits[:6]:
+                v = store.get_verdict(a["venue"], a["market_id"], m["venue"], m["market_id"])
+                cached = (f"cached same_event={v['same_event']}" if v else "NOT cached")
+                print(f"    ✓ ok                  [{cached}]  [{m['venue']}] "
+                      f"{m['market_id']}  {m['title']}")
+            for reason, m in near[:4]:
+                print(f"    ✗ {reason:<18}  [{m['venue']}] {m['market_id']}  {m['title']}")
+        print(f"\n  {matchable_anchors} matchable anchor(s) examined. legend: "
+              "'✓ ok + NOT cached' = recall bottleneck (shortlist never proposed it); "
+              "'✗ <reason>' = fingerprint rejected; 'NO complement' = coverage gap.")
         return 0
     finally:
         store.close()
