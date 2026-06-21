@@ -631,6 +631,7 @@ async def stream(
         cached = store.confirmed_pairs(
             use_fingerprint=settings.match_use_fingerprint,
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
+            sweep_fresh_s=(settings.match_sweep_fresh_hours * 3600) or None,
         )
         return await build_watchlist(cached, res.scanned, venues, store=store)
 
@@ -934,6 +935,7 @@ def show_watchlist(settings: Settings, *, limit: int = 500) -> int:
             cached = store.confirmed_pairs(
                 use_fingerprint=settings.match_use_fingerprint,
                 fingerprint_metrics=settings.match_fingerprint_metrics or None,
+                sweep_fresh_s=(settings.match_sweep_fresh_hours * 3600) or None,
             )
             # No wide scan needed: build_watchlist probes each cached leg directly.
             live = await build_watchlist(cached, set(), venues)
@@ -1193,6 +1195,7 @@ def inspect_matches(
         tradeable_pairs = store.confirmed_pairs(
             use_fingerprint=settings.match_use_fingerprint,
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
+            sweep_fresh_s=(settings.match_sweep_fresh_hours * 3600) or None,
         )
         if tradeable_only:
             # Exactly what the streamer will trade — audit this before going live.

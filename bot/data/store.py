@@ -267,6 +267,7 @@ class Store:
         self, min_confidence: float = 0.85, max_fanout: Optional[int] = 1,
         drop_scope_mismatch: bool = True, safe_types_only: bool = True,
         use_fingerprint: bool = False, fingerprint_metrics: Optional[frozenset] = None,
+        sweep_fresh_s: Optional[float] = None,
     ) -> list[tuple]:
         """Cached tradeable pairs: (venue_a, market_a, venue_b, market_b, event_key).
 
@@ -289,7 +290,7 @@ class Store:
            ``None`` to disable.
         """
         if use_fingerprint:
-            return self._fingerprint_sweep(fingerprint_metrics, max_fanout)
+            return self._fingerprint_sweep(fingerprint_metrics, max_fanout, sweep_fresh_s)
         rows = self.conn.execute(
             """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b, v.event_key,
                       ma.title AS title_a, mb.title AS title_b
@@ -324,6 +325,7 @@ class Store:
 
     def _fingerprint_sweep(
         self, fingerprint_metrics: Optional[frozenset], max_fanout: Optional[int],
+        fresh_within_s: Optional[float] = None,
     ) -> list[tuple]:
         """Authoritative matcher: fingerprint EVERY scanned cross-venue market pair and
         keep the provable complements — independent of the embedding/LLM shortlist, which
@@ -331,16 +333,27 @@ class Store:
         deterministic fingerprint is the precision gate, so any structurally complementary
         pair becomes tradeable the moment both legs are scanned. Pairs are blocked by metric
         (a complement requires equal metric) so the sweep is O(sum of per-metric K*P), not a
-        full O(N^2). One leg is always Kalshi; same-venue pairs are never formed."""
+        full O(N^2). One leg is always Kalshi; same-venue pairs are never formed.
+
+        ``fresh_within_s`` bounds the sweep to markets the scanner has seen within that many
+        seconds: settled markets stop being re-scanned, so their ``updated_at`` goes stale
+        and they drop out (otherwise the sweep resurfaces every long-settled game ever
+        scanned). ``None`` sweeps the whole table."""
         from collections import defaultdict
 
         from bot.matching.fingerprint import (
             are_complementary, from_kalshi, from_polymarket,
         )
 
-        rows = self.conn.execute(
-            "SELECT venue, market_id, title FROM markets"
-        ).fetchall()
+        if fresh_within_s is not None:
+            rows = self.conn.execute(
+                "SELECT venue, market_id, title FROM markets WHERE updated_at >= ?",
+                (time.time() - fresh_within_s,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT venue, market_id, title FROM markets"
+            ).fetchall()
         # Fingerprint each market once; drop the unmatchable ones up front, then bucket by
         # metric and Kalshi/other side so only plausible counterparties are compared.
         by_metric: dict[str, dict[str, list]] = defaultdict(
