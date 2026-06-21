@@ -807,6 +807,62 @@ def check_ws(settings: Settings) -> int:
     return asyncio.run(_run())
 
 
+def probe_ws_book(settings: Settings, slug: str, n: int = 6) -> int:
+    """Diagnose the Polymarket WS-vs-REST top-of-book gap for one slug.
+
+    Fetches the REST ``/book`` top, then captures the first ``n`` raw MARKET_DATA WS
+    messages and, for each, prints the raw level counts + the parsed top. If the WS
+    messages carry only a few levels and their parsed top diverges from REST, the channel
+    is delta-based (and our snapshot assumption is the bug). If they carry the full book
+    and still differ, it's a side/parse issue or genuine fast movement.
+    """
+    from bot.venues.polymarket_us import parse_market_data
+
+    async def _run() -> int:
+        venues = {v.name: v for v in _build_venues(settings)}
+        v = venues.get("polymarket_us")
+        if v is None:
+            print("polymarket_us venue not configured (need QCEX creds)")
+            return 2
+        try:
+            rest = await v.fetch_quote(RawMarket(market_id=slug, title="", raw={}))
+            if rest is None:
+                print(f"REST /book: no quote for {slug} (404?)")
+            else:
+                print(f"REST /book : yes_ask={rest.yes_ask}@{rest.yes_ask_size:g}  "
+                      f"no_ask={rest.no_ask}@{rest.no_ask_size:g}  state={getattr(rest,'state',None)}")
+            print(f"\ncapturing {n} raw WS MARKET_DATA messages for {slug} ...\n")
+            try:
+                msgs = await v.capture_market_data([slug], limit=n)
+            except Exception as exc:
+                print(f"WS capture failed: {exc}")
+                return 1
+            for i, m in enumerate(msgs):
+                md = m.get("marketData") or {}
+                bids = md.get("bids") or []
+                offers = md.get("offers") or []
+                top_bids = [(b.get("px", {}).get("value", b.get("px")), b.get("qty")) for b in bids[:3]]
+                top_offers = [(o.get("px", {}).get("value", o.get("px")), o.get("qty")) for o in offers[:3]]
+                q = parse_market_data(m)
+                keys = sorted(k for k in md.keys() if k not in ("bids", "offers"))
+                print(f"[msg {i}] slug={md.get('marketSlug')} other_keys={keys}")
+                print(f"         bids({len(bids)}) top={top_bids}")
+                print(f"         offers({len(offers)}) top={top_offers}")
+                if q is not None:
+                    print(f"         -> parsed yes_ask={q.yes_ask}@{q.yes_ask_size:g}  "
+                          f"no_ask={q.no_ask}@{q.no_ask_size:g}")
+            print("\nread: if bids/offers counts are small and the parsed top swings between "
+                  "messages / disagrees with REST, the channel is DELTA-based — each message "
+                  "is a partial book, so parsing it as a full snapshot picks a wrong top.")
+        finally:
+            aclose = getattr(v, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        return 0
+
+    return asyncio.run(_run())
+
+
 def show_book(settings: Settings, spec: str) -> int:
     """Fetch and print one market's real order book (sized quote) from its venue.
     ``spec`` is ``venue:market_id``. Read-only — diagnoses whether a market actually
@@ -1436,6 +1492,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="time window for --edge-report (default 24h)")
     p.add_argument("--show-book", metavar="VENUE:MARKET", default=None,
                    help="fetch and print one market's real order book (sized quote)")
+    p.add_argument("--probe-ws-book", metavar="SLUG", default=None,
+                   help="diagnose the Polymarket WS-vs-REST top-of-book gap: print the REST "
+                        "/book top then the first raw WS MARKET_DATA messages for SLUG")
     p.add_argument("--test-order", metavar="VENUE:MARKET", default=None,
                    help="place ONE test order to verify the live buying path; default "
                         "is a no-fill canary ($0 spent). Add --fill for a real buy.")
@@ -1524,6 +1583,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.show_book:
         raise SystemExit(show_book(load_settings(), args.show_book))
+
+    if args.probe_ws_book:
+        raise SystemExit(probe_ws_book(load_settings(), args.probe_ws_book))
 
     if args.recheck_matches:
         raise SystemExit(recheck_matches(load_settings(), limit=args.limit))

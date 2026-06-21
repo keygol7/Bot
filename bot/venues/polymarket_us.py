@@ -646,6 +646,40 @@ class PolymarketUSVenue:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
+    async def capture_market_data(
+        self, market_ids: list[str], *, limit: int = 6, idle_timeout: float = 20.0
+    ) -> list[dict[str, Any]]:
+        """Capture the first ``limit`` raw MARKET_DATA messages for diagnostics.
+
+        Subscribes exactly like :meth:`stream_order_book` but returns the raw decoded JSON
+        (not normalized), so a caller can see whether the channel sends a full snapshot or
+        incremental deltas, and whether the streamed top-of-book matches REST ``/book``.
+        """
+        if not getattr(self.cfg, "is_trading_configured", False):
+            raise OrderNotPermitted("Polymarket US credentials required for the WebSocket")
+        import json
+
+        import websockets  # lazy
+
+        path = "/v1/ws/markets"
+        out: list[dict[str, Any]] = []
+        headers = self._auth_headers("GET", path)
+        async with websockets.connect(
+            self.cfg.ws_markets, additional_headers=headers, open_timeout=10
+        ) as ws:
+            await ws.send(json.dumps({"subscribe": {
+                "requestId": "probe",
+                "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
+                "marketSlugs": market_ids,
+            }}))
+            while len(out) < limit:
+                raw = await asyncio.wait_for(ws.recv(), timeout=idle_timeout)
+                data = json.loads(raw)
+                if "heartbeat" in data or data.get("error"):
+                    continue
+                out.append(data)
+        return out
+
     def _api(self):
         """HTTP client for the authenticated trading API."""
         if self._api_client is None:
