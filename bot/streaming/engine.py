@@ -196,12 +196,20 @@ class StreamingEngine:
 
     async def _confirm_depth(self, p: ConfirmedPair):
         """Re-fetch real order-book depth for both legs and recompute the best
-        direction with true sizes + fresh prices. Returns the eval tuple or None."""
+        direction with true sizes + fresh prices. Returns the eval tuple or None.
+
+        The two legs are fetched CONCURRENTLY (asyncio.gather), so the confirmed edge is
+        sampled on a snapshot as near-simultaneous as the network allows. Fetching them
+        sequentially would leave the books tens of ms apart — and on a fast in-play market
+        that residual skew is itself a source of phantom edges (the very thing this confirm
+        exists to reject)."""
         if self.depth_fetch is None:
             return None
         try:
-            da = await self.depth_fetch(p.venue_a, p.market_a)
-            db = await self.depth_fetch(p.venue_b, p.market_b)
+            da, db = await asyncio.gather(
+                self.depth_fetch(p.venue_a, p.market_a),
+                self.depth_fetch(p.venue_b, p.market_b),
+            )
         except Exception as exc:
             log.warning("depth fetch failed for %s: %s", p.event_key, exc)
             return None

@@ -216,6 +216,29 @@ def test_maker_mode_confirms_depth_even_on_fresh_ws_book():
     assert fe.calls == []                 # phantom edge -> nothing armed
 
 
+def test_confirm_depth_fetches_both_legs_concurrently():
+    # The two confirm fetches must be in flight at once (asyncio.gather) so the edge is
+    # sampled on a near-simultaneous snapshot. Each fetch here blocks until BOTH have
+    # started: if they ran sequentially the second would never start, the first would time
+    # out, and only one leg would be recorded. Concurrency -> both start -> the gate opens.
+    started = []
+    both = asyncio.Event()
+
+    async def depth_fetch(venue, mid):
+        started.append(venue)
+        if len(started) == 2:
+            both.set()
+        await asyncio.wait_for(both.wait(), 1.0)
+        return q(venue, mid, yes_ask=0.40, ya=50, no_ask=0.65, na=50)
+
+    eng = StreamingEngine(
+        executor=FakeExec(), fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, depth_fetch=depth_fetch,
+    )
+    ev = asyncio.run(eng._confirm_depth(ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")))
+    assert started == ["kalshi", "poly"] and ev is not None    # both in flight together
+
+
 def test_stale_ws_quote_still_uses_rest_depth_fetch():
     # An old WS quote (beyond max_ws_quote_age) must fall back to the REST confirm.
     fe = FakeExec()
