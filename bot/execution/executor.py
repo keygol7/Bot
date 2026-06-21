@@ -168,6 +168,23 @@ class Executor:
                 log.warning("fill confirm failed for %s: %s", result.order_id, exc)
         return result
 
+    async def _position_after_error(self, venue, market_id):
+        """After an ambiguous leg ERROR, ask the venue whether a position actually
+        resulted. Returns True (a position exists -> naked risk), False (flat -> the
+        order didn't fill, safe to skip), or None (couldn't determine -> fail closed)."""
+        snap_fn = getattr(venue, "account_snapshot", None)
+        if snap_fn is None:
+            return None
+        try:
+            snap = await snap_fn()
+        except Exception as exc:
+            log.warning("post-error reconcile failed for %s: %s", market_id, exc)
+            return None
+        for pos in getattr(snap, "positions", None) or []:
+            if pos.market_id == market_id and pos.is_open:
+                return True
+        return False
+
     def _max_size(self, opp: ArbOpportunity) -> tuple[int, dict[str, float]]:
         """Largest whole-contract size that fits every hard limit at once:
 
@@ -273,7 +290,20 @@ class Executor:
         )
         log.info("leg1 %s", leg1)
         if leg1.status is OrderStatus.ERROR:
-            return self._halt(f"leg1 ERROR — fill state unknown ({_reject_reason(leg1)})", [leg1])
+            # An ambiguous order error (e.g. a transient network timeout) shouldn't
+            # freeze the whole bot. Reconcile against the venue: if no position
+            # resulted, it's a clean skip and we keep trading; only halt if a position
+            # exists (real naked risk) or we can't tell (fail closed).
+            left = await self._position_after_error(first_venue, first[1])
+            if left is False:
+                log.warning("leg1 ERROR but %s flat — no position, skipping (%s)",
+                            first[1], _reject_reason(leg1))
+                return ExecutionReport(
+                    ExecStatus.SKIPPED,
+                    f"leg1 ERROR, account flat — no position ({_reject_reason(leg1)})", [leg1])
+            return self._halt(
+                f"leg1 ERROR — {'position exists' if left else 'fill state unknown'} "
+                f"({_reject_reason(leg1)})", [leg1])
         if not leg1.left_a_position:
             # Clean: the first leg didn't fill, so NO position was taken — just skip.
             return ExecutionReport(

@@ -102,6 +102,49 @@ def test_leg1_killed_skips_no_position():
     assert not risk.is_killed
 
 
+class SnapshotVenue(FakeVenue):
+    """FakeVenue that also answers account_snapshot (for leg-1 ERROR reconciliation)."""
+
+    def __init__(self, name, responses, positions):
+        super().__init__(name, responses)
+        self._positions = positions
+
+    async def account_snapshot(self):
+        from bot.execution.account import AccountSnapshot
+        return AccountSnapshot(self.name, 1000.0, self._positions)
+
+
+def test_leg1_error_reconciles_flat_and_skips():
+    # A transient leg-1 ERROR with the account actually flat -> clean skip, no halt.
+    kalshi = SnapshotVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.ERROR, 0, None)], [])
+    poly = FakeVenue("poly", [])
+    ex, risk = make_exec([kalshi, poly])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.SKIPPED
+    assert not risk.is_killed and poly.calls == []     # not killed -> keeps trading
+
+
+def test_leg1_error_with_real_position_halts():
+    from bot.execution.account import VenuePosition
+    kalshi = SnapshotVenue(
+        "kalshi", [res("kalshi", Side.YES, OrderStatus.ERROR, 0, None)],
+        [VenuePosition("K1", 5, 0)],                    # a real naked position exists
+    )
+    poly = FakeVenue("poly", [])
+    ex, risk = make_exec([kalshi, poly])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.HALTED and risk.is_killed
+
+
+def test_leg1_error_unreconcilable_halts():
+    # Venue can't be reconciled (no account_snapshot) -> fail closed (halt).
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.ERROR, 0, None)])
+    poly = FakeVenue("poly", [])
+    ex, risk = make_exec([kalshi, poly])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.HALTED and risk.is_killed
+
+
 def test_leg2_error_halts_and_trips_kill_switch():
     yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
     no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.ERROR, 0, None)])
