@@ -662,6 +662,30 @@ class Executor:
             log.warning("maker hedge %s — %s", hedge.status.value, _reject_reason(hedge))
             return await self._unwind(
                 opp, maker_leg, hedge, reason=f"maker hedge {hedge.status.value} ({_reject_reason(hedge)})")
+        if hedge.status is OrderStatus.ERROR:
+            # Ambiguous hedge (e.g. a Polymarket 500/timeout). We already HOLD the maker
+            # fill, so holding it naked into settlement is the dangerous state — that is
+            # exactly how a hedge error became a total loss. Reconcile the hedge venue: if
+            # the hedge fully landed, settle; if it's flat, UNWIND the maker fill back to
+            # flat (cap the loss at the round-trip spread, not the whole position); only a
+            # partial/unreadable hedge halts for manual reconciliation.
+            qty = await self._hedge_qty_after_error(taker_venue, taker[1])
+            if qty is not None and qty >= filled - 1e-9:
+                log.warning("maker hedge ERROR but %s holds %g — hedge landed, settling (%s)",
+                            taker[1], qty, _reject_reason(hedge))
+                hedge = replace(
+                    hedge, status=OrderStatus.FILLED, filled=filled,
+                    avg_price=hedge.avg_price if hedge.avg_price is not None else taker_limit)
+                return self._settle_success(opp, filled, [maker_leg, hedge])
+            if qty is not None and qty <= 1e-9:
+                log.warning("maker hedge ERROR but %s flat — unwinding the naked maker fill (%s)",
+                            taker[1], _reject_reason(hedge))
+                return await self._unwind(
+                    opp, maker_leg, hedge,
+                    reason=f"maker hedge ERROR, hedge flat ({_reject_reason(hedge)})")
+            return self._halt(
+                f"maker hedge ambiguous (ERROR: {_reject_reason(hedge)}; "
+                f"hedge qty {qty}) — manual reconcile", [maker_leg, hedge])
         return self._halt(
             f"maker hedge ambiguous ({hedge.status.value}: {_reject_reason(hedge)})",
             [maker_leg, hedge])

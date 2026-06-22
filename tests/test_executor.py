@@ -345,6 +345,34 @@ def test_execute_maker_hedge_fails_unwinds_maker():
     assert kalshi.calls[1][2] == "sell"            # the maker NO leg was sold back
 
 
+def test_execute_maker_hedge_error_flat_unwinds():
+    # Maker fills; the Poly hedge ERRORS (500/timeout) and reconciles to FLAT -> UNWIND the
+    # naked maker fill instead of halting and holding it into settlement (the Ruzic loss).
+    kalshi = FakeVenue("kalshi", [
+        res("kalshi", Side.NO, OrderStatus.RESTING, 0, None),
+        res("kalshi", Side.NO, OrderStatus.FILLED, 5, 0.54, action="sell"),
+    ])
+    poly = SnapshotVenue("poly", [res("poly", Side.YES, OrderStatus.ERROR, 0, None)], [])
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55)}))
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.UNWOUND and not risk.is_killed
+    assert kalshi.calls[1][2] == "sell"            # the naked maker leg was flattened
+
+
+def test_execute_maker_hedge_error_present_settles():
+    # Maker fills; the Poly hedge ERRORS but the venue actually holds the hedge -> settle
+    # the locked arb rather than freezing.
+    from bot.execution.account import VenuePosition
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly = SnapshotVenue("poly", [res("poly", Side.YES, OrderStatus.ERROR, 0, None)],
+                         [VenuePosition("K1", 5, 0)])
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55)}))
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.SUCCESS and not risk.is_killed
+
+
 def test_execute_maker_rejected_when_would_cross():
     kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.REJECTED, 0, None)])
     poly = FakeVenue("poly", [])

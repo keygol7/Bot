@@ -609,11 +609,13 @@ class KalshiVenue:
             "self_trade_prevention_type": "taker_at_cross",
             "post_only": bool(post_only),
         }
-        # Kalshi's V2 auto-cancel field is `expiration_ts` (Unix seconds) used WITH
-        # time_in_force=good_till_canceled. An unknown key (e.g. "expiration_time") is
-        # silently ignored, leaving a true GTC maker that never expires — it then rests
-        # indefinitely and can fill long after we stop watching, NAKED. Use the right key.
+        # Self-expiry for a resting maker. The docs name the field `expiration_ts`, but a
+        # live order record confirmed the maker actually expires when sent as
+        # `expiration_time` (the returned order carried our exact +timeout value). Send
+        # BOTH keys so the expiry is honored regardless of which the API reads — a maker
+        # that fails to expire would rest indefinitely and fill naked later.
         if expiration_ts is not None:
+            body["expiration_time"] = int(expiration_ts)
             body["expiration_ts"] = int(expiration_ts)
 
         endpoint = "/portfolio/events/orders"
