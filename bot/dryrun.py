@@ -1443,6 +1443,35 @@ def kalshi_history(settings: Settings, *, limit: int = 100, find: str | None = N
     return 0
 
 
+def kalshi_order(settings: Settings, order_id: str) -> int:
+    """Print one Kalshi order's full record (GET /portfolio/orders/{id}) so a maker that
+    rested past its intended expiry — and filled naked — is provable from created_time vs
+    expiration_time vs the fill. Read-only."""
+    import json as _json
+
+    from bot.venues.kalshi import KalshiVenue
+
+    if not settings.kalshi.api_key_id:
+        print("Kalshi API credentials not configured (set KALSHI_API_KEY_ID + key path)")
+        return 1
+    v = KalshiVenue(settings.kalshi)
+
+    async def _run():
+        try:
+            data = await v.order_detail(order_id)
+        finally:
+            await v.aclose()
+        order = data.get("order") if isinstance(data, dict) else data
+        print(_json.dumps(order, indent=2, default=str))
+        if isinstance(order, dict):
+            print("\nKey fields: status=%s created=%s expiration=%s last_update=%s" % (
+                order.get("status"), order.get("created_time"),
+                order.get("expiration_time"), order.get("last_update_time")))
+
+    asyncio.run(_run())
+    return 0
+
+
 def edge_report(settings: Settings, *, hours: float = 24.0) -> int:
     """Summarize logged edge observations (what the streamer saw + did) over a window.
 
@@ -1578,6 +1607,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--kalshi-history", action="store_true",
                    help="print recent Kalshi fills + settlements (read-only order history) "
                         "with UTC+local times; filter with --find, size with --limit")
+    p.add_argument("--kalshi-order", metavar="ORDER_ID", default=None,
+                   help="print one Kalshi order's full record (created/expiration/status) "
+                        "to trace whether a maker expired or rested into a late naked fill")
     p.add_argument("--compare-filters", action="store_true",
                    help="SHADOW: compare the structured fingerprint matcher vs the live "
                         "filter over cached verdicts (adds/removes); trades nothing")
@@ -1668,6 +1700,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.kalshi_history:
         raise SystemExit(kalshi_history(
             load_settings(), limit=args.limit if args.limit != 50 else 100, find=args.find))
+
+    if args.kalshi_order:
+        raise SystemExit(kalshi_order(load_settings(), args.kalshi_order))
 
     if args.find:
         raise SystemExit(find_markets(load_settings(), args.find))

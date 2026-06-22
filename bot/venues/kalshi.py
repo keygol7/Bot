@@ -609,8 +609,12 @@ class KalshiVenue:
             "self_trade_prevention_type": "taker_at_cross",
             "post_only": bool(post_only),
         }
+        # Kalshi's V2 auto-cancel field is `expiration_ts` (Unix seconds) used WITH
+        # time_in_force=good_till_canceled. An unknown key (e.g. "expiration_time") is
+        # silently ignored, leaving a true GTC maker that never expires — it then rests
+        # indefinitely and can fill long after we stop watching, NAKED. Use the right key.
         if expiration_ts is not None:
-            body["expiration_time"] = int(expiration_ts)
+            body["expiration_ts"] = int(expiration_ts)
 
         endpoint = "/portfolio/events/orders"
         await self._limiter.wait()
@@ -698,6 +702,16 @@ class KalshiVenue:
             if pos.is_open:
                 positions.append(pos)
         return AccountSnapshot(self.name, balance, positions)
+
+    async def order_detail(self, order_id: str) -> dict:
+        """Raw order record from GET /portfolio/orders/{id}: created_time, expiration_time,
+        status, last_update_time — for tracing whether a maker actually expired or rested
+        until a late (naked) fill. Read-only."""
+        await self._limiter.wait()
+        path = f"/portfolio/orders/{order_id}"
+        resp = await self._http().get(path, headers=self._auth_headers("GET", path))
+        resp.raise_for_status()
+        return resp.json()
 
     async def fills(self, *, limit: int = 200, ticker: str | None = None) -> list[dict]:
         """Recent fills (executed trades) from /portfolio/fills — the authoritative order

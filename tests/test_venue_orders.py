@@ -76,7 +76,9 @@ def test_kalshi_maker_order_rests():
                                   tif="gtc", post_only=True, expiration_ts=1782300000))
     assert cap["body"]["post_only"] is True
     assert cap["body"]["time_in_force"] == "good_till_canceled"
-    assert cap["body"]["expiration_time"] == 1782300000
+    # Kalshi's auto-cancel key is `expiration_ts` (Unix s); a wrong key is silently ignored
+    # and the maker never expires (rests -> late naked fill).
+    assert cap["body"]["expiration_ts"] == 1782300000
     assert r.status.value == "RESTING" and r.order_id == "m1" and r.filled == 0.0
 
 
