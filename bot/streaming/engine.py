@@ -73,6 +73,8 @@ class StreamingEngine:
         min_leg_price: float = 0.0,
         store=None,
         maker_mode: bool = False,
+        hybrid_take_depth: float = 0.0,
+        hybrid_take_bar: float = 0.0,
         edge_snapshot_top: int = 5,
         edge_persist_secs: float = 0.0,
         prime_concurrency: int = 8,
@@ -99,6 +101,15 @@ class StreamingEngine:
         # Maker mode: rest the fee-heavy leg as a maker and complete it asynchronously
         # (so a pending maker doesn't block the quote loop). One maker per pair at a time.
         self.maker_mode = maker_mode
+        # Hybrid take-or-rest (maker mode only): when a depth-confirmed edge has at least
+        # ``hybrid_take_depth`` contracts of real top-of-book size AND clears the taker bar
+        # ``hybrid_take_bar`` (the raw lock floor + the taker hedge buffer — NOT the maker
+        # arm bar that ``min_edge`` carries in maker mode), TAKE it immediately (cross both
+        # books, lock now) instead of resting a maker that may never get crossed. Deep-but-
+        # thin edges (below the taker bar) and shallow edges still rest a maker. A take_depth
+        # of 0 disables it (pure maker mode — never auto-takes).
+        self.hybrid_take_depth = hybrid_take_depth
+        self.hybrid_take_bar = hybrid_take_bar
         # How many of the best edges the periodic snapshot logs each interval.
         self.edge_snapshot_top = edge_snapshot_top
         # Require an edge to persist this many seconds before acting (distinguishes a real
@@ -330,6 +341,23 @@ class StreamingEngine:
                 return None
         opp = self._build_opp(p, edge, yq, nq, size)
         if self.maker_mode:
+            # Hybrid take-or-rest: a depth-confirmed edge that has REAL top-of-book size
+            # (>= hybrid_take_depth) AND clears the taker bar (lock floor + hedge buffer)
+            # is takeable right now — cross both books and lock it immediately rather than
+            # resting a maker that may never get crossed. Edges that are deep but thin
+            # (below the taker bar) or shallow fall through to the maker. 0 = disabled.
+            if (self.hybrid_take_depth > 0 and size >= self.hybrid_take_depth
+                    and edge >= self.hybrid_take_bar - 1e-9):
+                log.info("STREAM edge %.4f sz %g on %s -> hybrid TAKE "
+                         "(depth >= %g, clears taker bar %.4f)",
+                         edge, size, p.event_key, self.hybrid_take_depth, self.hybrid_take_bar)
+                report = await self._execute_guarded(opp)
+                log.info("STREAM exec %s | %s", p.event_key, report)
+                status = getattr(report, "status", None)
+                self._observe(p, edge, yq, nq, size,
+                              status.value if status is not None else "executed")
+                self._note_outcome(key, p, report)
+                return report
             # Rest a maker and complete it asynchronously so a pending maker doesn't
             # block the quote loop (it may wait seconds to fill). Tracked + shielded.
             self._maker_inflight.add(key)

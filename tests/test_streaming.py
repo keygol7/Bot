@@ -599,6 +599,92 @@ def test_maker_mode_one_resting_maker_per_pair():
     assert fe.calls == 1
 
 
+class HybridExec:
+    """Records taker (execute) and maker (execute_maker) calls separately so a test
+    can assert which path the hybrid router chose."""
+
+    def __init__(self):
+        from bot.execution.executor import ExecStatus, ExecutionReport
+        self.taker = []
+        self.maker = []
+        self._report = ExecutionReport(ExecStatus.SUCCESS, "locked")
+
+    async def execute(self, opp):
+        self.taker.append(opp)
+        return self._report
+
+    async def execute_maker(self, opp):
+        self.maker.append(opp)
+        return self._report
+
+
+def _hybrid_engine(fe, *, take_depth, take_bar):
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, maker_mode=True,
+        hybrid_take_depth=take_depth, hybrid_take_bar=take_bar)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    return eng
+
+
+def test_hybrid_takes_deep_edge_that_clears_taker_bar():
+    # edge 0.05 on 60 contracts: clears the 0.04 taker bar AND has >= 50 depth -> TAKE now.
+    fe = HybridExec()
+    eng = _hybrid_engine(fe, take_depth=50, take_bar=0.04)
+
+    async def driver():
+        await eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
+        r = await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60))
+        assert r is not None                        # taker runs inline and returns its report
+        await asyncio.gather(*list(eng._inflight))
+
+    asyncio.run(driver())
+    assert len(fe.taker) == 1 and fe.maker == []    # took it, did not rest a maker
+    assert fe.taker[0].max_contracts == 60
+
+
+def test_hybrid_rests_maker_when_depth_too_thin():
+    # Same 0.05 edge but only 20 contracts of size (< take_depth 50) -> rest a maker.
+    fe = HybridExec()
+    eng = _hybrid_engine(fe, take_depth=50, take_bar=0.04)
+
+    async def driver():
+        await eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
+        await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=20))
+        await asyncio.gather(*list(eng._inflight))
+
+    asyncio.run(driver())
+    assert fe.maker and fe.taker == []              # rested a maker, did not take
+
+
+def test_hybrid_rests_maker_when_edge_below_taker_bar():
+    # Deep (60) but a thin 0.05 edge under a high 0.06 taker bar -> rest a maker, don't take.
+    fe = HybridExec()
+    eng = _hybrid_engine(fe, take_depth=50, take_bar=0.06)
+
+    async def driver():
+        await eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
+        await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60))
+        await asyncio.gather(*list(eng._inflight))
+
+    asyncio.run(driver())
+    assert fe.maker and fe.taker == []
+
+
+def test_hybrid_disabled_always_rests_maker():
+    # take_depth 0 = pure maker mode: never auto-takes even a deep, bar-clearing edge.
+    fe = HybridExec()
+    eng = _hybrid_engine(fe, take_depth=0, take_bar=0.04)
+
+    async def driver():
+        await eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
+        await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60))
+        await asyncio.gather(*list(eng._inflight))
+
+    asyncio.run(driver())
+    assert fe.maker and fe.taker == []
+
+
 def test_consume_counts_ws_quotes_for_health():
     # The WS-health heartbeat: _consume must count each tick per venue so the run
     # loop can report whether a venue's WebSocket is actually delivering data.

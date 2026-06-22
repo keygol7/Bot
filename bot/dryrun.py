@@ -612,6 +612,8 @@ async def stream(
         max_ws_quote_age=settings.stream_max_ws_quote_age,
         min_leg_price=settings.stream_min_leg_price, store=store,
         maker_mode=settings.exec_maker_mode,
+        hybrid_take_depth=settings.exec_hybrid_take_depth,
+        hybrid_take_bar=min_edge + settings.exec_hedge_buffer,
         edge_snapshot_top=settings.stream_edge_snapshot_top,
         edge_persist_secs=settings.stream_edge_persist_secs,
         prime_concurrency=settings.stream_prime_concurrency,
@@ -744,6 +746,12 @@ async def stream(
                     "on fill (EXEC_MAKER_MODE/EXEC_MAKER_ARM_CUSHION/EXEC_MAKER_POLL)",
                     "kalshi", min_edge, settings.exec_maker_arm_cushion, fire_threshold,
                     settings.exec_maker_timeout, guard)
+        if settings.exec_hybrid_take_depth > 0:
+            log.warning("execution: HYBRID — when a confirmed edge has >= %g contracts of real "
+                        "depth AND clears the taker bar (lock $%.2f + hedge $%.2f = $%.2f), TAKE "
+                        "it now instead of resting a maker (EXEC_HYBRID_TAKE_DEPTH)",
+                        settings.exec_hybrid_take_depth, min_edge, settings.exec_hedge_buffer,
+                        min_edge + settings.exec_hedge_buffer)
     else:
         log.warning("execution: TAKER mode — only fire edges >= lock $%.2f + hedge $%.2f "
                     "= $%.2f; hedge leg gets $%.2f of fill room (EXEC_HEDGE_BUFFER)",

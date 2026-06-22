@@ -205,6 +205,12 @@ class Settings:
     # (rest blindly until fill/expiry). Smaller = tighter (less fill-before-cancel race) but
     # more REST polls per resting maker.
     exec_maker_poll: float = 1.0
+    # Hybrid take-or-rest (maker mode only): when a depth-confirmed edge has at least this
+    # many contracts of real top-of-book size AND clears the taker bar (RISK_MIN_EDGE +
+    # EXEC_HEDGE_BUFFER), TAKE it immediately (cross both books, lock now) instead of
+    # resting a maker that may never get crossed. Deep-but-thin edges (below the taker bar)
+    # and shallow edges still rest a maker. 0 = disabled (pure maker mode, never auto-takes).
+    exec_hybrid_take_depth: float = 0.0
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -281,4 +287,5 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_maker_improvement=_env_float("EXEC_MAKER_IMPROVEMENT", 0.01),
         exec_maker_arm_cushion=_env_float("EXEC_MAKER_ARM_CUSHION", 0.04),
         exec_maker_poll=_env_float("EXEC_MAKER_POLL", 1.0),
+        exec_hybrid_take_depth=_env_float("EXEC_HYBRID_TAKE_DEPTH", 0.0),
     )
