@@ -212,6 +212,9 @@ def test_polymarket_buy_yes_price_is_yes_side():
     r = asyncio.run(v.place_order("slug", Side.YES, "buy", 0.62, 1))
     assert cap["body"]["intent"] == "ORDER_INTENT_BUY_LONG"
     assert cap["body"]["price"]["value"] == "0.62"
+    # maxBlockTime is a protobuf Duration: its JSON form needs a unit suffix ("5s"), not a
+    # bare "5" (which fails Duration parsing -> opaque server 500).
+    assert cap["body"]["maxBlockTime"] == "5s"
     assert r.status.value == "KILLED"
 
 

@@ -760,9 +760,12 @@ class PolymarketUSVenue:
             "intent": _INTENT[(side, action)],
             "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
             # Block until the order reaches a terminal state so the response carries the
-            # full executions (authoritative). maxBlockTime stays under the HTTP timeout.
+            # full executions (authoritative). maxBlockTime is a protobuf Duration: its JSON
+            # form REQUIRES a unit suffix ("5s"), and a bare "5" fails Duration parsing —
+            # which the gRPC-gateway surfaces as an opaque HTTP 500. Keep it under the 10s
+            # HTTP client timeout.
             "synchronousExecution": True,
-            "maxBlockTime": "5",
+            "maxBlockTime": "5s",
         }
         await self._limiter.wait()
         try:
@@ -773,6 +776,10 @@ class PolymarketUSVenue:
             data = resp.json()
         except Exception as exc:  # 4xx -> REJECTED (no fill); else ERROR (unknown)
             from bot.execution.orders import order_error_result
+            # The server's error body is often opaque ("internal server error"), so log the
+            # exact request we sent — it's what makes an order rejection diagnosable (and
+            # replayable with curl) when the response tells us nothing.
+            log.warning("polymarket order POST failed (%s); request body=%s", exc, body)
             return order_error_result(VENUE, market_id, side, action, contracts, exc)
 
         status, filled, avg_price, order_id = _parse_create_order_response(data, contracts, side)

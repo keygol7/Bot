@@ -377,11 +377,26 @@ def test_leg2_error_reconciles_hedge_present_settles():
     assert not risk.is_killed                         # 500-but-filled doesn't freeze the bot
 
 
-def test_leg2_error_reconciles_flat_halts():
-    # A leg-2 ERROR where the venue is FLAT -> we can't rule out the order landing late
-    # (auto-unwinding could double up), so halt for manual reconciliation (fail closed).
-    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+def test_leg2_error_reconciles_flat_unwinds():
+    # A leg-2 ERROR where the venue is FLAT -> the synchronous FOK didn't fill (no hedge),
+    # so unwind leg 1 and KEEP trading (one bad market doesn't freeze the whole bot).
+    yes = FakeVenue("kalshi", [
+        res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),
+        res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.38, action="sell"),
+    ])
     no = SnapshotVenue("poly", [res("poly", Side.NO, OrderStatus.ERROR, 0, None)], [])
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.UNWOUND and not risk.is_killed
+
+
+def test_leg2_error_partial_hedge_halts():
+    # A leg-2 ERROR leaving a PARTIAL hedge (1 of 2) is a known-but-mismatched naked
+    # remainder we can't auto-resolve -> halt for manual reconciliation.
+    from bot.execution.account import VenuePosition
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = SnapshotVenue("poly", [res("poly", Side.NO, OrderStatus.ERROR, 0, None)],
+                       [VenuePosition("P1", 1, 0)])
     ex, risk = make_exec([yes, no])
     report = asyncio.run(ex.execute(opp()))
     assert report.status is ExecStatus.HALTED and risk.is_killed

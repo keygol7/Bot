@@ -406,24 +406,38 @@ class Executor:
         if leg2.status is OrderStatus.ERROR:
             # A leg-2 ERROR (e.g. a transient Polymarket 500 on POST /orders) is ambiguous:
             # the hedge may or may not have landed. Rather than freeze the WHOLE bot on one
-            # venue hiccup, reconcile against the venue (as leg 1 does). A 500 frequently
-            # means the server DID process the order and then errored on the response — so
-            # the hedge is actually on and the arb is locked. If the full hedge is present,
-            # settle it (no halt). Otherwise we cannot rule out the order landing late (so
-            # auto-unwinding could double up) -> halt for manual reconciliation (fail closed).
+            # venue hiccup, reconcile against the venue (as leg 1 does) and act on the real
+            # hedge state. The hedge order is synchronous fill-or-kill (not a resting order),
+            # so the reconciled position is authoritative — it cannot land "later".
             qty = await self._hedge_qty_after_error(second_venue, second[1])
-            if qty is not None and qty >= size - 1e-9:
+            if qty is None:
+                # Couldn't read the account -> genuinely unknown -> fail closed (halt).
+                return self._halt(
+                    f"leg2 ambiguous ({leg2.status.value}: {_reject_reason(leg2)}; "
+                    f"hedge state unreadable) — manual reconcile", [leg1, leg2])
+            if qty >= size - 1e-9:
+                # A 500 often means the server DID process the order then errored on the
+                # response: the full hedge is on and the arb is locked -> settle it.
                 log.warning("leg2 ERROR but %s holds %g contracts — hedge landed, settling (%s)",
                             second[1], qty, _reject_reason(leg2))
                 leg2 = replace(
                     leg2, status=OrderStatus.FILLED, filled=size,
                     avg_price=leg2.avg_price if leg2.avg_price is not None else second[3])
                 return self._settle_success(opp, size, [leg1, leg2])
+            if qty <= 1e-9:
+                # Hedge confirmed FLAT. The synchronous FOK didn't fill -> no leg-2 position
+                # -> safe to unwind leg 1 and KEEP TRADING (one bad market doesn't freeze
+                # the whole bot).
+                log.warning("leg2 ERROR but %s flat — no hedge landed, unwinding leg1 (%s)",
+                            second[1], _reject_reason(leg2))
+                return await self._unwind(
+                    opp, leg1, leg2,
+                    reason=f"leg2 ERROR, hedge flat ({_reject_reason(leg2)})")
+            # 0 < qty < size: a partial hedge — a known-but-mismatched naked remainder we
+            # can't safely auto-resolve. Halt for manual reconciliation.
             return self._halt(
                 f"leg2 ambiguous ({leg2.status.value}: {_reject_reason(leg2)}; "
-                f"reconciled hedge qty {qty}) — manual reconcile",
-                [leg1, leg2],
-            )
+                f"partial hedge {qty:g}/{size:g}) — manual reconcile", [leg1, leg2])
 
         # PARTIAL (or any other non-definitive state) on leg 2: a known-but-mismatched
         # fill we can't safely auto-resolve. Halt for manual reconciliation.
