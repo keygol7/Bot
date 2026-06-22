@@ -615,6 +615,7 @@ async def stream(
         maker_mode=settings.exec_maker_mode,
         hybrid_take_depth=settings.exec_hybrid_take_depth,
         hybrid_take_bar=min_edge + settings.exec_hedge_buffer,
+        reconcile_halt=settings.exec_reconcile_halt,
         edge_snapshot_top=settings.stream_edge_snapshot_top,
         edge_persist_secs=settings.stream_edge_persist_secs,
         prime_concurrency=settings.stream_prime_concurrency,
@@ -642,6 +643,9 @@ async def stream(
             executor.set_balances(snaps)
             if settings.risk_caps_from_balance:
                 apply_balance_caps(risk, snaps)
+            # Cross-venue naked-exposure backstop: catch a position whose hedge never
+            # landed (the failure mode behind the Ruzic loss), not just at startup.
+            engine.reconcile_positions(snaps)
 
     async def refresh_specs():
         # Discovery cycle: scans markets + confirms/caches new pairs (embeddings/LLM).

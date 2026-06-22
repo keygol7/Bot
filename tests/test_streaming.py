@@ -714,6 +714,51 @@ def test_kill_switch_skips_all_pair_work():
     assert fe.calls == [] and depth_calls == []     # no execute, no REST depth-confirm
 
 
+def _snap(venue, positions):
+    from bot.execution.account import AccountSnapshot, VenuePosition
+    return AccountSnapshot(venue, 1000.0, [VenuePosition(m, q, 0) for m, q in positions])
+
+
+def test_reconcile_flags_and_halts_on_persistent_naked():
+    class RiskStub:
+        def __init__(self):
+            self.is_killed = False
+            self.reason = None
+        def trip_kill_switch(self, reason):
+            self.is_killed = True
+            self.reason = reason
+
+    class Exc:
+        def __init__(self):
+            self.risk = RiskStub()
+
+    exc = Exc()
+    eng = StreamingEngine(
+        executor=exc, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, clock=lambda: 0.0, reconcile_halt=True)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    # Kalshi holds 140, Polymarket holds nothing -> naked. First check warns, no halt.
+    snaps = [_snap("kalshi", [("K1", 140)]), _snap("poly", [])]
+    out = eng.reconcile_positions(snaps)
+    assert len(out) == 1 and not exc.risk.is_killed     # warned, not yet halted
+    # Still naked on the next check -> trip the kill switch.
+    eng.reconcile_positions(snaps)
+    assert exc.risk.is_killed
+
+
+def test_reconcile_balanced_pair_is_clean():
+    class Exc:
+        risk = None
+    eng = StreamingEngine(
+        executor=Exc(), fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, clock=lambda: 0.0)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    # Equal contracts on both legs = a locked arb, not naked.
+    snaps = [_snap("kalshi", [("K1", 140)]), _snap("poly", [("P1", 140)])]
+    assert eng.reconcile_positions(snaps) == []
+
+
 def test_consume_counts_ws_quotes_for_health():
     # The WS-health heartbeat: _consume must count each tick per venue so the run
     # loop can report whether a venue's WebSocket is actually delivering data.

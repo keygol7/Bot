@@ -75,6 +75,7 @@ class StreamingEngine:
         maker_mode: bool = False,
         hybrid_take_depth: float = 0.0,
         hybrid_take_bar: float = 0.0,
+        reconcile_halt: bool = True,
         edge_snapshot_top: int = 5,
         edge_persist_secs: float = 0.0,
         prime_concurrency: int = 8,
@@ -110,6 +111,13 @@ class StreamingEngine:
         # of 0 disables it (pure maker mode — never auto-takes).
         self.hybrid_take_depth = hybrid_take_depth
         self.hybrid_take_bar = hybrid_take_bar
+        # Periodic cross-venue reconciliation: a locked arb holds EQUAL contracts on both
+        # legs, so a per-pair size imbalance is naked directional exposure (a hedge that
+        # failed to land). When True, a naked position confirmed on two consecutive checks
+        # trips the kill switch so the bot stops until a human flattens. False = warn only.
+        self.reconcile_halt = reconcile_halt
+        self._reconcile_tol = 1.0               # contracts; below this is rounding, not naked
+        self._imbalanced_prev: set = set()      # pairs imbalanced last check (persistence)
         # How many of the best edges the periodic snapshot logs each interval.
         self.edge_snapshot_top = edge_snapshot_top
         # Require an edge to persist this many seconds before acting (distinguishes a real
@@ -456,6 +464,58 @@ class StreamingEngine:
             if r is not None:
                 report = r
         return report
+
+    def reconcile_positions(self, snapshots) -> list:
+        """Cross-venue naked-exposure backstop, run each refresh cycle from the venue
+        account snapshots. A locked arb holds EQUAL contracts on its two legs (YES on one
+        venue, NO on the other), so for every confirmed pair the leg sizes should match;
+        an imbalance is naked directional exposure — a hedge that never landed (how the
+        Ruzic maker fill became a total loss). To ride out a transient mid-trade/settlement
+        blip this warns on first sight and only trips the kill switch when the SAME pair is
+        still imbalanced on the next check. Positions on markets not in any active pair are
+        logged for visibility (their hedge can't be auto-verified). Returns the imbalances.
+        """
+        pos: dict[tuple[str, str], float] = {}
+        for snap in snapshots or []:
+            venue = getattr(snap, "venue", None)
+            for vp in getattr(snap, "positions", None) or []:
+                if getattr(vp, "is_open", False) and abs(getattr(vp, "quantity", 0.0)) > 1e-9:
+                    pos[(venue, vp.market_id)] = abs(vp.quantity)
+
+        imbalanced, paired_markets = [], set()
+        for p in self._pairs.values():
+            paired_markets.add((p.venue_a, p.market_a))
+            paired_markets.add((p.venue_b, p.market_b))
+            qa = pos.get((p.venue_a, p.market_a), 0.0)
+            qb = pos.get((p.venue_b, p.market_b), 0.0)
+            if abs(qa - qb) > self._reconcile_tol:
+                imbalanced.append((p, qa, qb))
+
+        # Held positions on markets the watchlist no longer pairs — can't auto-verify the
+        # hedge, so surface them for a manual check rather than alarm.
+        untracked = [(v, m, q) for (v, m), q in pos.items() if (v, m) not in paired_markets]
+        if untracked:
+            log.info("RECONCILE: %d held position(s) on unpaired markets (verify hedged): %s",
+                     len(untracked), ", ".join(f"{v}:{m}={q:g}" for v, m, q in untracked[:8]))
+
+        if not imbalanced:
+            self._imbalanced_prev = set()
+            return []
+        for p, qa, qb in imbalanced:
+            log.warning("RECONCILE: NAKED exposure on %s — %s=%g vs %s=%g (Δ%g contracts)",
+                        p.event_key, p.venue_a, qa, p.venue_b, qb, abs(qa - qb))
+        keys = {p.key for p, _, _ in imbalanced}
+        repeat = keys & self._imbalanced_prev
+        self._imbalanced_prev = keys
+        if repeat and self.reconcile_halt:
+            risk = getattr(self.executor, "risk", None)
+            trip = getattr(risk, "trip_kill_switch", None)
+            if trip is not None and not getattr(risk, "is_killed", False):
+                trip(f"reconcile: persistent naked exposure on {len(repeat)} pair(s)")
+            log.critical("RECONCILE HALT: naked exposure persisted on %d pair(s) — stopping "
+                         "until flat. Manually flatten the unhedged leg(s), then restart.",
+                         len(repeat))
+        return imbalanced
 
     async def prime_and_sweep(self):
         """Seed the live book with a REST snapshot of every watchlist market, then

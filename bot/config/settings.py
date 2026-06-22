@@ -215,6 +215,10 @@ class Settings:
     # error (e.g. a Polymarket 500/timeout) before unwinding — each retry only after
     # reconciling the hedge venue to confirm nothing landed (so it can't double up).
     exec_hedge_retries: int = 1
+    # Periodic cross-venue reconciliation: each cycle, compare the two legs of every pair;
+    # an imbalance is naked exposure (a hedge that never landed). True trips the kill switch
+    # when a naked position persists across two checks; False only warns. Always logs.
+    exec_reconcile_halt: bool = True
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -293,4 +297,5 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_maker_poll=_env_float("EXEC_MAKER_POLL", 1.0),
         exec_hybrid_take_depth=_env_float("EXEC_HYBRID_TAKE_DEPTH", 0.0),
         exec_hedge_retries=int(_env_float("EXEC_HEDGE_RETRIES", 1)),
+        exec_reconcile_halt=(env("EXEC_RECONCILE_HALT", "true") or "true").lower() == "true",
     )
