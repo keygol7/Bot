@@ -490,7 +490,8 @@ class PolymarketUSVenue:
 
         ``limit`` is a TOTAL cap across pages. We page via ``offset`` and dedupe by
         slug; if the gateway ignores ``offset`` (returns the same page) we get no new
-        slugs and stop, so this is safe whether or not paging is supported.
+        slugs and stop, so this is safe whether or not paging is supported. ``limit <= 0``
+        scans the ENTIRE feed (paginate until a short/empty page).
 
         ``max_close_ts`` (Unix seconds) enables a TARGETED scan: only markets closing
         at/before that time (from ``endDate``) are returned. The public gateway has no
@@ -500,15 +501,16 @@ class PolymarketUSVenue:
         out: list[MarketQuote] = []
         seen: set[str] = set()
         offset = 0
+        unbounded = limit <= 0                          # scan the whole feed
         # Server-side close-time filter (docs: endDateMax, ISO 8601). Cuts the feed at
         # the source; the client-side endDate filter below still backs it up.
         end_date_max = (
             datetime.fromtimestamp(max_close_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             if max_close_ts is not None else None
         )
-        while len(out) < limit:
+        while unbounded or len(out) < limit:
             await self._limiter.wait()
-            page_size = min(limit - len(out), 500)
+            page_size = 500 if unbounded else min(limit - len(out), 500)
             params: dict[str, Any] = {
                 "limit": page_size, "active": "true", "closed": "false", "offset": offset,
             }

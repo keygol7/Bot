@@ -1626,10 +1626,14 @@ def main(argv: list[str] | None = None) -> None:
         threshold = 0.65 if (args.embed or args.stream) else 0.5
 
     if args.stream:
+        _s = load_settings()
         # --interval overrides; otherwise the configured streaming default (STREAM_REFRESH_SECS).
-        interval = args.interval if args.interval != 15.0 else load_settings().stream_refresh_secs
+        interval = args.interval if args.interval != 15.0 else _s.stream_refresh_secs
+        # The streaming service scans by SCAN_LIMIT (0 = whole board), not the CLI --limit,
+        # unless --limit was set explicitly (i.e. changed from its default).
+        scan_limit = args.limit if args.limit != 50 else _s.scan_limit
         asyncio.run(stream(
-            refresh_interval=interval, limit=args.limit, use_llm=True, use_embed=True,
+            refresh_interval=interval, limit=scan_limit, use_llm=True, use_embed=True,
             match_threshold=threshold, min_edge=args.min_edge,
             max_confirms=args.max_confirms, max_resolve_gap_days=args.max_resolve_gap_days,
             close_within_days=args.close_within_days,

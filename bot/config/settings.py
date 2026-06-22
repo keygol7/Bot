@@ -140,6 +140,11 @@ class Settings:
     # set), so today's games are always covered without a huge --limit (the matcher
     # embeds every scanned title, so scan size is the cost). 0 = disabled (scan all).
     scan_close_within_days: float = 0.0
+    # Max markets to pull per venue per scan (TOTAL across paginated pages). 0 = scan the
+    # ENTIRE board (every available market), not just a page. Used by the streaming loop;
+    # the matched/tradeable set is still bounded by Polymarket's small universe, so this
+    # mainly governs how much of Kalshi is searched for a counterpart.
+    scan_limit: int = 0
     # Liquidity guard: min resting depth (contracts) required on BOTH legs before the
     # executor fires. Thin books are where a leg rejects and can't be hedged/unwound;
     # skipping them means we should never have to unwind. 0 = disabled.
@@ -259,6 +264,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
             if (tok := raw.strip().lower()) in _VALID_FINGERPRINT_METRICS
         ),
         scan_close_within_days=_env_float("SCAN_CLOSE_WITHIN_DAYS", 0.0),
+        scan_limit=int(_env_float("SCAN_LIMIT", 0)),
         match_sweep_past_days=_env_float("MATCH_SWEEP_PAST_DAYS", 1.0),
         stream_discovery=(env("STREAM_DISCOVERY", "true") or "true").lower() == "true",
         exec_min_leg_depth=_env_float("EXEC_MIN_LEG_DEPTH", 0.0),

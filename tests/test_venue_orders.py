@@ -243,6 +243,33 @@ def test_kalshi_scan_quotes_paginates_cursor():
     assert seen_params[1]["limit"] == "500"              # remaining cap, not a full page
 
 
+def test_kalshi_scan_quotes_unbounded_scans_whole_board():
+    # limit<=0 -> scan the ENTIRE feed: follow the cursor across pages until exhausted,
+    # requesting full 1000-market pages (not a shrinking remainder).
+    pages = [
+        {"markets": [{"ticker": f"A{i}", "title": f"A{i}", "yes_bid": 40, "yes_ask": 41,
+                      "no_bid": 59, "no_ask": 60} for i in range(1000)], "cursor": "CUR2"},
+        {"markets": [{"ticker": f"B{i}", "title": f"B{i}", "yes_bid": 40, "yes_ask": 41,
+                      "no_bid": 59, "no_ask": 60} for i in range(1000)], "cursor": "CUR3"},
+        {"markets": [{"ticker": "C0", "title": "C0", "yes_bid": 40, "yes_ask": 41,
+                      "no_bid": 59, "no_ask": 60}], "cursor": ""},
+    ]
+    seen = []
+
+    def handler(req):
+        seen.append(dict(req.url.params))
+        cur = req.url.params.get("cursor")
+        return httpx.Response(200, json=pages[{None: 0, "CUR2": 1, "CUR3": 2}[cur]])
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    quotes = asyncio.run(v.scan_quotes(0))               # 0 = unbounded
+    assert len(quotes) == 2001                            # all three pages
+    assert all(p["limit"] == "1000" for p in seen)        # full pages, not a remainder
+    assert len(seen) == 3
+
+
 def test_kalshi_scan_quotes_stops_when_cursor_exhausted():
     # limit asks for 5000 but the feed ends after one short page with no cursor.
     def handler(req):

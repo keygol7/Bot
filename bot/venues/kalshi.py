@@ -394,7 +394,8 @@ class KalshiVenue:
         Kalshi caps a single /markets page at 1000 and the markets we care about can
         sit past the first page (e.g. UFC fights), so we follow the ``cursor`` until
         we've scanned ``limit`` markets or the feed is exhausted. ``limit`` is a TOTAL
-        cap across pages, not a per-page size.
+        cap across pages, not a per-page size. ``limit <= 0`` scans the ENTIRE board
+        (paginate until the cursor is exhausted).
 
         ``max_close_ts`` (Unix seconds) enables a TARGETED scan: only markets closing
         at/before that time (the live/imminent set). It's sent as the documented
@@ -405,12 +406,13 @@ class KalshiVenue:
         out: list[MarketQuote] = []
         cursor: str | None = None
         fetched = 0
-        while fetched < limit:
+        unbounded = limit <= 0                          # scan the whole board
+        while unbounded or fetched < limit:
             await self._limiter.wait()
             params: dict[str, Any] = {
                 # mve_filter=exclude drops multivariate/parlay markets server-side,
                 # which otherwise dominate the feed. Client-side filter below backs it up.
-                "limit": min(limit - fetched, 1000),
+                "limit": 1000 if unbounded else min(limit - fetched, 1000),
                 "status": "open",
                 "mve_filter": "exclude",
             }
