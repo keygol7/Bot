@@ -1448,6 +1448,44 @@ def kalshi_history(settings: Settings, *, limit: int = 100, find: str | None = N
     return 0
 
 
+def check_flat(settings: Settings) -> int:
+    """Print each venue's balance, open positions, and resting orders, with a FLAT / NOT
+    FLAT verdict per venue. 'Flat' = no held positions and no resting orders. Read-only."""
+    venues = _build_venues(settings)
+
+    async def _run():
+        any_open = False
+        for v in venues:
+            snap_fn = getattr(v, "account_snapshot", None)
+            if snap_fn is None:
+                print(f"\n== {v.name} == (no account_snapshot — cannot check)")
+                continue
+            try:
+                snap = await snap_fn()
+            except Exception as exc:
+                print(f"\n== {v.name} == ERROR reading account: {exc}")
+                any_open = True            # can't confirm flat -> treat as unknown/unsafe
+                continue
+            opens = snap.open_positions
+            bal = f"${snap.balance:.2f}" if snap.balance is not None else "?"
+            verdict = "FLAT" if not opens else f"NOT FLAT ({len(opens)} open)"
+            print(f"\n== {v.name} ==  balance {bal}  -> {verdict}")
+            for pinfo in opens:
+                any_open = True
+                print(f"   {pinfo.market_id:40} qty={pinfo.quantity:g} "
+                      f"resting_orders={pinfo.resting_orders}")
+        for v in venues:
+            aclose = getattr(v, "aclose", None)
+            if aclose:
+                await aclose()
+        print("\n" + ("ALL VENUES FLAT — safe clean slate." if not any_open else
+                      "NOT FLAT — hedged arbs are normal; a position with NO offsetting "
+                      "leg on the other venue is naked. Cross-check the two venues."))
+
+    asyncio.run(_run())
+    return 0
+
+
 def kalshi_order(settings: Settings, order_id: str) -> int:
     """Print one Kalshi order's full record (GET /portfolio/orders/{id}) so a maker that
     rested past its intended expiry — and filled naked — is provable from created_time vs
@@ -1615,6 +1653,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--kalshi-order", metavar="ORDER_ID", default=None,
                    help="print one Kalshi order's full record (created/expiration/status) "
                         "to trace whether a maker expired or rested into a late naked fill")
+    p.add_argument("--check-flat", action="store_true",
+                   help="print each venue's balance, open positions, and resting orders "
+                        "with a FLAT / NOT FLAT verdict (read-only)")
     p.add_argument("--compare-filters", action="store_true",
                    help="SHADOW: compare the structured fingerprint matcher vs the live "
                         "filter over cached verdicts (adds/removes); trades nothing")
@@ -1708,6 +1749,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.kalshi_order:
         raise SystemExit(kalshi_order(load_settings(), args.kalshi_order))
+
+    if args.check_flat:
+        raise SystemExit(check_flat(load_settings()))
 
     if args.find:
         raise SystemExit(find_markets(load_settings(), args.find))
