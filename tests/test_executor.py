@@ -363,6 +363,30 @@ def test_leg2_error_halts_and_trips_kill_switch():
     assert risk.is_killed                            # ambiguous hedge state -> stop everything
 
 
+def test_leg2_error_reconciles_hedge_present_settles():
+    # A leg-2 ERROR (e.g. a Polymarket 500 on POST) where the venue actually HOLDS the
+    # hedge -> the order landed and the arb is locked; settle it instead of freezing the
+    # whole bot on a transient server error.
+    from bot.execution.account import VenuePosition
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = SnapshotVenue("poly", [res("poly", Side.NO, OrderStatus.ERROR, 0, None)],
+                       [VenuePosition("P1", 2, 0)])
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.SUCCESS
+    assert not risk.is_killed                         # 500-but-filled doesn't freeze the bot
+
+
+def test_leg2_error_reconciles_flat_halts():
+    # A leg-2 ERROR where the venue is FLAT -> we can't rule out the order landing late
+    # (auto-unwinding could double up), so halt for manual reconciliation (fail closed).
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = SnapshotVenue("poly", [res("poly", Side.NO, OrderStatus.ERROR, 0, None)], [])
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.HALTED and risk.is_killed
+
+
 def test_leg1_rejected_aborts_without_halting():
     # A definitive 4xx rejection (e.g. Kalshi 409) -> no position, abort the single
     # trade and KEEP trading. Must NOT trip the sticky kill switch.
@@ -708,14 +732,17 @@ def test_order_error_result_classification():
     assert r.status is OS.REJECTED and r.raw["http_status"] == 409
     assert "not accepting" in r.raw["body"]
 
-    # 5xx (ambiguous — may have processed) -> ERROR.
+    # 5xx (ambiguous — may have processed) -> ERROR, with the HTTP status + body captured
+    # (a 500 often carries a diagnostic message saying WHY the order was refused).
     http500 = Exception("Server error")
-    http500.response = SimpleNamespace(status_code=500, text="oops")
-    assert order_error_result("kalshi", "M", Side.YES, "buy", 1, http500).status is OS.ERROR
+    http500.response = SimpleNamespace(status_code=500, text="price off tick grid")
+    r500 = order_error_result("kalshi", "M", Side.YES, "buy", 1, http500)
+    assert r500.status is OS.ERROR and r500.raw["http_status"] == 500
+    assert "off tick grid" in r500.raw["body"]
 
-    # Network error (no response) -> ERROR.
-    assert order_error_result("kalshi", "M", Side.YES, "buy", 1,
-                              TimeoutError("timed out")).status is OS.ERROR
+    # Network error (no response) -> ERROR, no body to capture.
+    rnet = order_error_result("kalshi", "M", Side.YES, "buy", 1, TimeoutError("timed out"))
+    assert rnet.status is OS.ERROR and rnet.raw["body"] is None
 
 
 def test_risk_cap_skips():

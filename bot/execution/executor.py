@@ -26,7 +26,7 @@ import asyncio
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from bot.data.store import Store
@@ -213,6 +213,25 @@ class Executor:
                 return True
         return False
 
+    async def _hedge_qty_after_error(self, venue, market_id):
+        """After an ambiguous leg-2 ERROR (e.g. a venue 500 on POST /orders), ask the
+        venue HOW MANY contracts of the hedge actually landed. Returns the open quantity
+        (>= 0.0) or None if it couldn't be determined (fail closed -> halt). Unlike
+        ``_position_after_error`` this returns the size, so the executor can settle a fully
+        hedged trade (the common '500 but it actually filled' case) instead of freezing."""
+        snap_fn = getattr(venue, "account_snapshot", None)
+        if snap_fn is None:
+            return None
+        try:
+            snap = await snap_fn()
+        except Exception as exc:
+            log.warning("post-error hedge reconcile failed for %s: %s", market_id, exc)
+            return None
+        for pos in getattr(snap, "positions", None) or []:
+            if pos.market_id == market_id and pos.is_open:
+                return abs(pos.quantity)
+        return 0.0
+
     def _max_size(self, opp: ArbOpportunity,
                   depth_override: float | None = None) -> tuple[int, dict[str, float]]:
         """Largest whole-contract size that fits every hard limit at once:
@@ -384,8 +403,30 @@ class Executor:
                 opp, leg1, leg2, reason=f"leg2 {leg2.status.value} ({_reject_reason(leg2)})"
             )
 
-        # ERROR or PARTIAL on leg 2: we cannot be sure of the hedge state. Do NOT
-        # auto-unwind (risk of doubling up). Halt for manual reconciliation.
+        if leg2.status is OrderStatus.ERROR:
+            # A leg-2 ERROR (e.g. a transient Polymarket 500 on POST /orders) is ambiguous:
+            # the hedge may or may not have landed. Rather than freeze the WHOLE bot on one
+            # venue hiccup, reconcile against the venue (as leg 1 does). A 500 frequently
+            # means the server DID process the order and then errored on the response — so
+            # the hedge is actually on and the arb is locked. If the full hedge is present,
+            # settle it (no halt). Otherwise we cannot rule out the order landing late (so
+            # auto-unwinding could double up) -> halt for manual reconciliation (fail closed).
+            qty = await self._hedge_qty_after_error(second_venue, second[1])
+            if qty is not None and qty >= size - 1e-9:
+                log.warning("leg2 ERROR but %s holds %g contracts — hedge landed, settling (%s)",
+                            second[1], qty, _reject_reason(leg2))
+                leg2 = replace(
+                    leg2, status=OrderStatus.FILLED, filled=size,
+                    avg_price=leg2.avg_price if leg2.avg_price is not None else second[3])
+                return self._settle_success(opp, size, [leg1, leg2])
+            return self._halt(
+                f"leg2 ambiguous ({leg2.status.value}: {_reject_reason(leg2)}; "
+                f"reconciled hedge qty {qty}) — manual reconcile",
+                [leg1, leg2],
+            )
+
+        # PARTIAL (or any other non-definitive state) on leg 2: a known-but-mismatched
+        # fill we can't safely auto-resolve. Halt for manual reconciliation.
         return self._halt(
             f"leg2 ambiguous ({leg2.status.value}: {_reject_reason(leg2)}) — manual reconcile",
             [leg1, leg2],

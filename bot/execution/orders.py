@@ -70,12 +70,17 @@ def order_error_result(venue, market_id, side, action, contracts, exc) -> "Order
     """
     resp = getattr(exc, "response", None)
     code = getattr(resp, "status_code", None)
-    if isinstance(code, int) and 400 <= code < 500:
-        body = None
+    body = None
+    if resp is not None:
         with contextlib.suppress(Exception):
             body = resp.text[:500]
+    if isinstance(code, int) and 400 <= code < 500:
         return OrderResult(venue, market_id, side, action, contracts,
                            status=OrderStatus.REJECTED,
                            raw={"http_status": code, "body": body, "error": str(exc)})
+    # Network error, timeout, or 5xx (the request may or may not have been processed) ->
+    # ERROR (unknown fill state). Carry the HTTP status + server body when present: a 500
+    # often returns a diagnostic message that says WHY the order was refused.
     return OrderResult(venue, market_id, side, action, contracts,
-                       status=OrderStatus.ERROR, raw={"error": str(exc)})
+                       status=OrderStatus.ERROR,
+                       raw={"http_status": code, "body": body, "error": str(exc)})
