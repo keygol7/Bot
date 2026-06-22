@@ -125,6 +125,13 @@ def _amount(value: Any) -> float | None:
         return None
 
 
+def _price_str(value: float) -> str:
+    """Format a price as the API's ``Amount.value`` — a plain decimal string. Guards
+    against float-repr artifacts and scientific notation (e.g. ``1e-06``) that a bare
+    ``f"{x}"`` can emit, which the exchange would reject as a malformed price."""
+    return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
+
+
 _BALANCE_KEYS = (
     "buyingPower", "currentBalance", "availableBalance", "available",
     "cashBalance", "cash", "balance",
@@ -754,18 +761,17 @@ class PolymarketUSVenue:
         body = {
             "marketSlug": market_id,
             "type": "ORDER_TYPE_LIMIT",
-            "price": {"value": f"{yes_value}", "currency": "USD"},
+            "price": {"value": _price_str(yes_value), "currency": "USD"},
             "quantity": quantity,
             "tif": _TIF.get(tif, "TIME_IN_FORCE_FILL_OR_KILL"),
             "intent": _INTENT[(side, action)],
             "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
             # Block until the order reaches a terminal state so the response carries the
-            # full executions (authoritative). maxBlockTime is a protobuf Duration: its JSON
-            # form REQUIRES a unit suffix ("5s"), and a bare "5" fails Duration parsing —
-            # which the gRPC-gateway surfaces as an opaque HTTP 500. Keep it under the 10s
-            # HTTP client timeout.
+            # full executions (authoritative). Per the API schema maxBlockTime is an int64
+            # (seconds) encoded as a string — a bare "5", NOT a duration like "5s". Keep it
+            # under the 10s HTTP client timeout.
             "synchronousExecution": True,
-            "maxBlockTime": "5s",
+            "maxBlockTime": "5",
         }
         await self._limiter.wait()
         try:
