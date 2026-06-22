@@ -286,6 +286,31 @@ def _parse_create_order_response(data: Any, requested: float, side: Side):
     return status, filled, avg_price, order_id
 
 
+def _parse_order_snapshot(order: Any, requested: float, side: Side):
+    """Parse a single ``Order`` object (from ``/v1/order/preview`` or
+    ``GET /v1/order/{id}``) -> (status, filled, avg_price, id). For a preview the
+    ``cumQuantity`` is the EXPECTED fill, so the same threshold logic tells us whether
+    the order would fill fully."""
+    if not isinstance(order, dict):
+        return OrderStatus.ERROR, 0.0, None, None
+    order_id = order.get("id")
+    state = str(order.get("state") or "")
+    cum = order.get("cumQuantity")
+    filled = float(cum) if cum not in (None, "") else 0.0
+    avg_price = _amount(order.get("avgPx"))
+    if avg_price is not None and side is Side.NO:      # avgPx is YES-side; NO cost = 1 - it
+        avg_price = round(1.0 - avg_price, 6)
+    if state == _STATE_FILLED or (requested > 0 and filled >= requested - 1e-9):
+        status = OrderStatus.FILLED
+    elif state == _STATE_REJECTED:
+        status = OrderStatus.REJECTED
+    elif filled <= 1e-9:
+        status = OrderStatus.KILLED
+    else:
+        status = OrderStatus.PARTIAL
+    return status, filled, avg_price, order_id
+
+
 # Market states that mean the market is terminally done (vs temporarily not trading).
 # Used by is_open: only these drop a cached market; everything else stays live.
 _TERMINAL_MARKET_STATES = frozenset(
@@ -730,24 +755,15 @@ class PolymarketUSVenue:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
-    async def place_order(
-        self, market_id: str, side: Side, action: str, price: float, contracts: float,
-        *, tif: str = "fill_or_kill",
-    ) -> OrderResult:
-        """Place an order via POST /v1/orders (X-PM Ed25519 auth).
-
-        ``price`` is the cost/value of the requested ``side``; the API always wants the
-        YES/long price, so for NO we send ``1 - price``. ``manualOrderIndicator`` is
-        AUTOMATIC (bot, regulatory). NOTE: confirm the create-response fill fields
-        against the sandbox before live use.
-        """
-        if not getattr(self.cfg, "is_trading_configured", False):
-            raise OrderNotPermitted("Polymarket US trading credentials not configured")
+    def _order_body(self, market_id: str, side: Side, action: str, price: float,
+                    contracts: float, tif: str) -> dict:
+        """Build the CreateOrderRequest body (shared by place + preview so a preview
+        reflects the EXACT order we'd send). ``price`` is the cost of the requested side;
+        the API wants the YES/long price, so for NO we send ``1 - price``. Price and
+        quantity are snapped to the market's orderPriceMinTickSize / minimumTradeQty
+        (captured during scan_quotes) — off-grid values get normalized or rejected."""
         yes_value = price if side is Side.YES else round(1.0 - price, 6)
         yes_value = min(max(yes_value, 0.01), 0.99)
-        # Snap to the market's valid order increments (captured during scan_quotes).
-        # The docs say to use orderPriceMinTickSize / minimumTradeQty and NOT infer them
-        # from the slug/type; off-grid price or qty gets the order rejected.
         meta = self._meta.get(market_id) or {}
         tick, min_qty = meta.get("tick"), meta.get("min_qty")
         if tick and tick > 0:
@@ -758,7 +774,7 @@ class PolymarketUSVenue:
             snapped = math.floor(round(contracts / min_qty, 9)) * min_qty
             if snapped >= min_qty:          # keep original if snapping would zero it out
                 quantity = round(snapped, 6)
-        body = {
+        return {
             "marketSlug": market_id,
             "type": "ORDER_TYPE_LIMIT",
             "price": {"value": _price_str(yes_value), "currency": "USD"},
@@ -766,13 +782,26 @@ class PolymarketUSVenue:
             "tif": _TIF.get(tif, "TIME_IN_FORCE_FILL_OR_KILL"),
             "intent": _INTENT[(side, action)],
             "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
-            # Block until the order reaches a terminal state so the response carries the
-            # full executions (authoritative). Per the API schema maxBlockTime is an int64
-            # (seconds) encoded as a string — a bare "5", NOT a duration like "5s". Keep it
-            # under the 10s HTTP client timeout.
-            "synchronousExecution": True,
-            "maxBlockTime": "5",
         }
+
+    async def place_order(
+        self, market_id: str, side: Side, action: str, price: float, contracts: float,
+        *, tif: str = "fill_or_kill",
+    ) -> OrderResult:
+        """Place an order via POST /v1/orders (X-PM Ed25519 auth).
+
+        ``synchronousExecution`` blocks until the order is terminal so the response
+        carries the full executions (authoritative). If that response is still
+        non-terminal but carries an order id, poll GET /v1/order/{id} once for the
+        resolved state (the docs' submit-then-poll pattern).
+        """
+        if not getattr(self.cfg, "is_trading_configured", False):
+            raise OrderNotPermitted("Polymarket US trading credentials not configured")
+        body = self._order_body(market_id, side, action, price, contracts, tif)
+        # Per the API schema maxBlockTime is an int64 (seconds) encoded as a string — a
+        # bare "5", NOT a duration like "5s". Keep it under the 10s HTTP client timeout.
+        body["synchronousExecution"] = True
+        body["maxBlockTime"] = "5"
         await self._limiter.wait()
         try:
             resp = await self._api().post(
@@ -789,10 +818,69 @@ class PolymarketUSVenue:
             return order_error_result(VENUE, market_id, side, action, contracts, exc)
 
         status, filled, avg_price, order_id = _parse_create_order_response(data, contracts, side)
+        # Submit-then-poll fallback: a synchronous FOK should come back terminal, but if it
+        # didn't (a non-terminal state with an order id), GET the order once for the real
+        # terminal outcome rather than mis-reporting a fill/no-fill.
+        if order_id and status is OrderStatus.PARTIAL:
+            resolved = await self._get_order_result(order_id, contracts, side)
+            if resolved is not None:
+                return resolved
         return OrderResult(
             venue=VENUE, market_id=market_id, side=side, action=action,
             requested=contracts, filled=filled, avg_price=avg_price,
             order_id=order_id, status=status, raw=data,
+        )
+
+    async def preview_order(
+        self, market_id: str, side: Side, action: str, price: float, contracts: float,
+        *, tif: str = "fill_or_kill",
+    ) -> OrderResult:
+        """Preview an order via POST /v1/order/preview WITHOUT submitting it. The returned
+        Order carries calculated values (``cumQuantity`` = expected fill), so the executor
+        can confirm a hedge would fully fill before committing the first leg — avoiding a
+        FOK fired into phantom liquidity (a naked leg + the synchronous-execution 500)."""
+        if not getattr(self.cfg, "is_trading_configured", False):
+            raise OrderNotPermitted("Polymarket US trading credentials not configured")
+        body = self._order_body(market_id, side, action, price, contracts, tif)
+        await self._limiter.wait()
+        try:
+            resp = await self._api().post(
+                "/v1/order/preview", json={"request": body},
+                headers=self._auth_headers("POST", "/v1/order/preview"),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            from bot.execution.orders import order_error_result
+            log.warning("polymarket order preview failed (%s); request body=%s", exc, body)
+            return order_error_result(VENUE, market_id, side, action, contracts, exc)
+        order = data.get("order") if isinstance(data, dict) else None
+        status, filled, avg_price, order_id = _parse_order_snapshot(order, contracts, side)
+        return OrderResult(
+            venue=VENUE, market_id=market_id, side=side, action=action,
+            requested=contracts, filled=filled, avg_price=avg_price,
+            order_id=order_id, status=status, raw=data,
+        )
+
+    async def _get_order_result(self, order_id: str, requested: float,
+                                side: Side) -> OrderResult | None:
+        """GET /v1/order/{id} -> OrderResult, or None if it couldn't be read. The
+        authoritative terminal state for an order we already have an id for."""
+        path = f"/v1/order/{order_id}"
+        await self._limiter.wait()
+        try:
+            resp = await self._api().get(path, headers=self._auth_headers("GET", path))
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            log.warning("polymarket get-order %s failed: %s", order_id, exc)
+            return None
+        order = data.get("order") if isinstance(data, dict) else None
+        status, filled, avg_price, oid = _parse_order_snapshot(order, requested, side)
+        return OrderResult(
+            venue=VENUE, market_id=(order or {}).get("marketSlug", ""), side=side,
+            action="buy", requested=requested, filled=filled, avg_price=avg_price,
+            order_id=oid or order_id, status=status, raw=data,
         )
 
     async def cancel_order(self, order_id: str) -> dict:

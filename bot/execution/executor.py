@@ -232,6 +232,23 @@ class Executor:
                 return abs(pos.quantity)
         return 0.0
 
+    async def _hedge_would_fill(self, venue, leg, size) -> bool:
+        """Preview the hedge leg (when the venue supports it) to confirm it would fully
+        fill at its limit before we commit leg 1. Returns True to proceed (fills, OR no
+        preview support / a preview failure -> don't block on a best-effort check), False
+        only when the venue affirmatively says it would NOT fully fill."""
+        preview = getattr(venue, "preview_order", None)
+        if preview is None:
+            return True
+        try:
+            res = await preview(leg[1], leg[2], "buy", leg[3], size, tif="fill_or_kill")
+        except Exception as exc:
+            log.warning("hedge preview failed for %s: %s", leg[1], exc)
+            return True
+        if getattr(res, "status", None) is OrderStatus.ERROR:
+            return True                          # couldn't preview -> proceed (best effort)
+        return res.filled >= size - 1e-9
+
     def _max_size(self, opp: ArbOpportunity,
                   depth_override: float | None = None) -> tuple[int, dict[str, float]]:
         """Largest whole-contract size that fits every hard limit at once:
@@ -350,6 +367,17 @@ class Executor:
         second_venue = self.venues.get(second[0])
         if first_venue is None or second_venue is None:
             return ExecutionReport(ExecStatus.SKIPPED, "venue not available")
+
+        # Preview the hedge (deep) leg before committing leg 1: if it would NOT fully fill
+        # (phantom/evaporated depth), skip the whole trade — no leg placed, no naked risk,
+        # and we never fire a synchronous FOK into empty liquidity (the 500 trigger). Only
+        # acts when the hedge venue supports preview; a preview failure proceeds as before.
+        if not await self._hedge_would_fill(second_venue, second, size):
+            self._audit("execute_skip_preview", opp, size=size)
+            log.info("STREAM skip %s — hedge preview: leg2 would not fully fill %g",
+                     opp.event_key, size)
+            return ExecutionReport(
+                ExecStatus.SKIPPED, "hedge preview: leg2 would not fully fill")
 
         self._audit("execute_start", opp, size=size)
 

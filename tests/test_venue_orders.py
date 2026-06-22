@@ -490,6 +490,61 @@ def test_polymarket_place_order_no_meta_unchanged():
     assert cap["body"]["quantity"] == 3
 
 
+def test_polymarket_preview_order_reports_expected_fill():
+    # POST /v1/order/preview returns {order: {...}} with cumQuantity = expected fill.
+    cap = {}
+
+    def handler(req):
+        cap["path"] = req.url.path
+        cap["body"] = json.loads(req.content)
+        return httpx.Response(200, json={"order": {
+            "id": "pv", "state": "ORDER_STATE_NEW", "cumQuantity": 5,
+            "avgPx": {"value": "0.60", "currency": "USD"}}})
+
+    cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
+    v = PolymarketUSVenue(cfg)
+    v._api_client = _client(handler, cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    r = asyncio.run(v.preview_order("slug", Side.YES, "buy", 0.60, 5))
+    assert cap["path"].endswith("/v1/order/preview")
+    assert cap["body"]["request"]["marketSlug"] == "slug"   # wrapped under `request`
+    assert r.status.value == "FILLED" and r.filled == 5     # would fully fill
+
+
+def test_polymarket_preview_partial_is_not_full_fill():
+    def handler(req):
+        return httpx.Response(200, json={"order": {
+            "id": "pv", "state": "ORDER_STATE_NEW", "cumQuantity": 2}})
+
+    cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
+    v = PolymarketUSVenue(cfg)
+    v._api_client = _client(handler, cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    r = asyncio.run(v.preview_order("slug", Side.YES, "buy", 0.60, 5))
+    assert r.filled == 2 and r.filled < 5                   # would NOT fully fill
+
+
+def test_polymarket_place_order_polls_get_when_nonterminal():
+    # A synchronous response that comes back non-terminal (PARTIAL) but with an id ->
+    # GET /v1/order/{id} resolves the real terminal state (here, FILLED).
+    def handler(req):
+        if req.method == "GET" and "/v1/order/" in req.url.path:
+            return httpx.Response(200, json={"order": {
+                "id": "o9", "state": "ORDER_STATE_FILLED", "cumQuantity": 2,
+                "avgPx": {"value": "0.40", "currency": "USD"}}})
+        # POST /v1/orders: a non-terminal partial with an order id.
+        return httpx.Response(200, json={"id": "o9", "executions": [
+            {"type": "EXECUTION_TYPE_PARTIAL_FILL", "lastShares": "1",
+             "order": {"id": "o9", "state": "ORDER_STATE_PARTIALLY_FILLED", "cumQuantity": 1}}]})
+
+    cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
+    v = PolymarketUSVenue(cfg)
+    v._api_client = _client(handler, cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    r = asyncio.run(v.place_order("slug", Side.YES, "buy", 0.40, 2))
+    assert r.status.value == "FILLED" and r.filled == 2     # resolved via GET-by-id
+
+
 def test_kalshi_account_snapshot_balance_and_positions():
     def handler(req):
         if req.url.path.endswith("/portfolio/balance"):

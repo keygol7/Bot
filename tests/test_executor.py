@@ -363,6 +363,42 @@ def test_leg2_error_halts_and_trips_kill_switch():
     assert risk.is_killed                            # ambiguous hedge state -> stop everything
 
 
+class PreviewVenue(FakeVenue):
+    """FakeVenue that also answers preview_order (the hedge fillability pre-check)."""
+
+    def __init__(self, name, responses, preview_filled):
+        super().__init__(name, responses)
+        self._preview_filled = preview_filled
+
+    async def preview_order(self, market_id, side, action, price, contracts, *,
+                            tif="fill_or_kill"):
+        return res(self.name, side, OrderStatus.PARTIAL, self._preview_filled, None)
+
+
+def test_hedge_preview_skips_when_would_not_fill():
+    # The hedge preview says leg 2 would NOT fully fill (phantom depth) -> skip the whole
+    # trade before placing leg 1. No naked leg, no synchronous FOK into empty liquidity.
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = PreviewVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)],
+                      preview_filled=0)
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.SKIPPED
+    assert yes.calls == [] and no.calls == []         # nothing placed
+    assert not risk.is_killed
+
+
+def test_hedge_preview_proceeds_when_fills():
+    # The hedge preview confirms a full fill -> proceed and lock the arb as normal.
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = PreviewVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)],
+                      preview_filled=2)
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.SUCCESS
+    assert len(yes.calls) == 1 and len(no.calls) == 1
+
+
 def test_leg2_error_reconciles_hedge_present_settles():
     # A leg-2 ERROR (e.g. a Polymarket 500 on POST) where the venue actually HOLDS the
     # hedge -> the order landed and the arb is locked; settle it instead of freezing the
