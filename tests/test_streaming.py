@@ -436,6 +436,24 @@ def test_rejected_pair_backs_off_then_retries():
     assert fe.calls == 2
 
 
+def test_unfilled_maker_does_not_back_off():
+    # A maker that RESTED and expired uncrossed (leg status RESTING) is a benign no-trade:
+    # it must NOT back the pair off (so it can re-rest while the edge persists). A genuine
+    # venue REJECTION still does.
+    from bot.execution.executor import ExecStatus, ExecutionReport
+    from bot.execution.orders import OrderResult, OrderStatus
+
+    eng = make_engine(FakeExec())
+    p = next(iter(eng._pairs.values()))
+    resting = OrderResult("kalshi", "K1", None, "buy", 0, status=OrderStatus.RESTING)
+    eng._note_outcome(p.key, p, ExecutionReport(ExecStatus.SKIPPED, "maker unfilled — expired", [resting]))
+    assert p.key not in eng._backoff_until            # benign -> no backoff, re-rests
+
+    rejected = OrderResult("kalshi", "K1", None, "buy", 0, status=OrderStatus.REJECTED)
+    eng._note_outcome(p.key, p, ExecutionReport(ExecStatus.SKIPPED, "leg REJECTED", [rejected]))
+    assert p.key in eng._backoff_until                # hostile -> backs off
+
+
 def test_skips_when_a_leg_is_not_open():
     # The Polymarket leg reports a non-OPEN state on its quote -> don't fire.
     fe = FakeExec()

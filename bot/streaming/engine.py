@@ -362,10 +362,14 @@ class StreamingEngine:
 
     def _note_outcome(self, key, p, report) -> None:
         """Escalating backoff for a pair whose orders keep failing (e.g. a venue that
-        rejects orders on a live/in-play market). A real fill resets it; a failed
-        attempt (an order was placed but didn't lock the arb) pushes the next retry
-        out exponentially, so the engine stops hammering an untradeable market."""
+        rejects orders on a live/in-play market). A real fill resets it; a genuinely
+        hostile outcome (a rejected leg, an unwind, a halt) pushes the next retry out
+        exponentially. A maker that simply RESTED and expired unfilled is NOT a failure —
+        nobody crossed it yet — so it must not back off, or we'd cede the book most of the
+        time on a persistent edge instead of re-resting to capture it (cooldown still
+        throttles the re-rest)."""
         from bot.execution.executor import ExecStatus
+        from bot.execution.orders import OrderStatus
 
         status = getattr(report, "status", None)
         if status is None:
@@ -374,8 +378,15 @@ class StreamingEngine:
             self._fail_counts.pop(key, None)
             self._backoff_until.pop(key, None)
             return
-        if not getattr(report, "legs", None):
+        legs = getattr(report, "legs", None)
+        if not legs:
             return                                # pre-order skip (risk/size) — not a failure
+        rejected = any(getattr(leg, "status", None) is OrderStatus.REJECTED for leg in legs)
+        if status is ExecStatus.SKIPPED and not rejected:
+            # Benign no-trade: a maker rested and expired uncrossed. Clear any prior penalty
+            # and let it re-rest (gated only by the cooldown) while the edge persists.
+            self._fail_counts.pop(key, None)
+            return
         n = self._fail_counts.get(key, 0) + 1
         self._fail_counts[key] = n
         delay = min(self._backoff_base * (2 ** (n - 1)), self._backoff_cap)
