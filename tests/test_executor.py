@@ -346,18 +346,37 @@ def test_execute_maker_hedge_fails_unwinds_maker():
 
 
 def test_execute_maker_hedge_error_flat_unwinds():
-    # Maker fills; the Poly hedge ERRORS (500/timeout) and reconciles to FLAT -> UNWIND the
-    # naked maker fill instead of halting and holding it into settlement (the Ruzic loss).
+    # Maker fills; the Poly hedge ERRORS (500/timeout) and reconciles to FLAT. After the
+    # retries are exhausted it UNWINDS the naked maker fill instead of halting and holding
+    # it into settlement (the Ruzic loss).
     kalshi = FakeVenue("kalshi", [
         res("kalshi", Side.NO, OrderStatus.RESTING, 0, None),
         res("kalshi", Side.NO, OrderStatus.FILLED, 5, 0.54, action="sell"),
     ])
-    poly = SnapshotVenue("poly", [res("poly", Side.YES, OrderStatus.ERROR, 0, None)], [])
+    poly = SnapshotVenue("poly", [
+        res("poly", Side.YES, OrderStatus.ERROR, 0, None),
+        res("poly", Side.YES, OrderStatus.ERROR, 0, None),    # retry also errors -> unwind
+    ], [])
     ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.40, no_price=0.55)))
     assert report.status is ExecStatus.UNWOUND and not risk.is_killed
     assert kalshi.calls[1][2] == "sell"            # the naked maker leg was flattened
+
+
+def test_execute_maker_hedge_error_retries_then_settles():
+    # Maker fills; the first hedge ERRORS but reconciles to FLAT (nothing landed) -> retry;
+    # the retry FILLS -> locked arb. A transient venue error doesn't cost a round trip.
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly = SnapshotVenue("poly", [
+        res("poly", Side.YES, OrderStatus.ERROR, 0, None),     # transient hedge error
+        res("poly", Side.YES, OrderStatus.FILLED, 5, 0.40),    # retry fills
+    ], [])
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55)}))
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.SUCCESS and not risk.is_killed
+    assert len(poly.calls) == 2                    # retried the hedge once, then filled
 
 
 def test_execute_maker_hedge_error_present_settles():

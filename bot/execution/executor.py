@@ -94,6 +94,7 @@ class Executor:
         maker_improvement: float = 0.01,
         maker_arm_cushion: float = 0.0,
         maker_poll: float = 0.0,
+        hedge_retries: int = 1,
     ) -> None:
         self.venues = venues
         self.risk = risk
@@ -145,6 +146,11 @@ class Executor:
         # static guard at fire time; this is the dynamic guard while resting). 0 = disabled
         # (rest blindly until fill/expiry — only safe with a large arm cushion).
         self.maker_poll = maker_poll
+        # After a maker fills, the forced hedge may hit a TRANSIENT venue error (e.g. a
+        # Polymarket 500/timeout during a WS wobble). Re-place the hedge up to this many
+        # times — but ONLY after reconciling the hedge venue to confirm nothing landed, so
+        # a retry can never double up. Exhausting the retries falls through to the unwind.
+        self.hedge_retries = max(0, int(hedge_retries))
 
     def set_balances(self, snapshots) -> None:
         """Seed available cash per venue from account snapshots (startup/refresh)."""
@@ -653,16 +659,23 @@ class Executor:
                 "(combined %.3f > 1) — hedging to bound the loss; raise EXEC_MAKER_ARM_CUSHION",
                 opp.event_key, maker[2].value, maker_cost, taker_px, maker_cost + taker_px)
         taker_limit = min(0.99, round(taker_px + self.hedge_buffer, 4))
-        hedge = await self._place(
-            taker_venue, taker[1], taker[2], "buy", taker_limit, filled, "immediate_or_cancel")
-        log.info("maker-hedge %s", hedge)
-        if hedge.status is OrderStatus.FILLED and hedge.filled_fully:
-            return self._settle_success(opp, filled, [maker_leg, hedge])
-        if hedge.status in (OrderStatus.KILLED, OrderStatus.REJECTED) and hedge.filled <= 1e-9:
-            log.warning("maker hedge %s — %s", hedge.status.value, _reject_reason(hedge))
-            return await self._unwind(
-                opp, maker_leg, hedge, reason=f"maker hedge {hedge.status.value} ({_reject_reason(hedge)})")
-        if hedge.status is OrderStatus.ERROR:
+        attempt = 0
+        while True:
+            hedge = await self._place(
+                taker_venue, taker[1], taker[2], "buy", taker_limit, filled, "immediate_or_cancel")
+            log.info("maker-hedge %s", hedge)
+            if hedge.status is OrderStatus.FILLED and hedge.filled_fully:
+                return self._settle_success(opp, filled, [maker_leg, hedge])
+            if hedge.status in (OrderStatus.KILLED, OrderStatus.REJECTED) and hedge.filled <= 1e-9:
+                log.warning("maker hedge %s — %s", hedge.status.value, _reject_reason(hedge))
+                return await self._unwind(
+                    opp, maker_leg, hedge,
+                    reason=f"maker hedge {hedge.status.value} ({_reject_reason(hedge)})")
+            if hedge.status is not OrderStatus.ERROR:
+                return self._halt(
+                    f"maker hedge ambiguous ({hedge.status.value}: {_reject_reason(hedge)})",
+                    [maker_leg, hedge])
+            # ----- hedge ERROR (ambiguous) -----
             # Ambiguous hedge (e.g. a Polymarket 500/timeout). We already HOLD the maker
             # fill, so holding it naked into settlement is the dangerous state — that is
             # exactly how a hedge error became a total loss. Reconcile the hedge venue: if
@@ -678,6 +691,15 @@ class Executor:
                     avg_price=hedge.avg_price if hedge.avg_price is not None else taker_limit)
                 return self._settle_success(opp, filled, [maker_leg, hedge])
             if qty is not None and qty <= 1e-9:
+                # Confirmed flat: nothing landed, so a transient error doesn't mean no
+                # liquidity — safe to RE-PLACE the hedge (the reconcile rules out a
+                # double-up). Retry a bounded number of times, then unwind.
+                if attempt < self.hedge_retries:
+                    attempt += 1
+                    log.warning("maker hedge ERROR but %s flat — retrying hedge (%d/%d) (%s)",
+                                taker[1], attempt, self.hedge_retries, _reject_reason(hedge))
+                    await asyncio.sleep(0.25)
+                    continue
                 log.warning("maker hedge ERROR but %s flat — unwinding the naked maker fill (%s)",
                             taker[1], _reject_reason(hedge))
                 return await self._unwind(
@@ -686,9 +708,6 @@ class Executor:
             return self._halt(
                 f"maker hedge ambiguous (ERROR: {_reject_reason(hedge)}; "
                 f"hedge qty {qty}) — manual reconcile", [maker_leg, hedge])
-        return self._halt(
-            f"maker hedge ambiguous ({hedge.status.value}: {_reject_reason(hedge)})",
-            [maker_leg, hedge])
 
     # ---- outcomes ----
     def _settle_success(self, opp, size, legs) -> ExecutionReport:

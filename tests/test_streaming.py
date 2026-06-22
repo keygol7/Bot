@@ -685,6 +685,35 @@ def test_hybrid_disabled_always_rests_maker():
     assert fe.maker and fe.taker == []
 
 
+def test_kill_switch_skips_all_pair_work():
+    # When the executor's kill switch is tripped, a quote must NOT trigger any edge work
+    # (no execute, no depth-confirm REST) — the pair is dead until a restart clears it.
+    class KilledExec:
+        class risk:
+            is_killed = True
+        def __init__(self):
+            self.calls = []
+        async def execute(self, opp):
+            self.calls.append(opp)
+            return "executed"
+
+    fe = KilledExec()
+    depth_calls = []
+
+    async def depth_fetch(venue, mid):
+        depth_calls.append((venue, mid))
+        return q(venue, mid, yes_ask=0.40, ya=100, no_ask=0.55, na=100)
+
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, depth_fetch=depth_fetch)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)))
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)))
+    assert fe.calls == [] and depth_calls == []     # no execute, no REST depth-confirm
+
+
 def test_consume_counts_ws_quotes_for_health():
     # The WS-health heartbeat: _consume must count each tick per venue so the run
     # loop can report whether a venue's WebSocket is actually delivering data.

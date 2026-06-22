@@ -272,6 +272,13 @@ class StreamingEngine:
         p = self._pairs.get(key)
         if p is None:
             return None
+        # When the kill switch is tripped the executor SKIPs every order anyway, so doing
+        # the per-tick edge math + a REST depth-confirm round trip is pure waste — and a
+        # post-halt confirm storm starves the WS keepalive (a cause of the hedge-venue
+        # disconnect churn). Stop all work for the pair until a restart clears the halt.
+        risk = getattr(self.executor, "risk", None)
+        if risk is not None and getattr(risk, "is_killed", False):
+            return None
         if self.maker_mode and key in self._maker_inflight:
             return None                           # already resting a maker for this pair
         ev = self._best_direction(p)

@@ -16,6 +16,11 @@ WorkingDirectory=/home/keyahn/Bot
 # logic uses explicit UTC (datetime.now(timezone.utc)), so it is unaffected. Change the
 # zone if you relocate; remove the line to log in the system timezone (UTC on this VM).
 Environment=TZ=America/Denver
+# Soft memory cap: above this the kernel reclaims this service's pages first (throttle,
+# NOT an OOM-kill) so a full-board scan (SCAN_LIMIT=0) can't balloon RSS into swap and
+# stall the event loop (a cause of WS keepalive timeouts). Raise it if the bot is slowed;
+# it needs headroom under total RAM. MemoryMax is left unset so it is never killed mid-trade.
+MemoryHigh=2G
 # !!! REAL MONEY !!!
 # --stream places REAL orders. Polymarket US has NO demo, so the Polymarket leg is
 # ALWAYS real. For coherent cross-venue arb, BOTH venues must point at PRODUCTION in

@@ -590,6 +590,7 @@ async def stream(
         maker_improvement=settings.exec_maker_improvement,
         maker_arm_cushion=settings.exec_maker_arm_cushion,
         maker_poll=settings.exec_maker_poll,
+        hedge_retries=settings.exec_hedge_retries,
     )
 
     venue_by_name = {v.name: v for v in venues}

@@ -211,6 +211,10 @@ class Settings:
     # resting a maker that may never get crossed. Deep-but-thin edges (below the taker bar)
     # and shallow edges still rest a maker. 0 = disabled (pure maker mode, never auto-takes).
     exec_hybrid_take_depth: float = 0.0
+    # After a maker fills, retry the forced hedge this many times on a TRANSIENT venue
+    # error (e.g. a Polymarket 500/timeout) before unwinding — each retry only after
+    # reconciling the hedge venue to confirm nothing landed (so it can't double up).
+    exec_hedge_retries: int = 1
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -288,4 +292,5 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_maker_arm_cushion=_env_float("EXEC_MAKER_ARM_CUSHION", 0.04),
         exec_maker_poll=_env_float("EXEC_MAKER_POLL", 1.0),
         exec_hybrid_take_depth=_env_float("EXEC_HYBRID_TAKE_DEPTH", 0.0),
+        exec_hedge_retries=int(_env_float("EXEC_HEDGE_RETRIES", 1)),
     )
