@@ -11,6 +11,11 @@ Type=simple
 # Edit User and paths if your username/clone location differ.
 User=keyahn
 WorkingDirectory=/home/keyahn/Bot
+# Log timestamps in local (Denver) time so they line up with the Kalshi/Polymarket apps.
+# Only affects the process's local-time DISPLAY (Python's %(asctime)s); all internal time
+# logic uses explicit UTC (datetime.now(timezone.utc)), so it is unaffected. Change the
+# zone if you relocate; remove the line to log in the system timezone (UTC on this VM).
+Environment=TZ=America/Denver
 # !!! REAL MONEY !!!
 # --stream places REAL orders. Polymarket US has NO demo, so the Polymarket leg is
 # ALWAYS real. For coherent cross-venue arb, BOTH venues must point at PRODUCTION in

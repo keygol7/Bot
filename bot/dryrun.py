@@ -1383,6 +1383,66 @@ def probe_account(settings: Settings) -> int:
     return 0
 
 
+def kalshi_history(settings: Settings, *, limit: int = 100, find: str | None = None) -> int:
+    """Print recent Kalshi fills + settlements (the authoritative order history) so a
+    position you didn't see in the bot logs can be traced to a real fill and its payout.
+    Times are shown in BOTH UTC and local so they line up with the Kalshi app. Read-only.
+    """
+    from datetime import datetime, timezone
+
+    from bot.venues.kalshi import KalshiVenue
+
+    if not settings.kalshi.api_key_id:
+        print("Kalshi API credentials not configured (set KALSHI_API_KEY_ID + key path)")
+        return 1
+    v = KalshiVenue(settings.kalshi)
+
+    def _fmt_ts(ts):
+        # Kalshi timestamps are ISO8601 strings or epoch seconds; show UTC + local.
+        if ts in (None, ""):
+            return "?"
+        try:
+            dt = (datetime.fromtimestamp(float(ts), tz=timezone.utc)
+                  if isinstance(ts, (int, float)) or str(ts).replace(".", "").isdigit()
+                  else datetime.fromisoformat(str(ts).replace("Z", "+00:00")))
+        except Exception:
+            return str(ts)
+        local = dt.astimezone()
+        return f"{dt:%Y-%m-%d %H:%M}Z / {local:%H:%M %Z}"
+
+    async def _run():
+        try:
+            fills = await v.fills(limit=limit)
+            settlements = await v.settlements(limit=limit)
+        finally:
+            await v.aclose()
+
+        def _match(d):
+            return not find or find.lower() in str(d.get("ticker", "")).lower()
+
+        print(f"\n== FILLS (last {limit}) ==")
+        for f in fills:
+            if not _match(f):
+                continue
+            px = f.get("yes_price") if f.get("side") == "yes" else f.get("no_price")
+            print(f"  {_fmt_ts(f.get('created_time'))}  {f.get('ticker'):32} "
+                  f"{str(f.get('action','')).upper():4} {str(f.get('side','')).upper():3} "
+                  f"{f.get('count')}@{px}  taker={f.get('is_taker')}  order={f.get('order_id')}")
+        print(f"\n== SETTLEMENTS (last {limit}) ==")
+        for s in settlements:
+            if not _match(s):
+                continue
+            rev = s.get("revenue")
+            rev_str = f"${float(rev)/100:.2f}" if rev not in (None, "") else "?"
+            print(f"  {_fmt_ts(s.get('settled_time'))}  {s.get('ticker'):32} "
+                  f"result={s.get('market_result')}  yes={s.get('yes_count')} "
+                  f"no={s.get('no_count')}  payout={rev_str}")
+        print("\n(All times UTC / local. Cross-check a position against its fill + settlement.)")
+
+    asyncio.run(_run())
+    return 0
+
+
 def edge_report(settings: Settings, *, hours: float = 24.0) -> int:
     """Summarize logged edge observations (what the streamer saw + did) over a window.
 
@@ -1515,6 +1575,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--probe-account", action="store_true",
                    help="probe Polymarket US account/portfolio endpoints (read-only) "
                         "to discover the real balance/positions paths")
+    p.add_argument("--kalshi-history", action="store_true",
+                   help="print recent Kalshi fills + settlements (read-only order history) "
+                        "with UTC+local times; filter with --find, size with --limit")
     p.add_argument("--compare-filters", action="store_true",
                    help="SHADOW: compare the structured fingerprint matcher vs the live "
                         "filter over cached verdicts (adds/removes); trades nothing")
@@ -1601,6 +1664,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.count_markets:
         raise SystemExit(count_markets(load_settings()))
+
+    if args.kalshi_history:
+        raise SystemExit(kalshi_history(
+            load_settings(), limit=args.limit if args.limit != 50 else 100, find=args.find))
 
     if args.find:
         raise SystemExit(find_markets(load_settings(), args.find))

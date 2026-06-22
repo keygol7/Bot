@@ -699,6 +699,31 @@ class KalshiVenue:
                 positions.append(pos)
         return AccountSnapshot(self.name, balance, positions)
 
+    async def fills(self, *, limit: int = 200, ticker: str | None = None) -> list[dict]:
+        """Recent fills (executed trades) from /portfolio/fills — the authoritative order
+        history: each carries ticker, side, action, count, yes/no price, taker flag, and
+        created_time. Read-only. Optionally filter to one market ``ticker``."""
+        await self._limiter.wait()
+        path = "/portfolio/fills"
+        params: dict = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        resp = await self._http().get(path, params=params,
+                                      headers=self._auth_headers("GET", path))
+        resp.raise_for_status()
+        return resp.json().get("fills") or []
+
+    async def settlements(self, *, limit: int = 200) -> list[dict]:
+        """Settled markets from /portfolio/settlements: each carries ticker, market_result,
+        yes/no counts, revenue, and settled_time — where a closed position's actual payout
+        (or total loss) shows up. Read-only."""
+        await self._limiter.wait()
+        path = "/portfolio/settlements"
+        resp = await self._http().get(path, params={"limit": limit},
+                                      headers=self._auth_headers("GET", path))
+        resp.raise_for_status()
+        return resp.json().get("settlements") or []
+
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()
