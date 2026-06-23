@@ -95,6 +95,7 @@ class Executor:
         maker_arm_cushion: float = 0.0,
         maker_poll: float = 0.0,
         hedge_retries: int = 1,
+        maker_dynamic: bool = False,
     ) -> None:
         self.venues = venues
         self.risk = risk
@@ -151,6 +152,12 @@ class Executor:
         # times — but ONLY after reconciling the hedge venue to confirm nothing landed, so
         # a retry can never double up. Exhausting the retries falls through to the unwind.
         self.hedge_retries = max(0, int(hedge_retries))
+        # Dynamic maker side: rest the maker on whichever leg is the liquidity bottleneck
+        # (the THINNER book) and TAKE the deeper leg, instead of always resting on
+        # first_venue. Lets a thin Polymarket leg be SOURCED via its own flow as a maker
+        # rather than skipped because its book can't be taken. Requires the maker venue to
+        # support post-only (both adapters do). False = always rest on first_venue.
+        self.maker_dynamic = maker_dynamic
 
     def set_balances(self, snapshots) -> None:
         """Seed available cash per venue from account snapshots (startup/refresh)."""
@@ -238,22 +245,22 @@ class Executor:
                 return abs(pos.quantity)
         return 0.0
 
-    async def _hedge_would_fill(self, venue, leg, size) -> bool:
-        """Preview the hedge leg (when the venue supports it) to confirm it would fully
-        fill at its limit before we commit leg 1. Returns True to proceed (fills, OR no
-        preview support / a preview failure -> don't block on a best-effort check), False
-        only when the venue affirmatively says it would NOT fully fill."""
+    async def _hedge_fillable(self, venue, leg, size) -> float:
+        """Preview the hedge leg (when the venue supports it) and return how many contracts
+        would actually fill at its limit — so the caller can SIZE DOWN to the real fillable
+        quantity instead of skipping a partially-fillable hedge. Returns ``inf`` when the
+        venue has no preview or the preview itself errors (best-effort: don't cap)."""
         preview = getattr(venue, "preview_order", None)
         if preview is None:
-            return True
+            return float("inf")
         try:
             res = await preview(leg[1], leg[2], "buy", leg[3], size, tif="fill_or_kill")
         except Exception as exc:
             log.warning("hedge preview failed for %s: %s", leg[1], exc)
-            return True
+            return float("inf")
         if getattr(res, "status", None) is OrderStatus.ERROR:
-            return True                          # couldn't preview -> proceed (best effort)
-        return res.filled >= size - 1e-9
+            return float("inf")          # couldn't preview -> proceed (best effort)
+        return res.filled
 
     def _max_size(self, opp: ArbOpportunity,
                   depth_override: float | None = None) -> tuple[int, dict[str, float]]:
@@ -374,16 +381,24 @@ class Executor:
         if first_venue is None or second_venue is None:
             return ExecutionReport(ExecStatus.SKIPPED, "venue not available")
 
-        # Preview the hedge (deep) leg before committing leg 1: if it would NOT fully fill
-        # (phantom/evaporated depth), skip the whole trade — no leg placed, no naked risk,
-        # and we never fire a synchronous FOK into empty liquidity (the 500 trigger). Only
-        # acts when the hedge venue supports preview; a preview failure proceeds as before.
-        if not await self._hedge_would_fill(second_venue, second, size):
-            self._audit("execute_skip_preview", opp, size=size)
-            log.info("STREAM skip %s — hedge preview: leg2 would not fully fill %g",
-                     opp.event_key, size)
-            return ExecutionReport(
-                ExecStatus.SKIPPED, "hedge preview: leg2 would not fully fill")
+        # Preview the hedge (deep) leg before committing leg 1 and SIZE DOWN to what it
+        # would actually fill. Polymarket can be thin/phantom, so taking the full size
+        # would leave the hedge short (a naked remainder) or fire a FOK into empty
+        # liquidity (the 500 trigger). Sizing to the preview's fillable quantity keeps the
+        # trade fully hedged at whatever size the thin leg supports — capturing a small
+        # real arb instead of skipping it. No preview support / a preview error -> inf
+        # (don't cap, proceed as before).
+        fillable = await self._hedge_fillable(second_venue, second, size)
+        if fillable < size - 1e-9:
+            capped = int(fillable + 1e-9)
+            if capped < 1:
+                self._audit("execute_skip_preview", opp, size=size)
+                log.info("STREAM skip %s — hedge preview: would fill <1 contract", opp.event_key)
+                return ExecutionReport(
+                    ExecStatus.SKIPPED, "hedge preview: hedge would fill <1 contract")
+            log.info("STREAM %s: sizing down to hedge-fillable %d (book showed %d)",
+                     opp.event_key, capped, size)
+            size = capped
 
         self._audit("execute_start", opp, size=size)
 
@@ -542,14 +557,19 @@ class Executor:
         # HEDGE (taker) leg's depth is what binds in maker mode: the resting maker ADDS
         # liquidity (its own book depth doesn't constrain us), but we must cross the taker
         # to hedge a fill. So guard/size on the taker leg's own depth, not min(both legs).
-        if opp.buy_no_venue == self.first_venue:
-            maker = (opp.buy_no_venue, opp.buy_no_market, Side.NO, opp.no_price)
-            taker = (opp.buy_yes_venue, opp.buy_yes_market, Side.YES, opp.yes_price)
-            hedge_depth = opp.yes_size or opp.max_contracts
+        yes_leg = (opp.buy_yes_venue, opp.buy_yes_market, Side.YES, opp.yes_price)
+        no_leg = (opp.buy_no_venue, opp.buy_no_market, Side.NO, opp.no_price)
+        if self.maker_dynamic and opp.yes_size > 0 and opp.no_size > 0:
+            # Rest the maker on the THIN leg (the bottleneck); TAKE the deep leg (it fills
+            # reliably). hedge_depth is the taker leg's own size — what actually binds.
+            if opp.yes_size <= opp.no_size:
+                maker, taker, hedge_depth = yes_leg, no_leg, opp.no_size
+            else:
+                maker, taker, hedge_depth = no_leg, yes_leg, opp.yes_size
+        elif opp.buy_no_venue == self.first_venue:
+            maker, taker, hedge_depth = no_leg, yes_leg, (opp.yes_size or opp.max_contracts)
         elif opp.buy_yes_venue == self.first_venue:
-            maker = (opp.buy_yes_venue, opp.buy_yes_market, Side.YES, opp.yes_price)
-            taker = (opp.buy_no_venue, opp.buy_no_market, Side.NO, opp.no_price)
-            hedge_depth = opp.no_size or opp.max_contracts
+            maker, taker, hedge_depth = yes_leg, no_leg, (opp.no_size or opp.max_contracts)
         else:
             return await self.execute(opp)   # neither leg on the maker venue -> taker path
 

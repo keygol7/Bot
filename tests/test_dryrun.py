@@ -312,6 +312,22 @@ def test_build_watchlist_keeps_pair_when_both_legs_scanned():
     assert len(out) == 1 and out[0].event_key == "ufc"
 
 
+def test_build_watchlist_drops_thin_polymarket_leg():
+    # min_poly_depth filter: a pair whose Polymarket leg lacks takeable depth is dropped;
+    # a deep one is kept. Points the watchlist at markets the bot can actually hedge.
+    from bot.dryrun import build_watchlist
+
+    thin = mq("polymarket_us", "P1", "x", yes_ask=0.5, yes_ask_size=2, no_ask=0.5, no_ask_size=2)
+    deep = mq("polymarket_us", "P2", "y", yes_ask=0.5, yes_ask_size=50, no_ask=0.5, no_ask_size=50)
+    cached = [("kalshi", "K1", "polymarket_us", "P1", "thin"),
+              ("kalshi", "K2", "polymarket_us", "P2", "deep")]
+    scanned = {("kalshi", "K1"), ("kalshi", "K2"),
+               ("polymarket_us", "P1"), ("polymarket_us", "P2")}
+    venues = [StubVenue("kalshi", {}), StubVenue("polymarket_us", {"P1": thin, "P2": deep})]
+    out = asyncio.run(build_watchlist(cached, scanned, venues, min_poly_depth=10))
+    assert {p.event_key for p in out} == {"deep"}
+
+
 def test_build_watchlist_probes_leg_outside_scan_window():
     # The exact live bug: the Kalshi leg sits past the discovery --limit, so it's
     # absent from ``scanned``. A targeted fetch_quote must rescue it onto the watchlist.

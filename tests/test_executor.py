@@ -392,6 +392,27 @@ def test_execute_maker_hedge_error_present_settles():
     assert report.status is ExecStatus.SUCCESS and not risk.is_killed
 
 
+def test_maker_dynamic_rests_on_thin_leg():
+    # yes leg (poly) is thin (size 5), no leg (kalshi) is deep (200) -> rest the maker on
+    # the THIN poly leg (post_only), TAKE the deep kalshi leg.
+    poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.RESTING, 0, None)])
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.FILLED, 5, 0.55)])
+    risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({"poly": poly, "kalshi": kalshi}, risk,
+                  fee_models={"poly": ZeroFeeModel(), "kalshi": ZeroFeeModel()},
+                  max_order_contracts=5, fill_confirmer=FakeConfirmer({"poly": (OrderStatus.FILLED, 5, 0.40)}),
+                  maker_timeout=0.01, maker_dynamic=True)
+    o = ArbOpportunity(
+        event_key="E", buy_yes_venue="poly", buy_yes_market="P1",
+        buy_no_venue="kalshi", buy_no_market="K1", yes_price=0.40, no_price=0.55,
+        gross_cost=0.95, fee_per_pair=0.0, edge_per_contract=0.05, max_contracts=5,
+        total_fees=0.0, total_profit=0.25, notional=4.75, yes_size=5, no_size=200)
+    report = asyncio.run(ex.execute_maker(o))
+    assert poly.calls[0][1] == "YES" and poly.calls[0][6] is True   # poly maker, post_only
+    assert kalshi.calls[0][1] == "NO"                                # kalshi taker hedge
+    assert report.status is ExecStatus.SUCCESS
+
+
 def test_execute_maker_rejected_when_would_cross():
     kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.REJECTED, 0, None)])
     poly = FakeVenue("poly", [])
@@ -422,9 +443,9 @@ class PreviewVenue(FakeVenue):
         return res(self.name, side, OrderStatus.PARTIAL, self._preview_filled, None)
 
 
-def test_hedge_preview_skips_when_would_not_fill():
-    # The hedge preview says leg 2 would NOT fully fill (phantom depth) -> skip the whole
-    # trade before placing leg 1. No naked leg, no synchronous FOK into empty liquidity.
+def test_hedge_preview_skips_when_would_fill_nothing():
+    # The hedge preview says leg 2 would fill ZERO (phantom depth) -> skip before placing
+    # leg 1. No naked leg, no synchronous FOK into empty liquidity.
     yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
     no = PreviewVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)],
                       preview_filled=0)
@@ -433,6 +454,18 @@ def test_hedge_preview_skips_when_would_not_fill():
     assert report.status is ExecStatus.SKIPPED
     assert yes.calls == [] and no.calls == []         # nothing placed
     assert not risk.is_killed
+
+
+def test_hedge_preview_sizes_down_to_fillable():
+    # The hedge would fill only 1 of the 2 we'd take -> size the WHOLE arb down to 1 and
+    # lock it (capture the liquidity that's there instead of skipping).
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 1, 0.40)])
+    no = PreviewVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 1, 0.55)],
+                      preview_filled=1)
+    ex, risk = make_exec([yes, no])                   # max_order_contracts=2 -> size 2
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.SUCCESS
+    assert yes.calls[0][4] == 1 and no.calls[0][4] == 1   # both legs sized to fillable 1
 
 
 def test_hedge_preview_proceeds_when_fills():

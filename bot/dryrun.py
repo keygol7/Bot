@@ -434,7 +434,41 @@ async def run(
     return last
 
 
-async def build_watchlist(cached, scanned, venues, store=None):
+async def _filter_by_poly_depth(pairs, venue_by_name, min_depth):
+    """Drop pairs whose Polymarket (hedge-bottleneck) leg lacks real takeable depth, so the
+    streaming watchlist points at markets we can actually hedge. Probes the Polymarket book
+    concurrently; an unreadable book KEEPS the pair (don't drop on uncertainty)."""
+    sem = asyncio.Semaphore(16)
+
+    async def _keep(pair) -> bool:
+        for (vn, mid) in ((pair.venue_a, pair.market_a), (pair.venue_b, pair.market_b)):
+            if "poly" not in vn.lower():
+                continue
+            v = venue_by_name.get(vn)
+            if v is None:
+                return True
+            async with sem:
+                try:
+                    q = await v.fetch_quote(RawMarket(market_id=mid, title="", raw={}))
+                except Exception:
+                    return True
+            if q is None:
+                return True
+            depth = max(getattr(q, "yes_ask_size", 0.0) or 0.0,
+                        getattr(q, "no_ask_size", 0.0) or 0.0)
+            return depth >= min_depth
+        return True                              # no Polymarket leg -> keep
+
+    keep_flags = await asyncio.gather(*(_keep(p) for p in pairs))
+    kept = [p for p, ok in zip(pairs, keep_flags, strict=False) if ok]
+    dropped = len(pairs) - len(kept)
+    if dropped:
+        log.info("watchlist: dropped %d pair(s) below Polymarket depth %g (kept %d)",
+                 dropped, min_depth, len(kept))
+    return kept
+
+
+async def build_watchlist(cached, scanned, venues, store=None, *, min_poly_depth=0.0):
     """Confirmed pairs whose BOTH legs are live now -> the streaming watchlist.
 
     Durable across embedding/LLM variance: discovery only *adds* to the cache. A
@@ -521,6 +555,8 @@ async def build_watchlist(cached, scanned, venues, store=None):
                 missing_a += 1
             if not b_live:
                 missing_b += 1
+    if min_poly_depth > 0 and out:
+        out = await _filter_by_poly_depth(out, venue_by_name, min_poly_depth)
     log.info("watchlist: %d confirmed pairs live (of %d cached)", len(out), len(cached))
     if cached and not out:
         # Both probe and scan failed for every pair — show one concrete cached leg
@@ -591,6 +627,7 @@ async def stream(
         maker_arm_cushion=settings.exec_maker_arm_cushion,
         maker_poll=settings.exec_maker_poll,
         hedge_retries=settings.exec_hedge_retries,
+        maker_dynamic=settings.exec_maker_dynamic,
     )
 
     venue_by_name = {v.name: v for v in venues}
@@ -665,7 +702,8 @@ async def stream(
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
         )
-        return await build_watchlist(cached, res.scanned, venues, store=store)
+        return await build_watchlist(cached, res.scanned, venues, store=store,
+                                     min_poly_depth=settings.stream_min_poly_depth)
 
     async def feed_private(v):
         try:

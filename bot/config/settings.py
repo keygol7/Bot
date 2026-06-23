@@ -175,6 +175,10 @@ class Settings:
     # Max concurrent REST snapshots when re-priming the watchlist each cycle (the rest are
     # paced by the per-venue rate limiters). Higher = faster refresh (seconds vs >a minute).
     stream_prime_concurrency: int = 8
+    # Watchlist depth filter: drop pairs whose Polymarket (hedge-bottleneck) leg shows less
+    # than this much top-of-book size, so the bot watches only markets it can actually
+    # hedge. Costs one Polymarket /book probe per pair each refresh. 0 = off (watch all).
+    stream_min_poly_depth: float = 0.0
     # Price cushion reserved for the hedge (second) leg so it fills through book
     # movement WITHOUT unwinding. The bot only fires when the edge can pay this AND
     # still lock RISK_MIN_EDGE, so thin edges that would unwind never fire. Effective
@@ -219,6 +223,11 @@ class Settings:
     # an imbalance is naked exposure (a hedge that never landed). True trips the kill switch
     # when a naked position persists across two checks; False only warns. Always logs.
     exec_reconcile_halt: bool = True
+    # Dynamic maker side: rest the maker on whichever leg is the liquidity bottleneck (the
+    # thinner book) and take the deeper leg, instead of always resting on Kalshi. Lets a
+    # thin Polymarket leg be sourced via its own flow as a maker rather than skipped. Needs
+    # EXEC_MAKER_MODE=true. False = always rest on Kalshi (the original behavior).
+    exec_maker_dynamic: bool = False
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -289,6 +298,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         stream_edge_persist_secs=_env_float("STREAM_EDGE_PERSIST_SECS", 0.0),
         stream_refresh_secs=_env_float("STREAM_REFRESH_SECS", 300.0),
         stream_prime_concurrency=int(_env_float("STREAM_PRIME_CONCURRENCY", 8)),
+        stream_min_poly_depth=_env_float("STREAM_MIN_POLY_DEPTH", 0.0),
         exec_hedge_buffer=_env_float("EXEC_HEDGE_BUFFER", 0.03),
         exec_maker_mode=(env("EXEC_MAKER_MODE", "false") or "false").lower() == "true",
         exec_maker_timeout=_env_float("EXEC_MAKER_TIMEOUT", 5.0),
@@ -298,4 +308,5 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_hybrid_take_depth=_env_float("EXEC_HYBRID_TAKE_DEPTH", 0.0),
         exec_hedge_retries=int(_env_float("EXEC_HEDGE_RETRIES", 1)),
         exec_reconcile_halt=(env("EXEC_RECONCILE_HALT", "true") or "true").lower() == "true",
+        exec_maker_dynamic=(env("EXEC_MAKER_DYNAMIC", "false") or "false").lower() == "true",
     )

@@ -788,22 +788,34 @@ class PolymarketUSVenue:
 
     async def place_order(
         self, market_id: str, side: Side, action: str, price: float, contracts: float,
-        *, tif: str = "fill_or_kill",
+        *, tif: str = "fill_or_kill", post_only: bool = False, expiration_ts: int | None = None,
     ) -> OrderResult:
         """Place an order via POST /v1/orders (X-PM Ed25519 auth).
 
-        ``synchronousExecution`` blocks until the order is terminal so the response
-        carries the full executions (authoritative). If that response is still
-        non-terminal but carries an order id, poll GET /v1/order/{id} once for the
-        resolved state (the docs' submit-then-poll pattern).
+        Taker orders use ``synchronousExecution`` so the response carries the terminal
+        executions (with a submit-then-poll fallback). A ``post_only`` order is a resting
+        MAKER: it's sent async with ``participateDontInitiate`` (rejected if it would
+        immediately match), and ``expiration_ts`` self-cancels it via a good-till-date —
+        so an unfilled maker cleans itself up. A resting maker comes back ``RESTING``.
         """
         if not getattr(self.cfg, "is_trading_configured", False):
             raise OrderNotPermitted("Polymarket US trading credentials not configured")
         body = self._order_body(market_id, side, action, price, contracts, tif)
-        # Per the API schema maxBlockTime is an int64 (seconds) encoded as a string — a
-        # bare "5", NOT a duration like "5s". Keep it under the 10s HTTP client timeout.
-        body["synchronousExecution"] = True
-        body["maxBlockTime"] = "5"
+        if post_only:
+            # Maker-only: rest on the book, never cross (the docs reject it if it would
+            # immediately match). Self-expire via good-till-date so an unfilled maker
+            # cleans itself up. NO synchronousExecution — it rests; we confirm via the WS.
+            body["participateDontInitiate"] = True
+            if expiration_ts is not None:
+                from datetime import datetime, timezone
+                body["tif"] = "TIME_IN_FORCE_GOOD_TILL_DATE"
+                body["goodTillTime"] = datetime.fromtimestamp(
+                    expiration_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            # Per the API schema maxBlockTime is an int64 (seconds) encoded as a string — a
+            # bare "5", NOT a duration like "5s". Keep it under the 10s HTTP client timeout.
+            body["synchronousExecution"] = True
+            body["maxBlockTime"] = "5"
         await self._limiter.wait()
         try:
             resp = await self._api().post(
@@ -820,6 +832,11 @@ class PolymarketUSVenue:
             return order_error_result(VENUE, market_id, side, action, contracts, exc)
 
         status, filled, avg_price, order_id = _parse_create_order_response(data, contracts, side)
+        # A post-only maker that didn't immediately fill or reject is RESTING on the book
+        # (it was sent async, so there are no executions yet) — surface that so the caller
+        # waits for the fill via the WS confirmer rather than treating it as a no-trade.
+        if post_only and order_id and status is OrderStatus.KILLED and filled <= 1e-9:
+            status = OrderStatus.RESTING
         # Submit-then-poll fallback: a synchronous FOK should come back terminal, but if it
         # didn't (a non-terminal state with an order id), GET the order once for the real
         # terminal outcome rather than mis-reporting a fill/no-fill.

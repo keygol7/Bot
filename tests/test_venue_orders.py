@@ -549,6 +549,28 @@ def test_polymarket_place_order_polls_get_when_nonterminal():
     assert r.status.value == "FILLED" and r.filled == 2     # resolved via GET-by-id
 
 
+def test_polymarket_post_only_maker_rests():
+    # A post_only order is a resting MAKER: participateDontInitiate=true, good-till-date
+    # self-expiry, NO synchronousExecution. An accepted-but-unfilled maker -> RESTING.
+    cap = {}
+
+    def handler(req):
+        cap["body"] = json.loads(req.content)
+        return httpx.Response(200, json={"id": "mk1", "executions": []})   # rests, no fill
+
+    cfg = QcexConfig(api_key_id="k", secret_key="c2VjcmV0")
+    v = PolymarketUSVenue(cfg)
+    v._api_client = _client(handler, cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    r = asyncio.run(v.place_order("slug", Side.YES, "buy", 0.62, 5,
+                                  tif="gtc", post_only=True, expiration_ts=1782300000))
+    assert cap["body"]["participateDontInitiate"] is True
+    assert cap["body"]["tif"] == "TIME_IN_FORCE_GOOD_TILL_DATE"
+    assert "goodTillTime" in cap["body"]
+    assert "synchronousExecution" not in cap["body"]   # a maker rests; not blocked
+    assert r.status.value == "RESTING" and r.order_id == "mk1"
+
+
 def test_kalshi_account_snapshot_balance_and_positions():
     def handler(req):
         if req.url.path.endswith("/portfolio/balance"):
