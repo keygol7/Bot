@@ -228,6 +228,12 @@ class Settings:
     # thin Polymarket leg be sourced via its own flow as a maker rather than skipped. Needs
     # EXEC_MAKER_MODE=true. False = always rest on Kalshi (the original behavior).
     exec_maker_dynamic: bool = False
+    # Depth-scaled hedge buffer: at/above this book depth (contracts) the hedge fills at the
+    # touch, so the required hedge buffer scales down to one tick — letting the bot fire on
+    # the smaller, more frequent divergence windows on DEEP markets while keeping the full
+    # buffer on thin books. Set near the depth where fills are reliable (e.g. 1000 given the
+    # major markets are 50k-500k deep). 0 = off (always the full EXEC_HEDGE_BUFFER).
+    exec_buffer_deep_depth: float = 0.0
 
 
 def load_settings(dotenv_path: str = ".env") -> Settings:
@@ -309,4 +315,5 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_hedge_retries=int(_env_float("EXEC_HEDGE_RETRIES", 1)),
         exec_reconcile_halt=(env("EXEC_RECONCILE_HALT", "true") or "true").lower() == "true",
         exec_maker_dynamic=(env("EXEC_MAKER_DYNAMIC", "false") or "false").lower() == "true",
+        exec_buffer_deep_depth=_env_float("EXEC_BUFFER_DEEP_DEPTH", 0.0),
     )

@@ -60,6 +60,25 @@ class ExecStatus(str, Enum):
     HALTED = "HALTED"        # ambiguous/unknown state — kill switch tripped
 
 
+def scaled_hedge_buffer(buffer: float, depth: float, thin_depth: float,
+                        deep_depth: float) -> float:
+    """The hedge buffer to require for a given book ``depth``. The buffer is a price
+    cushion that lets the second (hedge) leg fill through movement without unwinding — but
+    a DEEP book fills at the touch and barely needs it, while a THIN book needs the full
+    amount. Scale linearly from the full ``buffer`` at/below ``thin_depth`` to a one-tick
+    floor at/above ``deep_depth``, so the bot can fire on the SMALLER (more frequent)
+    divergence windows on deep markets while keeping full protection on thin ones.
+    ``deep_depth <= 0`` disables scaling (always the full buffer)."""
+    floor = min(buffer, 0.01)
+    thin = max(thin_depth, 1.0)
+    if deep_depth <= thin or depth <= thin:
+        return buffer
+    if depth >= deep_depth:
+        return floor
+    frac = (depth - thin) / (deep_depth - thin)
+    return round(buffer - frac * (buffer - floor), 4)
+
+
 @dataclass
 class ExecutionReport:
     status: ExecStatus
@@ -96,6 +115,7 @@ class Executor:
         maker_poll: float = 0.0,
         hedge_retries: int = 1,
         maker_dynamic: bool = False,
+        buffer_deep_depth: float = 0.0,
     ) -> None:
         self.venues = venues
         self.risk = risk
@@ -158,6 +178,15 @@ class Executor:
         # rather than skipped because its book can't be taken. Requires the maker venue to
         # support post-only (both adapters do). False = always rest on first_venue.
         self.maker_dynamic = maker_dynamic
+        # Depth at/above which a market is "deep" enough that the hedge fills at the touch,
+        # so the hedge buffer scales down to one tick — letting the bot take the smaller
+        # divergence windows on deep books. 0 = off (always the full hedge_buffer).
+        self.buffer_deep_depth = buffer_deep_depth
+
+    def _hedge_buffer_for(self, depth: float) -> float:
+        """The depth-scaled hedge buffer for a fire of this size (see scaled_hedge_buffer)."""
+        return scaled_hedge_buffer(
+            self.hedge_buffer, depth, self.min_leg_depth, self.buffer_deep_depth)
 
     def set_balances(self, snapshots) -> None:
         """Seed available cash per venue from account snapshots (startup/refresh)."""
@@ -312,7 +341,7 @@ class Executor:
         locked profit is >= floor by construction."""
         floor = self.min_lock_edge if self.min_lock_edge is not None else self.risk.limits.min_edge
         surplus = max(0.0, opp.edge_per_contract - floor)
-        hedge = min(self.hedge_buffer, surplus)
+        hedge = min(self._hedge_buffer_for(opp.max_contracts), surplus)
         leftover = surplus - hedge
 
         def px(side):
@@ -361,11 +390,12 @@ class Executor:
         # just unwind. We only fire when the edge can pay the hedge buffer AND still lock
         # the floor, so the hedge fills through normal book movement (no unwind).
         floor = self.min_lock_edge if self.min_lock_edge is not None else self.risk.limits.min_edge
-        if opp.edge_per_contract < floor + self.hedge_buffer - 1e-9:
+        req_buffer = self._hedge_buffer_for(opp.max_contracts)
+        if opp.edge_per_contract < floor + req_buffer - 1e-9:
             return ExecutionReport(
                 ExecStatus.SKIPPED,
                 f"edge {opp.edge_per_contract:.3f} < lock {floor:.3f} + hedge "
-                f"{self.hedge_buffer:.3f} — would risk an unwind",
+                f"{req_buffer:.3f} (depth {opp.max_contracts:g}) — would risk an unwind",
             )
         first_limit, second_limit = self._leg_limits(opp, first_side, second_side)
         notional = size * (first_limit + second_limit)   # worst-case cost for the risk check

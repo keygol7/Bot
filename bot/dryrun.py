@@ -628,6 +628,7 @@ async def stream(
         maker_poll=settings.exec_maker_poll,
         hedge_retries=settings.exec_hedge_retries,
         maker_dynamic=settings.exec_maker_dynamic,
+        buffer_deep_depth=settings.exec_buffer_deep_depth,
     )
 
     venue_by_name = {v.name: v for v in venues}
@@ -645,13 +646,28 @@ async def stream(
     # so the hedge fills through movement instead of unwinding.
     fire_threshold = (min_edge + settings.exec_maker_arm_cushion if settings.exec_maker_mode
                       else min_edge + settings.exec_hedge_buffer)
+    # Depth-scaled take bar: on a deep book the hedge fills at the touch, so the hybrid TAKE
+    # needs only a one-tick buffer — let the bot catch the smaller (more frequent) divergence
+    # windows where the size is. The engine GATE drops to the minimum possible bar so those
+    # edges reach the depth check; each execution path still self-gates (taker on the scaled
+    # buffer, maker on the arm cushion). 0 = off (static bars, original behavior).
+    if settings.exec_buffer_deep_depth > 0:
+        from bot.execution.executor import scaled_hedge_buffer
+        fire_threshold = min_edge + min(settings.exec_hedge_buffer, 0.01)
+
+        def hybrid_take_bar(size):
+            return min_edge + scaled_hedge_buffer(
+                settings.exec_hedge_buffer, size, settings.exec_min_leg_depth,
+                settings.exec_buffer_deep_depth)
+    else:
+        hybrid_take_bar = min_edge + settings.exec_hedge_buffer
     engine = StreamingEngine(
         executor=executor, fee_models=fee_models, min_edge=fire_threshold, depth_fetch=depth_fetch,
         max_ws_quote_age=settings.stream_max_ws_quote_age,
         min_leg_price=settings.stream_min_leg_price, store=store,
         maker_mode=settings.exec_maker_mode,
         hybrid_take_depth=settings.exec_hybrid_take_depth,
-        hybrid_take_bar=min_edge + settings.exec_hedge_buffer,
+        hybrid_take_bar=hybrid_take_bar,
         reconcile_halt=settings.exec_reconcile_halt,
         edge_snapshot_top=settings.stream_edge_snapshot_top,
         edge_persist_secs=settings.stream_edge_persist_secs,

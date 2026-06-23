@@ -361,11 +361,13 @@ class StreamingEngine:
             # is takeable right now — cross both books and lock it immediately rather than
             # resting a maker that may never get crossed. Edges that are deep but thin
             # (below the taker bar) or shallow fall through to the maker. 0 = disabled.
+            take_bar = (self.hybrid_take_bar(size) if callable(self.hybrid_take_bar)
+                        else self.hybrid_take_bar)
             if (self.hybrid_take_depth > 0 and size >= self.hybrid_take_depth
-                    and edge >= self.hybrid_take_bar - 1e-9):
+                    and edge >= take_bar - 1e-9):
                 log.info("STREAM edge %.4f sz %g on %s -> hybrid TAKE "
                          "(depth >= %g, clears taker bar %.4f)",
-                         edge, size, p.event_key, self.hybrid_take_depth, self.hybrid_take_bar)
+                         edge, size, p.event_key, self.hybrid_take_depth, take_bar)
                 report = await self._execute_guarded(opp)
                 log.info("STREAM exec %s | %s", p.event_key, report)
                 status = getattr(report, "status", None)

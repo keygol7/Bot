@@ -850,6 +850,35 @@ def test_hedge_buffer_on_kalshi_first_buffers_the_poly_hedge():
     assert round(poly.calls[0][3] - 0.40, 4) == 0.03   # the Poly YES hedge got the buffer
 
 
+def test_scaled_hedge_buffer_interpolates_by_depth():
+    from bot.execution.executor import scaled_hedge_buffer
+    # Off (deep_depth=0) -> always the full buffer.
+    assert scaled_hedge_buffer(0.03, 99999, 10, 0) == 0.03
+    # Thin book (<= thin_depth) -> full buffer; deep book (>= deep_depth) -> one-tick floor.
+    assert scaled_hedge_buffer(0.03, 10, 10, 1000) == 0.03
+    assert scaled_hedge_buffer(0.03, 1000, 10, 1000) == 0.01
+    # Midway interpolates between full and floor.
+    mid = scaled_hedge_buffer(0.03, 505, 10, 1000)
+    assert 0.01 < mid < 0.03
+
+
+def test_deep_book_fires_thinner_edge_than_thin_book():
+    # With depth-scaling on, a 0.03 edge that a thin book SKIPS (full 0.03 buffer -> bar
+    # 0.04) is TAKEN on a deep book (buffer scales to 0.01 -> bar 0.02). floor = 0.01.
+    def run(depth):
+        yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+        no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.57)])
+        risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
+        ex = Executor({"kalshi": yes, "poly": no}, risk,
+                      fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+                      max_order_contracts=0, hedge_buffer=0.03, buffer_deep_depth=1000)
+        o = opp(max_contracts=depth, yes_price=0.40, no_price=0.57)   # edge 0.03
+        return asyncio.run(ex.execute(o))
+
+    assert run(2).status is ExecStatus.SKIPPED        # thin -> full 0.03 buffer -> bar 0.04
+    assert run(2000).status is ExecStatus.SUCCESS     # deep -> 0.01 buffer -> bar 0.02
+
+
 def test_order_error_result_classification():
     from types import SimpleNamespace
 
