@@ -1486,6 +1486,94 @@ def kalshi_history(settings: Settings, *, limit: int = 100, find: str | None = N
     return 0
 
 
+def poly_depth_report(settings: Settings, *, top: int = 40) -> int:
+    """Rank the bot's matched pairs by REAL Polymarket top-of-book depth and show the live
+    cross-venue edge at each, so the tradeable overlap is visible from live data: where is
+    Polymarket actually deep, and does Kalshi disagree there? Read-only.
+
+    Uses the cached confirmed pairs (populated by the running bot's discovery) and fetches
+    both legs' real /book per pair. Prints the deepest-Polymarket markets, then separately
+    any pair with a POSITIVE net edge (the actual opportunities)."""
+    store = Store(settings.db_path)
+    venues = _build_venues(settings)
+    venue_by_name = {v.name: v for v in venues}
+    fee_models = {v.name: getattr(v, "fee_model", ZeroFeeModel()) for v in venues}
+
+    cached = store.confirmed_pairs(
+        use_fingerprint=settings.match_use_fingerprint,
+        fingerprint_metrics=settings.match_fingerprint_metrics or None,
+        sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
+    )
+
+    def _best_edge(qa, qb):
+        best = None
+        for yq, nq in ((qa, qb), (qb, qa)):
+            if yq is None or nq is None or yq.yes_ask is None or nq.no_ask is None:
+                continue
+            fee = (fee_models.get(yq.venue, ZeroFeeModel()).fee(yq.yes_ask, 1)
+                   + fee_models.get(nq.venue, ZeroFeeModel()).fee(nq.no_ask, 1))
+            edge = 1.0 - (yq.yes_ask + nq.no_ask) - fee
+            size = min(yq.yes_ask_size or 0.0, nq.no_ask_size or 0.0)
+            if best is None or edge > best[0]:
+                best = (edge, size, yq, nq)
+        return best
+
+    sem = asyncio.Semaphore(16)
+
+    async def _row(va, ma, vb, mb, ek):
+        async def fetch(vn, mid):
+            v = venue_by_name.get(vn)
+            if v is None:
+                return None
+            async with sem:
+                try:
+                    return await v.fetch_quote(RawMarket(market_id=mid, title="", raw={}))
+                except Exception:
+                    return None
+        qa, qb = await asyncio.gather(fetch(va, ma), fetch(vb, mb))
+        by_venue = {va: qa, vb: qb}
+
+        def depth(q):
+            return max(getattr(q, "yes_ask_size", 0.0) or 0.0,
+                       getattr(q, "no_ask_size", 0.0) or 0.0) if q else 0.0
+        poly_d = max((depth(q) for v, q in by_venue.items() if "poly" in v.lower()), default=0.0)
+        kal_d = max((depth(q) for v, q in by_venue.items() if "poly" not in v.lower()), default=0.0)
+        be = _best_edge(qa, qb)
+        edge = be[0] if be else float("nan")
+        esize = be[1] if be else 0.0
+        return {"ek": ek or f"{va}:{ma}|{vb}:{mb}", "poly": poly_d, "kal": kal_d,
+                "edge": edge, "size": esize}
+
+    async def _run():
+        try:
+            rows = await asyncio.gather(*(_row(*c) for c in cached))
+        finally:
+            for v in venues:
+                aclose = getattr(v, "aclose", None)
+                if aclose:
+                    await aclose()
+        rows = [r for r in rows if r is not None]
+        rows.sort(key=lambda r: r["poly"], reverse=True)
+        print(f"\n== {len(rows)} matched pairs, deepest Polymarket book first (top {top}) ==")
+        print(f"  {'POLY_DEPTH':>10} {'KAL_DEPTH':>10} {'EDGE':>7} {'SIZE':>7}  EVENT")
+        for r in rows[:top]:
+            print(f"  {r['poly']:>10.1f} {r['kal']:>10.1f} {r['edge']:>+7.3f} "
+                  f"{r['size']:>7.1f}  {r['ek']}")
+        # The actual opportunities: a positive net edge with hedgeable size on BOTH sides.
+        opps = sorted((r for r in rows if r["edge"] > 0 and r["size"] >= 1),
+                      key=lambda r: r["edge"], reverse=True)
+        print(f"\n== {len(opps)} pair(s) with POSITIVE net edge AND >=1 hedgeable contract ==")
+        for r in opps[:top]:
+            print(f"  edge {r['edge']:>+.3f}  size {r['size']:>6.1f}  "
+                  f"poly_depth {r['poly']:>7.1f}  {r['ek']}")
+        if not opps:
+            print("  (none — the deep-Polymarket markets are efficiently priced; the edges "
+                  "are on markets Polymarket can't hedge)")
+
+    asyncio.run(_run())
+    return 0
+
+
 def check_flat(settings: Settings) -> int:
     """Print each venue's balance, open positions, and resting orders, with a FLAT / NOT
     FLAT verdict per venue. 'Flat' = no held positions and no resting orders. Read-only."""
@@ -1694,6 +1782,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--check-flat", action="store_true",
                    help="print each venue's balance, open positions, and resting orders "
                         "with a FLAT / NOT FLAT verdict (read-only)")
+    p.add_argument("--poly-depth-report", action="store_true",
+                   help="rank matched pairs by real Polymarket book depth + show the live "
+                        "edge at each, to find the tradeable overlap (read-only)")
     p.add_argument("--compare-filters", action="store_true",
                    help="SHADOW: compare the structured fingerprint matcher vs the live "
                         "filter over cached verdicts (adds/removes); trades nothing")
@@ -1790,6 +1881,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.check_flat:
         raise SystemExit(check_flat(load_settings()))
+
+    if args.poly_depth_report:
+        raise SystemExit(poly_depth_report(
+            load_settings(), top=args.limit if args.limit != 50 else 40))
 
     if args.find:
         raise SystemExit(find_markets(load_settings(), args.find))
