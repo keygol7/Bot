@@ -332,17 +332,88 @@ def test_execute_maker_unfilled_is_no_trade():
 
 
 def test_execute_maker_hedge_fails_unwinds_maker():
-    # Maker fills; the Poly hedge fails -> unwind the (rare) filled maker leg.
+    # Maker fills; the Poly hedge KILLs (no fill) -> re-cross once (hedge_retries=1), still
+    # nothing -> unwind the (rare) filled maker leg. A clean KILLED is flat, so re-crossing
+    # can't double up; exhausting the retries falls through to the unwind.
     kalshi = FakeVenue("kalshi", [
         res("kalshi", Side.NO, OrderStatus.RESTING, 0, None),
         res("kalshi", Side.NO, OrderStatus.FILLED, 5, 0.54, action="sell"),
     ])
-    poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.KILLED, 0, None)])
+    poly = FakeVenue("poly", [
+        res("poly", Side.YES, OrderStatus.KILLED, 0, None),     # initial hedge: no fill
+        res("poly", Side.YES, OrderStatus.KILLED, 0, None),     # re-cross: still no fill
+    ])
     ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.40, no_price=0.55)))
     assert report.status is ExecStatus.UNWOUND and not risk.is_killed
     assert kalshi.calls[1][2] == "sell"            # the maker NO leg was sold back
+    assert len(poly.calls) == 2                    # hedge was re-crossed before unwinding
+
+
+def test_execute_maker_partial_hedge_recrosses_then_settles():
+    # Maker (kalshi NO) fills 5; the Poly YES hedge only PARTIAL-fills 3, so the remaining 2
+    # is re-crossed at the live ask and fills -> fully hedged -> locked arb, no naked leg.
+    from bot.models import MarketQuote
+    quote = MarketQuote(venue="poly", market_id="P1", title="", yes_ask=0.40, no_ask=0.40)
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly = QuotingVenue("poly", [
+        res("poly", Side.YES, OrderStatus.PARTIAL, 3, 0.40),   # initial hedge: 3 of 5
+        res("poly", Side.YES, OrderStatus.FILLED, 2, 0.40),    # re-cross: the last 2
+    ], quote)
+    ex, risk = make_maker_exec(
+        [kalshi, poly],
+        FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55), "poly": (OrderStatus.PARTIAL, 3, 0.40)}))
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.SUCCESS and not risk.is_killed
+    assert round(report.realized_pnl, 4) == round(5 * (1 - 0.40 - 0.55), 4)   # full 5 locked
+    assert len(poly.calls) == 2                    # hedged in two crossings
+    assert poly.calls[1][4] == 2                   # re-cross was for the unhedged remainder
+
+
+def test_execute_maker_partial_hedge_settles_matched_unwinds_excess():
+    # Maker fills 5; Poly hedges 3 then can't fill the rest (re-cross KILLs). End flat-or-
+    # locked: settle the matched 3 as an arb and UNWIND the unhedged 2 of the maker leg.
+    from bot.models import MarketQuote
+    quote = MarketQuote(venue="kalshi", market_id="K1", title="", yes_ask=0.46, no_ask=0.46)
+    kalshi = QuotingVenue("kalshi", [
+        res("kalshi", Side.NO, OrderStatus.RESTING, 0, None),
+        res("kalshi", Side.NO, OrderStatus.FILLED, 2, 0.53, action="sell"),   # unwind the excess 2
+    ], quote)
+    poly = QuotingVenue("poly", [
+        res("poly", Side.YES, OrderStatus.PARTIAL, 3, 0.40),   # initial hedge: 3 of 5
+        res("poly", Side.YES, OrderStatus.KILLED, 0, None),    # re-cross: nothing more available
+    ], MarketQuote(venue="poly", market_id="P1", title="", yes_ask=0.40, no_ask=0.40))
+    ex, risk = make_maker_exec(
+        [kalshi, poly],
+        FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55), "poly": (OrderStatus.PARTIAL, 3, 0.40)}))
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.40, no_price=0.55)))
+    # Locked 3 (+0.15) and unwound the naked 2 (~-0.04) -> never halts, never naked.
+    assert report.status is ExecStatus.UNWOUND and not risk.is_killed
+    assert kalshi.calls[-1][2] == "sell" and kalshi.calls[-1][4] == 2   # sold back the excess 2
+    matched = 3 * (1 - 0.40 - 0.55)
+    unwind = 2 * (0.53 - 0.55)
+    assert round(report.realized_pnl, 4) == round(matched + unwind, 4)
+
+
+def test_execute_maker_gtc_cancels_unfilled_on_timeout():
+    # A GOOD_TILL_CANCEL maker does not self-expire: if it never fills, the executor must
+    # explicitly CANCEL it at the timeout (else it would rest unhedged). maker_poll=0 path.
+    kalshi = CancelVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly = FakeVenue("poly", [])                    # hedge must never be placed
+    risk = RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({v.name: v for v in [kalshi, poly]}, risk,
+                  fee_models={v.name: ZeroFeeModel() for v in [kalshi, poly]},
+                  max_order_contracts=0,
+                  fill_confirmer=SlowConfirmer((OrderStatus.KILLED, 0, None), delay=0.1),
+                  maker_timeout=0.02, maker_arm_cushion=0.0, maker_poll=0.0)
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.SKIPPED and "unfilled" in report.reason
+    assert kalshi.cancelled == ["o"]                # GTC maker explicitly cancelled at timeout
+    assert poly.calls == []                          # never hedged
 
 
 def test_execute_maker_hedge_error_flat_unwinds():

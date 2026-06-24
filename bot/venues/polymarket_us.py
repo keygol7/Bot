@@ -795,22 +795,27 @@ class PolymarketUSVenue:
         Taker orders use ``synchronousExecution`` so the response carries the terminal
         executions (with a submit-then-poll fallback). A ``post_only`` order is a resting
         MAKER: it's sent async with ``participateDontInitiate`` (rejected if it would
-        immediately match), and ``expiration_ts`` self-cancels it via a good-till-date —
-        so an unfilled maker cleans itself up. A resting maker comes back ``RESTING``.
+        immediately match) and a GOOD_TILL_CANCEL tif — the executor cancels it on
+        timeout/drift. We deliberately do NOT use GOOD_TILL_DATE: Polymarket has GTD
+        disabled venue-side (POST /v1/orders -> HTTP 400 "GTD orders are temporarily
+        disabled"), and an explicit cancel doesn't depend on a venue feature. A resting
+        maker comes back ``RESTING``. ``expiration_ts`` is accepted for signature
+        compatibility (the executor passes its maker timeout) but no longer drives a
+        server-side expiry — cleanup is the executor's cancel.
         """
         if not getattr(self.cfg, "is_trading_configured", False):
             raise OrderNotPermitted("Polymarket US trading credentials not configured")
         body = self._order_body(market_id, side, action, price, contracts, tif)
         if post_only:
             # Maker-only: rest on the book, never cross (the docs reject it if it would
-            # immediately match). Self-expire via good-till-date so an unfilled maker
-            # cleans itself up. NO synchronousExecution — it rests; we confirm via the WS.
+            # immediately match). NO synchronousExecution — it rests; we confirm via the WS.
+            # Time-in-force is GOOD_TILL_CANCEL; the executor cancels it on timeout/drift.
+            # We do NOT use GOOD_TILL_DATE: Polymarket has it disabled venue-side (POST
+            # /v1/orders -> HTTP 400 "GTD orders are temporarily disabled"), so a server-side
+            # self-expiry isn't available — an explicit cancel is the cleanup, and it doesn't
+            # depend on a venue feature that can come and go.
             body["participateDontInitiate"] = True
-            if expiration_ts is not None:
-                from datetime import datetime, timezone
-                body["tif"] = "TIME_IN_FORCE_GOOD_TILL_DATE"
-                body["goodTillTime"] = datetime.fromtimestamp(
-                    expiration_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            body["tif"] = "TIME_IN_FORCE_GOOD_TILL_CANCEL"
         else:
             # Per the API schema maxBlockTime is an int64 (seconds) encoded as a string — a
             # bare "5", NOT a duration like "5s". Keep it under the 10s HTTP client timeout.

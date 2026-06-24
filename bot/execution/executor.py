@@ -525,6 +525,18 @@ class Executor:
             [leg1, leg2],
         )
 
+    async def _cancel_maker(self, venue, order_id) -> None:
+        """Best-effort cancel of a resting maker. A GOOD_TILL_CANCEL maker does not
+        self-expire, so the executor must cancel an unfilled one or it would rest unhedged.
+        A cancel that races a fill is harmless — the fill confirmation stays authoritative."""
+        cancel = getattr(venue, "cancel_order", None)
+        if cancel is None or not order_id:
+            return
+        try:
+            await cancel(order_id)
+        except Exception as exc:
+            log.warning("maker cancel failed for %s: %s", order_id, exc)
+
     async def _taker_ask(self, taker, taker_venue) -> float | None:
         """Current ask for the taker (hedge) leg from its live book, or None on failure."""
         try:
@@ -544,6 +556,7 @@ class Executor:
         confirm = asyncio.ensure_future(
             self.fill_confirmer.confirm(m.venue, m.order_id, size, self.maker_timeout + 1.5))
         deadline = time.time() + self.maker_timeout
+        cancelled = False
         try:
             while not confirm.done() and time.time() < deadline:
                 done, _ = await asyncio.wait({confirm}, timeout=self.maker_poll)
@@ -558,14 +571,17 @@ class Executor:
                     log.info(
                         "maker adverse drift on %s: taker ask %.3f -> hedge edge %.3f < floor "
                         "%.3f, cancelling maker before fill", maker[1], ask, edge_now, floor)
-                    try:
-                        await maker_venue.cancel_order(m.order_id)
-                    except Exception as exc:
-                        log.warning("maker cancel failed for %s: %s", m.order_id, exc)
+                    await self._cancel_maker(maker_venue, m.order_id)
+                    cancelled = True
                     break
         except asyncio.CancelledError:
             confirm.cancel()
             raise
+        # A GOOD_TILL_CANCEL maker does not self-expire: if it neither filled nor was already
+        # cancelled on drift, cancel it now — BEFORE awaiting the authoritative confirm, so a
+        # fill racing the cancel is still caught — otherwise it would rest on the book unhedged.
+        if not confirm.done() and not cancelled:
+            await self._cancel_maker(maker_venue, m.order_id)
         # Whether we cancelled or not, the confirmation is authoritative: a cancel that
         # raced a fill still reports the real filled amount (which we then hedge).
         _, filled, avg = await confirm
@@ -575,8 +591,10 @@ class Executor:
         """Capture an edge by RESTING the fee-heavy leg (``first_venue``, e.g. Kalshi)
         as a maker — no slippage, lower fee — then TAKING the deep leg (Polymarket) the
         instant the maker fills. Lets THIN edges be captured (we capture the spread
-        instead of paying it). The maker self-expires if unfilled, so an uncrossed quote
-        is a clean no-trade. The naked window is just the maker-fill -> taker round trip.
+        instead of paying it). An unfilled maker is cancelled at the timeout, so an
+        uncrossed quote is a clean no-trade. The naked window is just the maker-fill ->
+        taker round trip; a hedge that can't fully fill re-crosses, then unwinds the
+        unhedged remainder — it never leaves a naked leg resting.
         """
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
@@ -669,10 +687,18 @@ class Executor:
                 filled, avg = await self._rest_with_drift_guard(
                     m, maker, taker, maker_venue, taker_venue, maker_px, size, floor)
             else:
-                # Confirm timeout slightly past the maker's expiry, so by the time it
-                # returns the order is terminal and ``filled`` is final.
-                _, filled, avg = await self.fill_confirmer.confirm(
-                    m.venue, m.order_id, size, self.maker_timeout + 1.5)
+                # No drift polling: wait up to the maker timeout for a fill, then CANCEL
+                # (a GOOD_TILL_CANCEL maker won't self-expire) BEFORE the authoritative
+                # confirm — so an unfilled maker can't rest unhedged, and a fill racing the
+                # cancel is still caught by the confirm (which runs slightly past the timeout).
+                confirm = asyncio.ensure_future(
+                    self.fill_confirmer.confirm(m.venue, m.order_id, size, self.maker_timeout + 1.5))
+                try:
+                    await asyncio.wait({confirm}, timeout=self.maker_timeout)
+                finally:
+                    if not confirm.done():
+                        await self._cancel_maker(maker_venue, m.order_id)
+                _, filled, avg = await confirm
         if filled <= 1e-9:
             return ExecutionReport(
                 ExecStatus.SKIPPED, "maker unfilled — expired/cancelled, no trade", [m])
@@ -710,54 +736,72 @@ class Executor:
                 opp.event_key, maker[2].value, maker_cost, taker_px, maker_cost + taker_px)
         taker_limit = min(0.99, round(taker_px + self.hedge_buffer, 4))
         attempt = 0
+        hedged = 0.0                 # contracts of the hedge confirmed filled so far
+        hedge_notional = 0.0         # sum(filled_i * price_i) -> blended hedge avg price
         while True:
+            need = round(filled - hedged, 6)
             hedge = await self._place(
-                taker_venue, taker[1], taker[2], "buy", taker_limit, filled, "immediate_or_cancel")
+                taker_venue, taker[1], taker[2], "buy", taker_limit, need, "immediate_or_cancel")
             log.info("maker-hedge %s", hedge)
-            if hedge.status is OrderStatus.FILLED and hedge.filled_fully:
-                return self._settle_success(opp, filled, [maker_leg, hedge])
-            if hedge.status in (OrderStatus.KILLED, OrderStatus.REJECTED) and hedge.filled <= 1e-9:
-                log.warning("maker hedge %s — %s", hedge.status.value, _reject_reason(hedge))
-                return await self._unwind(
-                    opp, maker_leg, hedge,
-                    reason=f"maker hedge {hedge.status.value} ({_reject_reason(hedge)})")
-            if hedge.status is not OrderStatus.ERROR:
-                return self._halt(
-                    f"maker hedge ambiguous ({hedge.status.value}: {_reject_reason(hedge)})",
-                    [maker_leg, hedge])
-            # ----- hedge ERROR (ambiguous) -----
-            # Ambiguous hedge (e.g. a Polymarket 500/timeout). We already HOLD the maker
-            # fill, so holding it naked into settlement is the dangerous state — that is
-            # exactly how a hedge error became a total loss. Reconcile the hedge venue: if
-            # the hedge fully landed, settle; if it's flat, UNWIND the maker fill back to
-            # flat (cap the loss at the round-trip spread, not the whole position); only a
-            # partial/unreadable hedge halts for manual reconciliation.
-            qty = await self._hedge_qty_after_error(taker_venue, taker[1])
-            if qty is not None and qty >= filled - 1e-9:
-                log.warning("maker hedge ERROR but %s holds %g — hedge landed, settling (%s)",
-                            taker[1], qty, _reject_reason(hedge))
-                hedge = replace(
-                    hedge, status=OrderStatus.FILLED, filled=filled,
-                    avg_price=hedge.avg_price if hedge.avg_price is not None else taker_limit)
-                return self._settle_success(opp, filled, [maker_leg, hedge])
-            if qty is not None and qty <= 1e-9:
-                # Confirmed flat: nothing landed, so a transient error doesn't mean no
-                # liquidity — safe to RE-PLACE the hedge (the reconcile rules out a
-                # double-up). Retry a bounded number of times, then unwind.
-                if attempt < self.hedge_retries:
-                    attempt += 1
-                    log.warning("maker hedge ERROR but %s flat — retrying hedge (%d/%d) (%s)",
-                                taker[1], attempt, self.hedge_retries, _reject_reason(hedge))
-                    await asyncio.sleep(0.25)
-                    continue
-                log.warning("maker hedge ERROR but %s flat — unwinding the naked maker fill (%s)",
-                            taker[1], _reject_reason(hedge))
-                return await self._unwind(
-                    opp, maker_leg, hedge,
-                    reason=f"maker hedge ERROR, hedge flat ({_reject_reason(hedge)})")
-            return self._halt(
-                f"maker hedge ambiguous (ERROR: {_reject_reason(hedge)}; "
-                f"hedge qty {qty}) — manual reconcile", [maker_leg, hedge])
+
+            if hedge.status is OrderStatus.ERROR:
+                # ----- hedge ERROR (ambiguous: e.g. a Polymarket 500/timeout) -----
+                # We already HOLD the maker fill, so holding it naked into settlement is the
+                # dangerous state. Reconcile the hedge venue for the TRUE open hedge quantity
+                # (rules out a double-up on retry) and fold it into ``hedged``; only a venue
+                # we can't read at all halts for manual reconciliation.
+                qty = await self._hedge_qty_after_error(taker_venue, taker[1])
+                if qty is None:
+                    return self._halt(
+                        f"maker hedge ambiguous (ERROR: {_reject_reason(hedge)}; "
+                        f"hedge qty unreadable) — manual reconcile", [maker_leg, hedge])
+                if qty > hedged:     # newly-landed contracts, priced at the limit we sent
+                    hedge_notional += (qty - hedged) * (
+                        hedge.avg_price if hedge.avg_price is not None else taker_limit)
+                hedged = qty
+                log.warning("maker hedge ERROR; reconciled %s open=%g of %g (%s)",
+                            taker[1], hedged, filled, _reject_reason(hedge))
+            elif hedge.left_a_position:
+                # FILLED (full or partial) — a KNOWN fill amount we can trust.
+                hedged += hedge.filled
+                hedge_notional += hedge.filled * (
+                    hedge.avg_price if hedge.avg_price is not None else taker_limit)
+
+            # ----- shared decision: fully hedged -> settle; else re-cross or unwind -----
+            if hedged >= filled - 1e-9:
+                combined = replace(
+                    hedge, side=taker[2], action="buy", requested=filled, filled=hedged,
+                    status=OrderStatus.FILLED,
+                    avg_price=(hedge_notional / hedged) if hedged > 1e-9 else taker_limit)
+                return self._settle_success(opp, filled, [maker_leg, combined])
+
+            if attempt < self.hedge_retries:
+                # Not fully hedged, but the unfilled remainder is reconciled flat (no
+                # double-up risk): RE-CROSS it at a fresh, current ask instead of giving up.
+                # Most KILLED/PARTIAL hedges are transient thinning at our limit — a re-cross
+                # usually locks the arb rather than eating the unwind spread.
+                attempt += 1
+                log.warning(
+                    "maker hedge incomplete (%g/%g) — re-crossing remainder (%d/%d) (%s: %s)",
+                    hedged, filled, attempt, self.hedge_retries,
+                    hedge.status.value, _reject_reason(hedge))
+                await asyncio.sleep(0.25)
+                try:
+                    fresh = await taker_venue.fetch_quote(
+                        RawMarket(market_id=taker[1], title="", raw={}))
+                    live = fresh.yes_ask if taker[2] is Side.YES else fresh.no_ask
+                    if live is not None:
+                        taker_limit = min(0.99, round(live + self._hedge_buffer_for(need), 4))
+                except Exception as exc:
+                    log.warning("hedge re-cross book refetch failed for %s: %s", taker[1], exc)
+                continue
+
+            # ----- retries exhausted: settle what's hedged, UNWIND the unhedged remainder -----
+            # Ending flat-or-hedged always beats halting with a naked leg: the matched
+            # ``hedged`` portion is a locked arb; the maker's unhedged excess is sold back.
+            return await self._settle_partial_hedge(
+                opp, maker_leg, filled, hedged, hedge_notional, hedge,
+                reason=f"maker hedge incomplete ({hedged:g}/{filled:g}: {_reject_reason(hedge)})")
 
     # ---- outcomes ----
     def _settle_success(self, opp, size, legs) -> ExecutionReport:
@@ -782,6 +826,36 @@ class Executor:
         self._audit("execute_success", opp, pnl=pnl)
         log.info("ARB LOCKED %s | pnl=%+.2f", opp.event_key, pnl)
         return ExecutionReport(ExecStatus.SUCCESS, "both legs filled", list(legs), pnl)
+
+    async def _settle_partial_hedge(
+        self, opp, maker_leg, maker_filled, hedged, hedge_notional, last_hedge, *, reason,
+    ) -> ExecutionReport:
+        """Couldn't fully hedge a maker fill after re-crossing. End flat-or-locked, never
+        naked: SETTLE the matched (``hedged``) portion as a locked arb, then UNWIND the
+        maker's unhedged excess (``maker_filled - hedged``). Returns UNWOUND with the
+        combined pnl; if the unwind itself can't flatten, that path halts (correct — we
+        genuinely can't get flat). The hedge leg has no excess: it's fully matched."""
+        excess = round(maker_filled - hedged, 6)
+        legs: list[OrderResult] = []
+        pnl = 0.0
+        if hedged > 1e-9:
+            matched_hedge = replace(
+                last_hedge, action="buy", requested=hedged, filled=hedged,
+                status=OrderStatus.FILLED, avg_price=hedge_notional / hedged)
+            matched_maker = replace(maker_leg, requested=hedged, filled=hedged)
+            settled = self._settle_success(opp, hedged, [matched_maker, matched_hedge])
+            legs += settled.legs
+            pnl += settled.realized_pnl
+        if excess > 1e-9:
+            excess_leg = replace(maker_leg, requested=excess, filled=excess)
+            unwound = await self._unwind(opp, excess_leg, None, reason=reason)
+            if unwound.status is ExecStatus.HALTED:
+                return unwound          # couldn't flatten the excess -> already halted
+            legs += unwound.legs
+            pnl += unwound.realized_pnl
+        log.warning("PARTIAL-HEDGE %s: locked %g + unwound %g | pnl=%+.2f (%s)",
+                    opp.event_key, hedged, excess, pnl, reason)
+        return ExecutionReport(ExecStatus.UNWOUND, reason, legs, pnl)
 
     async def _unwind(self, opp, leg1, leg2, *, reason: str = "leg2 failed") -> ExecutionReport:
         """Sell the filled first leg back (IOC, slippage-tolerant) to return to flat.

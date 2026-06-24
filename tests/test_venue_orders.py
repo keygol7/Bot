@@ -550,8 +550,9 @@ def test_polymarket_place_order_polls_get_when_nonterminal():
 
 
 def test_polymarket_post_only_maker_rests():
-    # A post_only order is a resting MAKER: participateDontInitiate=true, good-till-date
-    # self-expiry, NO synchronousExecution. An accepted-but-unfilled maker -> RESTING.
+    # A post_only order is a resting MAKER: participateDontInitiate=true, GOOD_TILL_CANCEL
+    # (the executor cancels it on timeout/drift — Polymarket has GTD disabled venue-side),
+    # NO synchronousExecution. An accepted-but-unfilled maker -> RESTING.
     cap = {}
 
     def handler(req):
@@ -565,8 +566,8 @@ def test_polymarket_post_only_maker_rests():
     r = asyncio.run(v.place_order("slug", Side.YES, "buy", 0.62, 5,
                                   tif="gtc", post_only=True, expiration_ts=1782300000))
     assert cap["body"]["participateDontInitiate"] is True
-    assert cap["body"]["tif"] == "TIME_IN_FORCE_GOOD_TILL_DATE"
-    assert "goodTillTime" in cap["body"]
+    assert cap["body"]["tif"] == "TIME_IN_FORCE_GOOD_TILL_CANCEL"
+    assert "goodTillTime" not in cap["body"]
     assert "synchronousExecution" not in cap["body"]   # a maker rests; not blocked
     assert r.status.value == "RESTING" and r.order_id == "mk1"
 
