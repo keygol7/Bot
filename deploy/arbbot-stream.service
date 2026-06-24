@@ -28,7 +28,7 @@ MemoryHigh=2G
 # holding a real naked position. The RISK_* caps in .env bound exposure.
 # --limit is a TOTAL cap across paginated Kalshi pages (1000/page). 5000 reaches
 # markets past the first page (e.g. UFC fights) so discovery can match them.
-ExecStart=/home/keyahn/Bot/.venv/bin/python -m bot.dryrun --stream --limit 5000 --interval 300
+ExecStart=/home/keyahn/Bot/.venv/bin/python -m bot.dryrun --stream --limit 5000 --interval 120
 # Restart only on crash (not clean exit). After ANY crash during live trading,
 # MANUALLY verify open positions before re-enabling — the bot does not reconcile
 # existing positions on startup, so an auto-restart could trade on top of them.
