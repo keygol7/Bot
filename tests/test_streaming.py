@@ -759,6 +759,23 @@ def test_reconcile_balanced_pair_is_clean():
     assert eng.reconcile_positions(snaps) == []
 
 
+def test_preview_no_fill_backs_off_pair():
+    # A "hedge preview ... would fill <1" skip should back the pair off briefly so it stops
+    # re-confirming an unfillable edge every cooldown (no legs were placed -> not a failure).
+    from bot.execution.executor import ExecStatus, ExecutionReport
+    eng = make_engine(FakeExec(), now=100.0)
+    p = next(iter(eng._pairs.values()))
+    eng._note_outcome(p.key, p, ExecutionReport(
+        ExecStatus.SKIPPED, "hedge preview: hedge would fill <1 contract"))
+    assert eng._backoff_until.get(p.key, 0) > 100.0       # backed off
+    # A benign maker-expired skip (no 'preview' reason) must NOT back off.
+    eng2 = make_engine(FakeExec(), now=100.0)
+    p2 = next(iter(eng2._pairs.values()))
+    eng2._note_outcome(p2.key, p2, ExecutionReport(
+        ExecStatus.SKIPPED, "maker unfilled — expired/cancelled, no trade"))
+    assert p2.key not in eng2._backoff_until
+
+
 def test_consume_counts_ws_quotes_for_health():
     # The WS-health heartbeat: _consume must count each tick per venue so the run
     # loop can report whether a venue's WebSocket is actually delivering data.
