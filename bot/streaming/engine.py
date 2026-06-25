@@ -143,6 +143,7 @@ class StreamingEngine:
         self._backoff_until: dict[tuple, float] = {}
         self._backoff_base = 60.0               # first penalty after a failed attempt
         self._backoff_cap = 1800.0              # max 30 min between retries
+        self._preview_backoff = 60.0            # pause a pair whose hedge can't fill (preview)
         # Latest known market state per (venue, market_id): from Polymarket's marketData
         # `state` (carried on the quote) and Kalshi's lifecycle channel. Used to skip
         # firing into a non-OPEN (halted/suspended/pre-open/settled) market.
@@ -422,6 +423,14 @@ class StreamingEngine:
         if status is ExecStatus.SUCCESS:
             self._fail_counts.pop(key, None)
             self._backoff_until.pop(key, None)
+            return
+        reason = getattr(report, "reason", "") or ""
+        if status is ExecStatus.SKIPPED and "preview" in reason:
+            # The hedge can't fill at the edge price right now (thin/phantom top-of-book —
+            # a real, fillable edge would have passed the preview). Don't re-confirm it every
+            # cooldown; back the pair off briefly so we stop hammering REST on an unfillable
+            # edge. It re-enters naturally once the book actually supports the hedge.
+            self._backoff_until[key] = self.clock() + self._preview_backoff
             return
         legs = getattr(report, "legs", None)
         if not legs:
