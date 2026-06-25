@@ -9,8 +9,8 @@ StartLimitBurst=5
 [Service]
 Type=simple
 # Edit User and paths if your username/clone location differ.
-User=keyahn
-WorkingDirectory=/home/keyahn/Bot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Bot
 # Log timestamps in local (Denver) time so they line up with the Kalshi/Polymarket apps.
 # Only affects the process's local-time DISPLAY (Python's %(asctime)s); all internal time
 # logic uses explicit UTC (datetime.now(timezone.utc)), so it is unaffected. Change the
@@ -28,7 +28,7 @@ MemoryHigh=2G
 # holding a real naked position. The RISK_* caps in .env bound exposure.
 # --limit is a TOTAL cap across paginated Kalshi pages (1000/page). 5000 reaches
 # markets past the first page (e.g. UFC fights) so discovery can match them.
-ExecStart=/home/keyahn/Bot/.venv/bin/python -m bot.dryrun --stream --limit 5000 --interval 120
+ExecStart=/home/ubuntu/Bot/.venv/bin/python -m bot.dryrun --stream --limit 5000 --interval 120
 # Restart only on crash (not clean exit). After ANY crash during live trading,
 # MANUALLY verify open positions before re-enabling — the bot does not reconcile
 # existing positions on startup, so an auto-restart could trade on top of them.

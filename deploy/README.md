@@ -15,7 +15,7 @@ Two service units are provided. Pick **one** based on what you want:
 ## Prerequisites
 - Repo cloned at `/home/<user>/Bot`, venv created, deps installed (`pip install -e ".[venues,dev]"`).
 - `.env` filled in (LLM URL, venue keys, `RISK_*` caps). `python -m bot.dryrun --check-llm` returns OK.
-- Edit `User=` and the two `/home/keyahn/Bot` paths in the unit file if your username/path differ.
+- The units ship configured for `User=ubuntu` and `/home/ubuntu/Bot`; edit `User=` and the two `/home/ubuntu/Bot` paths in the unit file if your username/path differ.
 
 ## Install (read-only monitor)
 ```bash
