@@ -528,14 +528,34 @@ class Executor:
     async def _cancel_maker(self, venue, order_id) -> None:
         """Best-effort cancel of a resting maker. A GOOD_TILL_CANCEL maker does not
         self-expire, so the executor must cancel an unfilled one or it would rest unhedged.
-        A cancel that races a fill is harmless — the fill confirmation stays authoritative."""
+        A cancel that races a fill is harmless — the fill confirmation stays authoritative.
+
+        A 404/400 on the cancel means the order is no longer cancellable (already filled,
+        expired, or cancelled) — which is exactly the state we wanted, so it's logged quietly
+        WITH the venue's response body for diagnosis. Anything else (5xx, network) stays a
+        warning. A genuinely stranded resting order that later fills is caught by the periodic
+        naked-exposure reconciliation (EXEC_RECONCILE_HALT), the cross-cycle backstop."""
         cancel = getattr(venue, "cancel_order", None)
         if cancel is None or not order_id:
             return
         try:
             await cancel(order_id)
+            return
         except Exception as exc:
-            log.warning("maker cancel failed for %s: %s", order_id, exc)
+            resp = getattr(exc, "response", None)
+            code = getattr(resp, "status_code", None)
+            body = ""
+            if resp is not None:
+                try:
+                    body = resp.text[:200]
+                except Exception:
+                    body = ""
+            if code in (400, 404):
+                log.info("maker %s not cancellable (already filled/expired/cancelled): "
+                         "HTTP %s %s", order_id, code, body)
+            else:
+                log.warning("maker cancel failed for %s: HTTP %s %s (%s)",
+                            order_id, code, body, exc)
 
     async def _taker_ask(self, taker, taker_venue) -> float | None:
         """Current ask for the taker (hedge) leg from its live book, or None on failure."""
@@ -648,6 +668,19 @@ class Executor:
         taker_venue = self.venues.get(taker[0])
         if maker_venue is None or taker_venue is None:
             return ExecutionReport(ExecStatus.SKIPPED, "venue not available")
+
+        # Don't arm a maker we can't hedge. The quoted hedge depth can be PHANTOM — the book
+        # shows size but a real IOC fills nothing (the post-fill hedge then KILLs at the cap
+        # and forces an unwind). Preview the taker (hedge) leg and SIZE DOWN to what would
+        # actually fill; skip entirely if it can't fill at all. (The taker path does the same
+        # before committing leg 1.) Best-effort: a venue without preview returns inf.
+        fillable = await self._hedge_fillable(taker_venue, taker, size)
+        if fillable < 1:
+            return ExecutionReport(
+                ExecStatus.SKIPPED,
+                f"hedge not fillable (preview {fillable:g} < 1) — would arm an unhedgeable maker")
+        if fillable < size:
+            size = int(fillable)
 
         notional = size * (opp.yes_price + opp.no_price)
         decision = self.risk.check(f"{opp.buy_yes_venue}:{opp.buy_yes_market}", notional)

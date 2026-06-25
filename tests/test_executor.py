@@ -416,6 +416,66 @@ def test_execute_maker_gtc_cancels_unfilled_on_timeout():
     assert poly.calls == []                          # never hedged
 
 
+def test_execute_maker_skips_when_hedge_preview_fills_nothing():
+    # The hedge book is PHANTOM: quoted depth but a preview shows it would fill nothing.
+    # Don't arm a maker we can't hedge (else the post-fill hedge KILLs and forces an unwind).
+    kalshi = FakeVenue("kalshi", [])                # maker must never be placed
+    poly = PreviewVenue("poly", [], preview_filled=0)
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({}))
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.SKIPPED and "not fillable" in report.reason
+    assert kalshi.calls == []                        # never armed the maker
+
+
+def test_execute_maker_sizes_down_to_hedge_fillable():
+    # The hedge would only fill 3 of 5 -> arm the maker for 3, not 5 (so the whole fill
+    # hedges) instead of arming 5 and unwinding the unhedgeable 2.
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly = PreviewVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 3, 0.40)], preview_filled=3)
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 3, 0.55)}))
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.SUCCESS
+    assert kalshi.calls[0][4] == 3                   # maker armed for the fillable 3, not 5
+    assert round(report.realized_pnl, 4) == round(3 * (1 - 0.40 - 0.55), 4)
+
+
+def test_maker_cancel_http_4xx_is_handled_gracefully():
+    # A 400/404 on the GTC cancel means the order is already not cancellable (filled/expired)
+    # -> swallow it (log with body), never crash the loop. The maker still resolves as a
+    # clean no-trade; a genuinely stranded order is caught by the periodic reconciler.
+    class _Resp:
+        status_code = 400
+        text = '{"message":"order not in a cancellable state"}'
+
+    class _Err(Exception):
+        response = _Resp()
+
+    class Cancel400Venue(FakeVenue):
+        def __init__(self, name, responses):
+            super().__init__(name, responses)
+            self.cancel_attempts = 0
+
+        async def cancel_order(self, order_id):
+            self.cancel_attempts += 1
+            raise _Err()
+
+    kalshi = Cancel400Venue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly = FakeVenue("poly", [])
+    risk = RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({v.name: v for v in [kalshi, poly]}, risk,
+                  fee_models={v.name: ZeroFeeModel() for v in [kalshi, poly]},
+                  max_order_contracts=0,
+                  fill_confirmer=SlowConfirmer((OrderStatus.KILLED, 0, None), delay=0.1),
+                  maker_timeout=0.02, maker_arm_cushion=0.0, maker_poll=0.0)
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.SKIPPED and "unfilled" in report.reason
+    assert kalshi.cancel_attempts == 1               # cancel attempted; 4xx swallowed, no crash
+    assert poly.calls == []
+
+
 def test_execute_maker_hedge_error_flat_unwinds():
     # Maker fills; the Poly hedge ERRORS (500/timeout) and reconciles to FLAT. After the
     # retries are exhausted it UNWINDS the naked maker fill instead of halting and holding
