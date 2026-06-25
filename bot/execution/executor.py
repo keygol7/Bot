@@ -948,10 +948,28 @@ class Executor:
 
     def _halt(self, reason: str, legs: list[OrderResult]) -> ExecutionReport:
         self.risk.trip_kill_switch(f"executor halt: {reason}")
+        # Record what we were HOLDING so a halt isn't invisible in the books. A halt is an
+        # ambiguous/stuck state, so the SETTLED pnl is unknown — but the fills are factual and
+        # the CASH that moved is real. Record each filled leg + a PROVISIONAL pnl row (the net
+        # cash outflow, conservatively treating held legs as not-yet-recovered). Without this,
+        # a halt's real fills never hit the db and the trade log silently understates losses;
+        # the operator reconciles the provisional figure against venue settlement.
+        cash = 0.0
+        for leg in legs or []:
+            if leg is None or leg.filled <= 1e-9:
+                continue
+            price = leg.avg_price if leg.avg_price is not None else 0.0
+            is_sell = getattr(leg, "action", "buy") == "sell"
+            side = f"{leg.side.value}_SELL" if is_sell else leg.side.value
+            cash += (price * leg.filled) if is_sell else -(price * leg.filled)
+            if self.store is not None:
+                self.store.record_fill(leg.venue, leg.market_id, side, price, leg.filled)
         if self.store is not None:
-            self.store.audit("execute_halt", {"reason": reason, "legs": [str(leg) for leg in legs]})
-        log.critical("HALT: %s", reason)
-        return ExecutionReport(ExecStatus.HALTED, reason, legs)
+            self.store.record_pnl(cash, note=f"HALT provisional, unreconciled ({reason})")
+            self.store.audit("execute_halt", {"reason": reason, "cash": round(cash, 4),
+                                              "legs": [str(leg) for leg in legs]})
+        log.critical("HALT: %s | provisional cash %+.2f recorded for reconciliation", reason, cash)
+        return ExecutionReport(ExecStatus.HALTED, reason, legs, cash)
 
     def _audit(self, kind: str, opp: ArbOpportunity, **extra) -> None:
         if self.store is not None:

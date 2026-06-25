@@ -649,6 +649,28 @@ def test_leg2_error_partial_hedge_halts():
     assert report.status is ExecStatus.HALTED and risk.is_killed
 
 
+def test_halt_records_held_legs_and_provisional_pnl():
+    # A halt must not vanish from the books: record the held (filled) legs to `fills` and a
+    # provisional HALT pnl row for the cash that moved, so a halt is reconcilable instead of
+    # silently understating losses in the trade log.
+    from bot.execution.account import VenuePosition
+    store = Store(":memory:")
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = SnapshotVenue("poly", [res("poly", Side.NO, OrderStatus.ERROR, 0, None)],
+                       [VenuePosition("P1", 1, 0)])
+    ex, risk = make_exec([yes, no], store=store)
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.HALTED and risk.is_killed
+    # the filled YES leg is now recorded (previously a halt recorded NOTHING but an audit row)
+    fills = store.conn.execute("SELECT venue, side, contracts FROM fills").fetchall()
+    assert any(f["venue"] == "kalshi" and f["side"] == "YES" and f["contracts"] == 2 for f in fills)
+    # a single provisional HALT pnl row captures the cash out for the held leg
+    pnl = store.conn.execute("SELECT amount, note FROM pnl").fetchall()
+    assert len(pnl) == 1 and "HALT provisional" in pnl[0]["note"]
+    assert round(pnl[0]["amount"], 4) == round(-2 * 0.40, 4)   # bought 2 YES @0.40 -> cash out
+    assert round(report.realized_pnl, 4) == round(-2 * 0.40, 4)
+
+
 def test_leg1_rejected_aborts_without_halting():
     # A definitive 4xx rejection (e.g. Kalshi 409) -> no position, abort the single
     # trade and KEEP trading. Must NOT trip the sticky kill switch.
