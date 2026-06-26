@@ -718,6 +718,20 @@ class KalshiVenue:
         resp.raise_for_status()
         return resp.json()
 
+    async def order_filled_qty(self, order_id: str, requested: float, side) -> float | None:
+        """Authoritative filled contracts for one order from GET /portfolio/orders/{id}
+        (``fill_count``), or None if it couldn't be read. Lets the executor reconcile a
+        maker's true fill instead of trusting a private-stream count that under-reported."""
+        try:
+            data = await self.order_detail(order_id)
+        except Exception as exc:
+            log.warning("kalshi order-fill read failed for %s: %s", order_id, exc)
+            return None
+        order = data.get("order") if isinstance(data, dict) else None
+        order = order if isinstance(order, dict) else (data if isinstance(data, dict) else {})
+        fc = order.get("fill_count")
+        return float(fc) if fc not in (None, "") else None
+
     async def fills(self, *, limit: int = 200, ticker: str | None = None) -> list[dict]:
         """Recent fills (executed trades) from /portfolio/fills — the authoritative order
         history: each carries ticker, side, action, count, yes/no price, taker flag, and

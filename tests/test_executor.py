@@ -303,6 +303,57 @@ def test_execute_maker_hedge_reprices_off_live_book():
     assert poly.calls[0][3] == 0.50                # crossed the live ask, not the stale 0.40
 
 
+class OrderFillVenue(FakeVenue):
+    """FakeVenue that also answers order_filled_qty — the authoritative per-order fill the
+    executor reconciles against. fill_qty=None simulates an unreadable order (read failed)."""
+    def __init__(self, name, responses, fill_qty=None, hedge_depth=1e9):
+        super().__init__(name, responses, hedge_depth)
+        self._fill_qty = fill_qty
+
+    async def order_filled_qty(self, order_id, requested, side):
+        return self._fill_qty
+
+
+def test_maker_reconciles_underreported_confirmer_fill():
+    # The confirmer reports the maker as UNFILLED (0), but the venue order shows 17 actually
+    # filled (a Polymarket maker partial the private stream missed). The bot must trust the
+    # venue and HEDGE the true 17 — not walk away leaving them naked (the RECONCILE HALT bug).
+    kalshi = OrderFillVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)],
+                            fill_qty=17)
+    poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 17, 0.40)])
+    ex, risk = make_maker_exec([kalshi, poly],
+                               FakeConfirmer({"kalshi": (OrderStatus.KILLED, 0, None)}))
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=20,
+                                              yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.SUCCESS
+    assert poly.calls[0][2] == "buy" and poly.calls[0][4] == 17   # hedged the TRUE fill
+
+
+def test_maker_halts_when_confirmer_zero_and_venue_unreadable():
+    # Confirmer says 0 AND the venue order can't be read -> ambiguous. Fail closed (HALT),
+    # never guess 0 and leak a possibly-naked fill, never hedge a fill that may not exist.
+    kalshi = OrderFillVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)],
+                            fill_qty=None)
+    poly = FakeVenue("poly", [])
+    ex, risk = make_maker_exec([kalshi, poly],
+                               FakeConfirmer({"kalshi": (OrderStatus.KILLED, 0, None)}))
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=20)))
+    assert report.status is ExecStatus.HALTED and risk.is_killed
+    assert poly.calls == []                                       # never hedged a guessed fill
+
+
+def test_maker_venue_confirms_truly_unfilled_is_clean_skip():
+    # Venue authoritatively confirms 0 filled -> a clean no-trade skip, NOT a halt.
+    kalshi = OrderFillVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)],
+                            fill_qty=0.0)
+    poly = FakeVenue("poly", [])
+    ex, risk = make_maker_exec([kalshi, poly],
+                               FakeConfirmer({"kalshi": (OrderStatus.KILLED, 0, None)}))
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=20)))
+    assert report.status is ExecStatus.SKIPPED and not risk.is_killed
+    assert poly.calls == []
+
+
 class SlowConfirmer:
     """Confirmer that returns a fixed terminal result after a delay — lets the drift
     guard poll at least once before the maker resolves."""

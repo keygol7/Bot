@@ -814,6 +814,28 @@ class Executor:
                     if not confirm.done():
                         await self._cancel_maker(maker_venue, m.order_id)
                 _, filled, avg = await confirm
+        # AUTHORITATIVE maker fill: the private-fill confirmer can UNDER-report a venue maker
+        # partial — a Polymarket maker that filled 17/20 was booked as 0, leaving 17 naked
+        # contracts and tripping a RECONCILE HALT. Re-read the order's true filled qty from
+        # the venue and trust the larger value, so we never walk away from a real fill.
+        fn = getattr(maker_venue, "order_filled_qty", None)
+        if fn is not None and m.order_id:
+            try:
+                true_qty = await fn(m.order_id, size, maker[2])
+            except Exception as exc:
+                log.warning("maker true-fill read failed for %s: %s", m.order_id, exc)
+                true_qty = None
+            if true_qty is not None:
+                if true_qty > filled + 1e-9:
+                    log.warning("maker fill UNDER-REPORTED by confirmer (%g) — venue shows %g; "
+                                "hedging the true fill (would have leaked naked)", filled, true_qty)
+                filled = max(filled, true_qty)
+            elif filled <= 1e-9:
+                # Confirmer says unfilled AND the venue (which supports the read) couldn't be
+                # reached -> ambiguous. Fail closed: halt rather than guess 0 and leak naked.
+                return self._halt(
+                    "maker fill state unreadable after cancel (confirmer 0, venue read "
+                    "failed) — manual reconcile", [m])
         if filled <= 1e-9:
             return ExecutionReport(
                 ExecStatus.SKIPPED, "maker unfilled — expired/cancelled, no trade", [m])

@@ -987,6 +987,13 @@ class PolymarketUSVenue:
             order_id=oid or order_id, status=status, raw=data,
         )
 
+    async def order_filled_qty(self, order_id: str, requested: float, side: Side) -> float | None:
+        """Authoritative filled contracts for one order from GET /v1/order/{id}, or None if
+        it couldn't be read. The private-fill stream can MISS a maker partial; this reads the
+        order's true ``cumQuantity`` so the executor never walks away from a real fill."""
+        res = await self._get_order_result(order_id, requested, side)
+        return None if res is None else res.filled
+
     async def cancel_order(self, order_id: str) -> dict:
         if not getattr(self.cfg, "is_trading_configured", False):
             raise OrderNotPermitted("Polymarket US trading credentials not configured")
