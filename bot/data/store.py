@@ -135,6 +135,19 @@ CREATE TABLE IF NOT EXISTS match_blacklist (
     ts        REAL,
     PRIMARY KEY (venue_a, market_a, venue_b, market_b)
 );
+
+-- Empirical per-market fill reliability: did a FOK order actually FILL (real depth) or
+-- KILL/REJECT (phantom depth)? This is the live, learned replacement for the volume proxy —
+-- a market is probed small until it proves it fills, then scaled up; one that keeps failing
+-- its hedge is excluded. Persisted so the verdict survives restarts.
+CREATE TABLE IF NOT EXISTS market_reliability (
+    venue      TEXT NOT NULL,
+    market_id  TEXT NOT NULL,
+    fills      INTEGER NOT NULL DEFAULT 0,
+    fails      INTEGER NOT NULL DEFAULT 0,
+    ts         REAL,
+    PRIMARY KEY (venue, market_id)
+);
 """
 
 
@@ -290,6 +303,27 @@ class Store:
         if not bl:
             return pairs
         return [p for p in pairs if self._pair_key(p[0], p[1], p[2], p[3]) not in bl]
+
+    # ---- empirical per-market fill reliability (probe-then-scale) ----
+    def record_market_outcome(self, venue: str, market_id: str, ok: bool) -> None:
+        """Record one FOK outcome for a market: ok=filled (real depth) / not (phantom)."""
+        self.conn.execute(
+            """INSERT INTO market_reliability (venue, market_id, fills, fails, ts)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(venue, market_id) DO UPDATE SET
+                 fills=fills+?, fails=fails+?, ts=excluded.ts""",
+            (venue, market_id, 1 if ok else 0, 0 if ok else 1, time.time(),
+             1 if ok else 0, 0 if ok else 1),
+        )
+        self.conn.commit()
+
+    def market_reliability(self) -> dict:
+        """All markets' (fills, fails) keyed by (venue, market_id), for the sizing gate."""
+        return {
+            (r["venue"], r["market_id"]): (r["fills"], r["fails"])
+            for r in self.conn.execute(
+                "SELECT venue, market_id, fills, fails FROM market_reliability")
+        }
 
     def cache_verdict(
         self, va: str, ma: str, vb: str, mb: str, *,

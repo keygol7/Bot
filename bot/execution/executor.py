@@ -103,6 +103,10 @@ class Executor:
         fill_confirmer=None,
         confirm_timeout: float = 5.0,
         balance_buffer: float = 0.99,
+        min_venue_balance: float = 0.0,
+        probe_contracts: float = 0.0,
+        market_proven_fills: int = 3,
+        market_max_fails: int = 2,
         min_lock_edge: float | None = None,
         leg2_slippage_share: float = 0.6,
         min_leg_depth: float = 0.0,
@@ -147,6 +151,16 @@ class Executor:
         # Available cash per venue, seeded from the startup snapshot and decremented as
         # legs fill. Used to size each arb to the most the funded balances allow.
         self.balance_buffer = balance_buffer       # leave headroom for fees/slippage
+        self.min_venue_balance = min_venue_balance  # don't trade a leg whose venue is below this
+        # Empirical fill-reliability (probe-then-scale): a market is PROBED at probe_contracts
+        # until its FOK orders have FILLED market_proven_fills times (proving real depth), then
+        # scaled to full size; a market that KILL/REJECTs market_max_fails times without proving
+        # is excluded. The live, learned replacement for the volume proxy. 0 probe = disabled.
+        self.probe_contracts = probe_contracts
+        self.market_proven_fills = market_proven_fills
+        self.market_max_fails = market_max_fails
+        self._market_rel: dict[tuple, tuple] = (
+            self.store.market_reliability() if self.store is not None else {})
         self._balances: dict[str, float] = {}
         # Bounded-aggressive limit pricing: how much edge to preserve as locked profit
         # (defaults to the risk min_edge floor).
@@ -243,7 +257,27 @@ class Executor:
                         result.avg_price = avg
             except Exception as exc:  # confirmer failure -> keep REST result
                 log.warning("fill confirm failed for %s: %s", result.order_id, exc)
+        # Empirical fill-reliability: a FOK BUY that FILLED proves the market's depth is real;
+        # a KILL/REJECT/ERROR/partial proves it's phantom (the naked-leg source). Record per
+        # market (not on unwinds — sells, which we only do to recover) to drive probe sizing.
+        if action == "buy" and self.probe_contracts > 0:
+            self._record_market_reliability(
+                getattr(venue, "name", "?"), market_id,
+                result.status is OrderStatus.FILLED)
         return result
+
+    def _record_market_reliability(self, venue: str, market_id: str, ok: bool) -> None:
+        key = (venue, market_id)
+        fills, fails = self._market_rel.get(key, (0, 0))
+        self._market_rel[key] = (fills + (1 if ok else 0), fails + (0 if ok else 1))
+        if self.store is not None:
+            try:
+                self.store.record_market_outcome(venue, market_id, ok)
+            except Exception as exc:
+                log.warning("market reliability write failed for %s: %s", market_id, exc)
+        if not ok:
+            log.info("reliability: %s:%s FOK failed (%d fills/%d fails) — probe-gated until proven",
+                     venue, market_id, *self._market_rel[key])
 
     async def _position_after_error(self, venue, market_id):
         """After an ambiguous leg ERROR, ask the venue whether a position actually
@@ -330,10 +364,15 @@ class Executor:
         caps: dict[str, float] = {"depth": depth * self.depth_safety}
 
         yb, nb = self._balance(opp.buy_yes_venue), self._balance(opp.buy_no_venue)
+        # Min-venue-balance guard: a venue too drained to reliably fund/hedge a leg must NOT
+        # trade — else we fire the first (Polymarket) leg and the second (Kalshi) leg rejects
+        # for insufficient_balance, leaving a naked position (the Kalshi-at-$0.38 incident).
+        # Cap that leg to 0 -> size 0 -> clean skip. Self-healing: resumes when funds return.
+        floor = self.min_venue_balance
         if yb is not None and opp.yes_price > 0:
-            caps["cash_yes"] = (yb * self.balance_buffer) / opp.yes_price
+            caps["cash_yes"] = 0.0 if (floor > 0 and yb < floor) else (yb * self.balance_buffer) / opp.yes_price
         if nb is not None and opp.no_price > 0:
-            caps["cash_no"] = (nb * self.balance_buffer) / opp.no_price
+            caps["cash_no"] = 0.0 if (floor > 0 and nb < floor) else (nb * self.balance_buffer) / opp.no_price
 
         gross = opp.gross_cost
         if gross > 0:
@@ -344,7 +383,29 @@ class Executor:
         if self.max_order_contracts and self.max_order_contracts > 0:
             caps["order_cap"] = float(self.max_order_contracts)
 
+        # Empirical fill-reliability (the live replacement for the volume proxy): cap each
+        # leg by what its market's real FOK history has proven. Unproven markets are bounded
+        # to a tiny probe; markets that have repeatedly failed without ever filling are
+        # excluded. The min across both legs governs — a phantom on EITHER leg can leave a
+        # naked position. proven markets are unbounded here (other caps apply).
+        if self.probe_contracts > 0:
+            caps["reliability"] = min(
+                self._reliability_cap(opp.buy_yes_venue, opp.buy_yes_market),
+                self._reliability_cap(opp.buy_no_venue, opp.buy_no_market),
+            )
+
         return math.floor(max(0.0, min(caps.values()))), caps
+
+    def _reliability_cap(self, venue: str, market_id: str) -> float:
+        """Contract ceiling a market's empirical FOK history earns it: full once it has
+        proven real depth (>= market_proven_fills fills), excluded once it has failed
+        >= market_max_fails times without ever proving, else a tiny probe to find out."""
+        fills, fails = self._market_rel.get((venue, market_id), (0, 0))
+        if fills >= self.market_proven_fills:
+            return math.inf
+        if fails >= self.market_max_fails:
+            return 0.0
+        return float(self.probe_contracts)
 
     def _leg_limits(self, opp: ArbOpportunity, first_side, second_side) -> tuple[float, float]:
         """Limit prices for the (first, second) legs that may pay worse than the quoted

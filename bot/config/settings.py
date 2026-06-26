@@ -216,6 +216,17 @@ class Settings:
     # (thin hedges 500 -> naked maker). Thin markets stay TAKE-able (a 500 there is a clean
     # skip via the leg-order fix). 0 = no gate. Distinct from QCEX_MIN_VOLUME_24H (universe).
     exec_maker_min_volume_24h: float = 0.0
+    # Min venue balance ($) to fire a leg there: a drained venue can't fund its hedge ->
+    # naked. Below this, that leg's trades are skipped (self-healing). 0 = off.
+    exec_min_venue_balance: float = 0.0
+    # Empirical fill-reliability (probe-then-scale): the live, learned replacement for the
+    # volume proxy. Untested markets trade at exec_probe_contracts until their FOK orders
+    # have FILLED exec_market_proven_fills times (real depth proven), then scale to full
+    # size; a market that KILL/REJECTs exec_market_max_fails times without proving is
+    # excluded. 0 probe = disabled (no empirical gate).
+    exec_probe_contracts: float = 0.0
+    exec_market_proven_fills: int = 3
+    exec_market_max_fails: int = 2
     # Maker mode: capture THIN edges by RESTING the fee-heavy (Kalshi) leg as a maker
     # (no slippage / lower fee), then TAKING the deep (Polymarket) leg the instant it
     # fills. The firing threshold drops to just RISK_MIN_EDGE (no hedge buffer needed).
@@ -348,6 +359,10 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         match_empirical_min_obs=int(_env_float("MATCH_EMPIRICAL_MIN_OBS", 0)),
         match_empirical_sum_floor=_env_float("MATCH_EMPIRICAL_SUM_FLOOR", 0.93),
         exec_maker_min_volume_24h=_env_float("EXEC_MAKER_MIN_VOLUME_24H", 0.0),
+        exec_min_venue_balance=_env_float("EXEC_MIN_VENUE_BALANCE", 0.0),
+        exec_probe_contracts=_env_float("EXEC_PROBE_CONTRACTS", 0.0),
+        exec_market_proven_fills=int(_env_float("EXEC_MARKET_PROVEN_FILLS", 3)),
+        exec_market_max_fails=int(_env_float("EXEC_MARKET_MAX_FAILS", 2)),
         exec_maker_mode=(env("EXEC_MAKER_MODE", "false") or "false").lower() == "true",
         exec_maker_timeout=_env_float("EXEC_MAKER_TIMEOUT", 5.0),
         exec_maker_improvement=_env_float("EXEC_MAKER_IMPROVEMENT", 0.01),

@@ -90,6 +90,22 @@ def test_leg2_killed_unwinds_leg1():
     assert yes.calls[1][2] == "sell"                 # second yes call was the unwind
 
 
+def test_min_venue_balance_skips_drained_hedge_leg():
+    # A venue too drained to fund its leg must NOT trade — else we'd fire the first leg and
+    # the second rejects for insufficient_balance, leaving a naked position (Kalshi at $0.38).
+    yes = FakeVenue("kalshi", [])
+    no = FakeVenue("poly", [])
+    risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor(
+        {v.name: v for v in [yes, no]}, risk,
+        fee_models={v.name: ZeroFeeModel() for v in [yes, no]},
+        max_order_contracts=0, min_venue_balance=5.0)
+    ex._balances = {"kalshi": 100.0, "poly": 0.38}   # poly (the NO/hedge leg) is drained
+    report = asyncio.run(ex.execute(opp(yv="kalshi", nv="poly")))
+    assert report.status is ExecStatus.SKIPPED and "cash_no" in report.reason
+    assert yes.calls == [] and no.calls == []         # nothing fired -> no naked leg
+
+
 def test_take_first_venue_fires_rejection_prone_leg_first():
     # With take_first_venue = the rejection-prone venue (poly), it fires FIRST. A poly KILL/
     # 500 is then a CLEAN SKIP (no kalshi leg placed, no unwind) instead of a kalshi unwind —
@@ -106,6 +122,70 @@ def test_take_first_venue_fires_rejection_prone_leg_first():
     assert len(poly.calls) == 1                        # poly fired FIRST
     assert kalshi.calls == []                          # its KILL -> clean skip, no hedge leg
     assert report.status is ExecStatus.SKIPPED and not risk.is_killed
+
+
+def _rel_exec(venues, store=None):
+    """Executor with the empirical reliability gate armed (probe 2 / proven 3 / max-fails 2)."""
+    risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
+    return Executor(
+        {v.name: v for v in venues}, risk,
+        fee_models={v.name: ZeroFeeModel() for v in venues},
+        store=store, max_order_contracts=100,
+        probe_contracts=2, market_proven_fills=3, market_max_fails=2,
+    )
+
+
+def test_reliability_caps_unproven_market_to_probe_size():
+    # An untested market trades only at the tiny probe size (2) regardless of depth/balance,
+    # so a phantom-depth book can leave at most a 2-contract naked remainder, not 100.
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
+    ex = _rel_exec([yes, no])
+    size, caps = ex._max_size(opp(max_contracts=100))
+    assert caps["reliability"] == 2 and size == 2
+
+
+def test_reliability_scales_proven_market_to_full_size():
+    # After 3 recorded fills the market is proven and the reliability cap lifts (inf),
+    # so other caps (depth/order) govern — the good low-volume arb scales up.
+    yes = FakeVenue("kalshi", [])
+    no = FakeVenue("poly", [])
+    ex = _rel_exec([yes, no])
+    ex._market_rel[("kalshi", "K1")] = (3, 0)
+    ex._market_rel[("poly", "P1")] = (3, 0)
+    _, caps = ex._max_size(opp(max_contracts=100))
+    assert caps["reliability"] == float("inf")
+
+
+def test_reliability_excludes_repeatedly_failing_market():
+    # A market that has KILL/REJECTed max_fails times without ever proving is excluded (cap 0).
+    yes = FakeVenue("kalshi", [])
+    no = FakeVenue("poly", [])
+    ex = _rel_exec([yes, no])
+    ex._market_rel[("poly", "P1")] = (0, 2)            # poly leg proven phantom
+    size, caps = ex._max_size(opp(max_contracts=100))
+    assert caps["reliability"] == 0 and size == 0
+
+
+def test_reliability_records_fok_outcomes_and_persists():
+    # A FILLED buy is recorded as a fill, and persists to the store for cross-restart memory.
+    store = Store(":memory:")
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)])
+    ex = _rel_exec([yes, no], store=store)
+    asyncio.run(ex.execute(opp()))
+    # kalshi YES filled -> (1,0); poly NO killed -> (0,1)
+    assert ex._market_rel[("kalshi", "K1")] == (1, 0)
+    assert ex._market_rel[("poly", "P1")] == (0, 1)
+    assert store.market_reliability()[("poly", "P1")] == (0, 1)
+
+
+def test_reliability_loads_history_from_store_on_init():
+    store = Store(":memory:")
+    store.record_market_outcome("poly", "P1", ok=False)
+    store.record_market_outcome("poly", "P1", ok=False)
+    ex = _rel_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], store=store)
+    assert ex._market_rel[("poly", "P1")] == (0, 2)    # excluded from the first tick after restart
 
 
 def test_leg1_partial_unwinds_not_halts():
