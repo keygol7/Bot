@@ -145,6 +145,7 @@ CREATE TABLE IF NOT EXISTS market_reliability (
     market_id  TEXT NOT NULL,
     fills      INTEGER NOT NULL DEFAULT 0,
     fails      INTEGER NOT NULL DEFAULT 0,
+    streak     INTEGER NOT NULL DEFAULT 0,   -- CONSECUTIVE fails (reset to 0 on a fill)
     ts         REAL,
     PRIMARY KEY (venue, market_id)
 );
@@ -167,6 +168,11 @@ class Store:
         except sqlite3.OperationalError:
             pass  # e.g. :memory: — fall back to defaults
         self.conn.executescript(_SCHEMA)
+        # Migration: add market_reliability.streak to DBs created before it existed.
+        if "streak" not in {r["name"] for r in
+                            self.conn.execute("PRAGMA table_info(market_reliability)")}:
+            self.conn.execute(
+                "ALTER TABLE market_reliability ADD COLUMN streak INTEGER NOT NULL DEFAULT 0")
         self.conn.commit()
 
     def close(self) -> None:
@@ -306,23 +312,27 @@ class Store:
 
     # ---- empirical per-market fill reliability (probe-then-scale) ----
     def record_market_outcome(self, venue: str, market_id: str, ok: bool) -> None:
-        """Record one FOK outcome for a market: ok=filled (real depth) / not (phantom)."""
+        """Record one FOK outcome for a market: ok=filled (real depth) / not (phantom).
+        ``streak`` is the CONSECUTIVE-fail count (reset to 0 on a fill) — it catches a
+        once-proven market whose depth later vanishes (game-ending liquidity drain)."""
         self.conn.execute(
-            """INSERT INTO market_reliability (venue, market_id, fills, fails, ts)
-               VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO market_reliability (venue, market_id, fills, fails, streak, ts)
+               VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(venue, market_id) DO UPDATE SET
-                 fills=fills+?, fails=fails+?, ts=excluded.ts""",
-            (venue, market_id, 1 if ok else 0, 0 if ok else 1, time.time(),
-             1 if ok else 0, 0 if ok else 1),
+                 fills=fills+?, fails=fails+?,
+                 streak=CASE WHEN ?=1 THEN 0 ELSE streak+1 END,
+                 ts=excluded.ts""",
+            (venue, market_id, 1 if ok else 0, 0 if ok else 1, 0 if ok else 1, time.time(),
+             1 if ok else 0, 0 if ok else 1, 1 if ok else 0),
         )
         self.conn.commit()
 
     def market_reliability(self) -> dict:
-        """All markets' (fills, fails) keyed by (venue, market_id), for the sizing gate."""
+        """All markets' (fills, fails, streak) keyed by (venue, market_id), for the gate."""
         return {
-            (r["venue"], r["market_id"]): (r["fills"], r["fails"])
+            (r["venue"], r["market_id"]): (r["fills"], r["fails"], r["streak"])
             for r in self.conn.execute(
-                "SELECT venue, market_id, fills, fails FROM market_reliability")
+                "SELECT venue, market_id, fills, fails, streak FROM market_reliability")
         }
 
     def cache_verdict(

@@ -198,8 +198,8 @@ def test_reliability_scales_proven_market_to_full_size():
     yes = FakeVenue("kalshi", [])
     no = FakeVenue("poly", [])
     ex = _rel_exec([yes, no])
-    ex._market_rel[("kalshi", "K1")] = (3, 0)
-    ex._market_rel[("poly", "P1")] = (3, 0)
+    ex._market_rel[("kalshi", "K1")] = (3, 0, 0)
+    ex._market_rel[("poly", "P1")] = (3, 0, 0)
     _, caps = ex._max_size(opp(max_contracts=100))
     assert caps["reliability"] == float("inf")
 
@@ -209,9 +209,26 @@ def test_reliability_excludes_repeatedly_failing_market():
     yes = FakeVenue("kalshi", [])
     no = FakeVenue("poly", [])
     ex = _rel_exec([yes, no])
-    ex._market_rel[("poly", "P1")] = (0, 2)            # poly leg proven phantom
+    ex._market_rel[("poly", "P1")] = (0, 2, 2)         # poly leg proven phantom
     size, caps = ex._max_size(opp(max_contracts=100))
     assert caps["reliability"] == 0 and size == 0
+
+
+def test_reliability_excludes_proven_market_on_consecutive_fail_streak():
+    # The Valorant case: a market proved real depth (5 fills) then its liquidity drained
+    # mid-game (consecutive fails). Despite being "proven", a streak >= max_fails must
+    # EXCLUDE it (cap 0) so it stops firing full size into vanished volume -> unwinds.
+    yes = FakeVenue("kalshi", [])
+    no = FakeVenue("poly", [])
+    ex = _rel_exec([yes, no])
+    ex._market_rel[("kalshi", "K1")] = (5, 3, 2)       # proven, but 2 consecutive fails now
+    ex._market_rel[("poly", "P1")] = (8, 0, 0)
+    size, caps = ex._max_size(opp(max_contracts=100))
+    assert caps["reliability"] == 0 and size == 0
+    # ...and a single fresh fill resets the streak -> the market is uncapped again.
+    ex._market_rel[("kalshi", "K1")] = (6, 3, 0)
+    _, caps2 = ex._max_size(opp(max_contracts=100))
+    assert caps2["reliability"] == float("inf")
 
 
 def test_reliability_records_fok_outcomes_and_persists():
@@ -221,10 +238,20 @@ def test_reliability_records_fok_outcomes_and_persists():
     no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)])
     ex = _rel_exec([yes, no], store=store)
     asyncio.run(ex.execute(opp()))
-    # kalshi YES filled -> (1,0); poly NO killed -> (0,1)
-    assert ex._market_rel[("kalshi", "K1")] == (1, 0)
-    assert ex._market_rel[("poly", "P1")] == (0, 1)
-    assert store.market_reliability()[("poly", "P1")] == (0, 1)
+    # kalshi YES filled -> (1,0,0); poly NO killed -> (0,1,1)
+    assert ex._market_rel[("kalshi", "K1")] == (1, 0, 0)
+    assert ex._market_rel[("poly", "P1")] == (0, 1, 1)
+    assert store.market_reliability()[("poly", "P1")] == (0, 1, 1)
+
+
+def test_reliability_streak_resets_on_fill_in_store():
+    # fail, fail -> streak 2; then a fill resets streak to 0 (fills/fails cumulative).
+    store = Store(":memory:")
+    store.record_market_outcome("kalshi", "K1", ok=False)
+    store.record_market_outcome("kalshi", "K1", ok=False)
+    assert store.market_reliability()[("kalshi", "K1")] == (0, 2, 2)
+    store.record_market_outcome("kalshi", "K1", ok=True)
+    assert store.market_reliability()[("kalshi", "K1")] == (1, 2, 0)
 
 
 def test_reliability_loads_history_from_store_on_init():
@@ -232,7 +259,7 @@ def test_reliability_loads_history_from_store_on_init():
     store.record_market_outcome("poly", "P1", ok=False)
     store.record_market_outcome("poly", "P1", ok=False)
     ex = _rel_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], store=store)
-    assert ex._market_rel[("poly", "P1")] == (0, 2)    # excluded from the first tick after restart
+    assert ex._market_rel[("poly", "P1")] == (0, 2, 2)  # excluded from the first tick after restart
 
 
 def test_leg1_partial_unwinds_not_halts():

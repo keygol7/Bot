@@ -268,16 +268,20 @@ class Executor:
 
     def _record_market_reliability(self, venue: str, market_id: str, ok: bool) -> None:
         key = (venue, market_id)
-        fills, fails = self._market_rel.get(key, (0, 0))
-        self._market_rel[key] = (fills + (1 if ok else 0), fails + (0 if ok else 1))
+        fills, fails, streak = self._market_rel.get(key, (0, 0, 0))
+        self._market_rel[key] = (fills + (1 if ok else 0), fails + (0 if ok else 1),
+                                 0 if ok else streak + 1)
         if self.store is not None:
             try:
                 self.store.record_market_outcome(venue, market_id, ok)
             except Exception as exc:
                 log.warning("market reliability write failed for %s: %s", market_id, exc)
         if not ok:
-            log.info("reliability: %s:%s FOK failed (%d fills/%d fails) — probe-gated until proven",
-                     venue, market_id, *self._market_rel[key])
+            f, x, s = self._market_rel[key]
+            log.info("reliability: %s:%s FOK failed (%d fills/%d fails/%d streak) — "
+                     "%s", venue, market_id, f, x, s,
+                     "EXCLUDED (depth vanished)" if s >= self.market_max_fails
+                     else "probe-gated until proven")
 
     async def _position_after_error(self, venue, market_id):
         """After an ambiguous leg ERROR, ask the venue whether a position actually
@@ -399,8 +403,15 @@ class Executor:
     def _reliability_cap(self, venue: str, market_id: str) -> float:
         """Contract ceiling a market's empirical FOK history earns it: full once it has
         proven real depth (>= market_proven_fills fills), excluded once it has failed
-        >= market_max_fails times without ever proving, else a tiny probe to find out."""
-        fills, fails = self._market_rel.get((venue, market_id), (0, 0))
+        >= market_max_fails times (consecutively, or without ever proving), else a tiny
+        probe to find out."""
+        fills, fails, streak = self._market_rel.get((venue, market_id), (0, 0, 0))
+        # CONSECUTIVE fails exclude EVEN a once-proven market: a Valorant/tennis market that
+        # filled early then had its depth drain as the game wound down kept firing full size
+        # into vanished volume (5 fills/3 fails) -> repeated hedge-reject unwinds. A live fill
+        # resets the streak, so a healthy market with the odd miss stays uncapped.
+        if streak >= self.market_max_fails:
+            return 0.0
         if fills >= self.market_proven_fills:
             return math.inf
         if fails >= self.market_max_fails:
