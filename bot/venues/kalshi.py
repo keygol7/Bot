@@ -698,7 +698,10 @@ class KalshiVenue:
         resp.raise_for_status()
         positions = []
         for mp in resp.json().get("market_positions") or []:
-            qty = float(mp.get("position") or 0)
+            # The signed contract count is ``position_fp`` (decimal string, e.g. "-4.00");
+            # ``position`` is the legacy/integer field and is absent on the live API, so
+            # reading only it silently reported every held position as flat.
+            qty = float(mp.get("position_fp") or mp.get("position") or 0)
             resting = int(mp.get("resting_orders_count") or 0)
             pos = VenuePosition(mp.get("ticker", ""), qty, resting)
             if pos.is_open:

@@ -20,6 +20,7 @@ class RiskLimits:
     max_daily_loss: float = 500.0            # $ realized loss before kill switch
     min_edge: float = 0.01                   # $ per-contract edge to act on an arb
     max_order_contracts: float = 2.0         # LIVE_SMALL per-order size cap (contracts)
+    max_position_fraction: float = 1.0       # per-market cap as a fraction of total (concentration)
 
     def __post_init__(self) -> None:
         for name in (

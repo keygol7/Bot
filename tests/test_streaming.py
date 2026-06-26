@@ -138,6 +138,45 @@ def test_edge_snapshot_only_includes_two_sided_pairs(caplog):
     assert "1/2 pairs two-sided" in caplog.text
 
 
+def test_log_edge_snapshot_ranks_by_confirmed_depth_excludes_one_sided(caplog):
+    import logging
+    from bot.streaming.engine import StreamingEngine
+    # Two pairs both quote a "good" WS edge, but E_empty's real book is one-sided (no NO
+    # offer on the Kalshi leg) while E_real has true two-sided depth. The snapshot must
+    # rank by the CONFIRMED book and drop the empty/sentinel pair entirely.
+    async def depth_fetch(venue, mid):
+        if mid in ("K_empty", "P_empty"):
+            # One-sided: only a YES ask exists, no NO offer -> not a tradeable arb.
+            return q(venue, mid, yes_ask=0.01, ya=100, no_ask=None, na=0.0)
+        if venue == "kalshi":
+            return q("kalshi", "K_real", yes_ask=0.40, ya=500, no_ask=0.62, na=500)
+        return q("poly", "P_real", yes_ask=0.61, ya=800, no_ask=0.55, na=800)
+
+    eng = StreamingEngine(
+        executor=FakeExec(),
+        fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, depth_fetch=depth_fetch,
+    )
+    eng.set_pairs([
+        ConfirmedPair("E_empty", "kalshi", "K_empty", "poly", "P_empty"),
+        ConfirmedPair("E_real", "kalshi", "K_real", "poly", "P_real"),
+    ])
+    # Both pairs get a two-sided WS quote so both are CANDIDATES; depth confirm decides.
+    asyncio.run(eng.on_quote(q("kalshi", "K_empty", yes_ask=0.01, ya=100, no_ask=0.50, na=100)))
+    asyncio.run(eng.on_quote(q("poly", "P_empty", yes_ask=0.40, ya=100, no_ask=0.50, na=100)))
+    asyncio.run(eng.on_quote(q("kalshi", "K_real", yes_ask=0.40, ya=100, no_ask=0.62, na=100)))
+    asyncio.run(eng.on_quote(q("poly", "P_real", yes_ask=0.61, ya=100, no_ask=0.55, na=100)))
+
+    with caplog.at_level(logging.INFO, logger="bot.streaming"):
+        asyncio.run(eng.log_edge_snapshot())
+    text = caplog.text
+    # Both pairs quote two-sided on WS (the honest denominator), but only the genuinely
+    # two-sided REAL book is tradeable — shown with its real (non-zero) confirmed size.
+    assert "2/2 pairs two-sided on WS, 1 tradeable" in text
+    assert "sz=500" in text          # min(K_real 500, P_real 800) from the confirmed book
+    assert "sz=0" not in text        # the empty/sentinel pair is gone, not shown at size 0
+
+
 def test_sizeless_ws_quote_triggers_depth_fetch_then_executes():
     # Kalshi-style: WS quotes have a price edge but size 0. The engine must depth-fetch
     # real sizes before firing, then execute.
@@ -214,6 +253,142 @@ def test_maker_mode_confirms_depth_even_on_fresh_ws_book():
     asyncio.run(eng.on_quote(pa))
     assert fetched != []                  # confirmed real depth despite the fresh WS book
     assert fe.calls == []                 # phantom edge -> nothing armed
+
+
+def test_maker_mode_deep_fresh_ws_fast_takes_without_confirm():
+    # LATENCY: in MAKER mode, a fresh + sized WS book deep enough to TAKE (size >=
+    # hybrid_take_depth) fires the take WITHOUT the REST depth-confirm round-trip — beating
+    # slower actors to the edge instead of losing it in the ~35ms confirm window. (Thin
+    # books and maker rests still confirm; covered by the test above with depth 0.)
+    import time as _time
+
+    fe = FakeExec()
+    fetched = []
+
+    async def depth_fetch(venue, mid):
+        fetched.append((venue, mid))                 # must NOT be called on the fast take
+        return q(venue, mid, yes_ask=0.99, ya=1, no_ask=0.99, na=1)
+
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, depth_fetch=depth_fetch,
+        max_ws_quote_age=2.0, maker_mode=True, hybrid_take_depth=10,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    now = _time.time()
+    ka = q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100); ka.timestamp = now
+    pa = q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60); pa.timestamp = now
+    asyncio.run(eng.on_quote(ka))
+    asyncio.run(eng.on_quote(pa))
+    assert len(fe.calls) == 1 and fetched == []      # took off the WS book, no REST confirm
+    # a SHALLOW fresh book (below hybrid_take_depth) must still confirm, not fast-take
+    fe2 = FakeExec(); fetched.clear()
+    eng2 = StreamingEngine(
+        executor=fe2, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, depth_fetch=depth_fetch,
+        max_ws_quote_age=2.0, maker_mode=True, hybrid_take_depth=10,
+    )
+    eng2.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    ka2 = q("kalshi", "K1", yes_ask=0.40, ya=5, no_ask=0.65, na=5); ka2.timestamp = now
+    pa2 = q("poly", "P1", yes_ask=0.62, ya=5, no_ask=0.55, na=5); pa2.timestamp = now
+    asyncio.run(eng2.on_quote(ka2))
+    asyncio.run(eng2.on_quote(pa2))
+    assert fetched != []                              # size 5 < 10 -> confirmed, not fast-taken
+
+
+def test_sync_window_fires_sub_100ms_bypassing_persist():
+    # With a sync window set, a deep edge whose BOTH legs ticked within the window fires
+    # IMMEDIATELY (first sighting) — bypassing the 0.75s persist wait — and with NO REST
+    # confirm. A non-synced edge (legs ticked far apart) falls back to the persist guard.
+    import time as _time
+
+    def make(persist, sync):
+        fe = FakeExec(); fetched = []
+
+        async def depth_fetch(venue, mid):
+            fetched.append((venue, mid))
+            return q(venue, mid, yes_ask=0.99, ya=1, no_ask=0.99, na=1)
+
+        eng = StreamingEngine(
+            executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+            min_edge=0.01, cooldown=100.0, clock=lambda: 1000.0, depth_fetch=depth_fetch,
+            max_ws_quote_age=2.0, maker_mode=True, hybrid_take_depth=10,
+            edge_persist_secs=persist, sync_window_secs=sync,
+        )
+        eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+        return eng, fe, fetched
+
+    now = _time.time()
+    # SYNCED: both legs stamped ~now -> within the 50ms window of each other and of now.
+    eng, fe, fetched = make(persist=0.75, sync=0.05)
+    ka = q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100); ka.timestamp = now
+    pa = q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60); pa.timestamp = now
+    asyncio.run(eng.on_quote(ka))
+    asyncio.run(eng.on_quote(pa))
+    assert len(fe.calls) == 1 and fetched == []      # fired first sighting, no persist, no REST
+
+    # NOT SYNCED: one leg ticked 200ms ago -> outside the window -> persist guard applies ->
+    # first sighting just waits (nothing fired).
+    eng2, fe2, _ = make(persist=0.75, sync=0.05)
+    ka2 = q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100); ka2.timestamp = now - 0.2
+    pa2 = q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60); pa2.timestamp = now
+    asyncio.run(eng2.on_quote(ka2))
+    asyncio.run(eng2.on_quote(pa2))
+    assert fe2.calls == []                            # not synced -> persist held it back
+
+
+def test_implausible_edge_skipped_as_false_match():
+    # An edge too large to be a real arb (the R6/CoD signature: YES+NO ≈ 0.59 -> ~41% "edge")
+    # is the fingerprint of a FALSE same-event match -> never trade it.
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, max_plausible_edge=0.06, cooldown=100.0, clock=lambda: 0.0)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.50, ya=100, no_ask=0.50, na=100)))
+    asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.50, ya=100, no_ask=0.09, na=100)))
+    assert fe.calls == []                            # 0.50+0.09=0.59 -> edge ~0.41 > 0.06 -> skip
+
+
+def test_empirical_gate_blocks_false_match_and_confirms_real_pair():
+    # The empirical same-event gate: a pair only trades once its observed YES+NO sum confirms
+    # the legs are complements (mean >= floor over >= min_obs samples).
+    def run(no_ask_poly):
+        fe = FakeExec(); t = [0.0]
+        eng = StreamingEngine(
+            executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+            min_edge=0.01, empirical_min_obs=4, empirical_sum_floor=0.93,
+            cooldown=0.0, clock=lambda: t[0])
+        eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+        for i in range(12):
+            t[0] = float(i)
+            asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)))
+            asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=no_ask_poly, na=100)))
+        return fe
+
+    # FALSE match: YES 0.40 + NO 0.50 = 0.90 < floor 0.93 -> never trades, however many ticks.
+    assert run(0.50).calls == []
+    # REAL pair: YES 0.40 + NO 0.55 = 0.95 >= floor -> confirms after observing, then trades.
+    assert len(run(0.55).calls) >= 1
+
+
+def test_maker_volume_gate_blocks_maker_keeps_take():
+    # A thin (maker-ineligible) Polymarket market: a shallow edge does NOT rest a maker (its
+    # hedge would 500 and go naked), but a DEEP edge still TAKES it — a 500 on a taker leg is
+    # a clean skip via the leg-order fix. So thin markets stay tradeable, just never rested.
+    def fire(depth_size):
+        fe = FakeExec()
+        eng = StreamingEngine(
+            executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+            min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, maker_mode=True,
+            hybrid_take_depth=10, maker_eligible=lambda v, m: False)   # poly thin -> never maker
+        eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+        asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=depth_size, no_ask=0.65, na=depth_size)))
+        asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=depth_size, no_ask=0.55, na=depth_size)))
+        return fe
+
+    assert fire(5).calls == []          # shallow (5 < take_depth 10) -> maker path -> blocked
+    assert len(fire(50).calls) == 1     # deep (50 >= 10) -> hybrid TAKE fires despite thin market
 
 
 def test_prime_and_sweep_fetches_concurrently():
@@ -760,15 +935,15 @@ def test_reconcile_balanced_pair_is_clean():
 
 
 def test_preview_no_fill_backs_off_pair():
-    # A "hedge preview ... would fill <1" skip should back the pair off briefly so it stops
+    # A "hedge unfillable ..." skip should back the pair off briefly so it stops
     # re-confirming an unfillable edge every cooldown (no legs were placed -> not a failure).
     from bot.execution.executor import ExecStatus, ExecutionReport
     eng = make_engine(FakeExec(), now=100.0)
     p = next(iter(eng._pairs.values()))
     eng._note_outcome(p.key, p, ExecutionReport(
-        ExecStatus.SKIPPED, "hedge preview: hedge would fill <1 contract"))
+        ExecStatus.SKIPPED, "hedge unfillable: book depth <1 contract at limit"))
     assert eng._backoff_until.get(p.key, 0) > 100.0       # backed off
-    # A benign maker-expired skip (no 'preview' reason) must NOT back off.
+    # A benign maker-expired skip (no 'hedge unfillable' reason) must NOT back off.
     eng2 = make_engine(FakeExec(), now=100.0)
     p2 = next(iter(eng2._pairs.values()))
     eng2._note_outcome(p2.key, p2, ExecutionReport(

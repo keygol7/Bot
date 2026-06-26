@@ -308,19 +308,23 @@ async def run_cycle(
     return result
 
 
-def apply_balance_caps(risk, snapshots) -> float:
+def apply_balance_caps(risk, snapshots, per_market_fraction: float = 1.0) -> float:
     """Set the per-market and total exposure caps from the live balance check.
 
-    Both are set to the sum of funded venue balances so the funded cash (tracked
-    per-venue in the executor) is the real limit — no hardcoded dollar caps. Returns
-    the total used (0.0 if no balances were readable, leaving the caps unchanged).
+    Total exposure = sum of funded venue balances (the funded cash, tracked per-venue in
+    the executor, is the real limit). The PER-MARKET cap is a FRACTION of that — a
+    concentration limit so no single (possibly mis-matched) pair can drain the whole
+    account into one position (the R6/CoD incident put ~$84 into one bad pair). Returns the
+    total (0.0 if no balances were readable, leaving the caps unchanged).
     """
     total = sum(s.balance for s in snapshots if getattr(s, "balance", None) is not None)
     if total <= 0:
         return 0.0
+    frac = per_market_fraction if 0 < per_market_fraction <= 1 else 1.0
     risk.limits.max_total_exposure = total
-    risk.limits.max_position_per_market = total
-    log.info("risk caps set from balances: per-market=$%.2f total=$%.2f", total, total)
+    risk.limits.max_position_per_market = total * frac
+    log.info("risk caps set from balances: per-market=$%.2f (%.0f%% concentration) total=$%.2f",
+             total * frac, frac * 100, total)
     return total
 
 
@@ -488,6 +492,23 @@ async def build_watchlist(cached, scanned, venues, store=None, *, min_poly_depth
     venue_by_name = {v.name: v for v in venues}
     settled: list[tuple[str, str]] = []   # confirmed closed -> prune from the cache
 
+    # Liquidity gate at the watchlist level: the Polymarket scan is volume-gated (and small
+    # enough to return in full), so a cached pair whose POLYMARKET leg isn't in this scan is
+    # a thin/settled market we must NOT trade — drop it (else a resting maker there 500s its
+    # hedge and goes naked). Kalshi legs can legitimately sit past the scan --limit, so those
+    # still fall through to the liveness probe below. Guard: only enforce when the Polymarket
+    # scan actually returned markets, so a transient scan failure can't nuke the watchlist.
+    poly_live = {mid for (vn, mid) in live if vn == "polymarket_us"}
+    if poly_live:
+        before = len(cached)
+        cached = [
+            (va, ma, vb, mb, ek) for (va, ma, vb, mb, ek) in cached
+            if (ma if va == "polymarket_us" else mb) in poly_live
+        ]
+        if before - len(cached):
+            log.info("watchlist: dropped %d pair(s) below the Polymarket liquidity gate "
+                     "(thin/settled)", before - len(cached))
+
     to_probe = {
         (vn, mid)
         for (va, ma, vb, mb, _ek) in cached
@@ -621,6 +642,7 @@ async def stream(
         max_order_contracts=settings.risk.max_order_contracts, fill_confirmer=tracker,
         min_leg_depth=settings.exec_min_leg_depth,
         depth_safety=settings.exec_depth_fraction,
+        take_first_venue=settings.exec_take_first_venue or None,
         hedge_buffer=settings.exec_hedge_buffer,
         maker_timeout=settings.exec_maker_timeout,
         maker_improvement=settings.exec_maker_improvement,
@@ -661,8 +683,27 @@ async def stream(
                 settings.exec_buffer_deep_depth)
     else:
         hybrid_take_bar = min_edge + settings.exec_hedge_buffer
+
+    # Maker-volume gate: a market may host a resting MAKER only if its real 24h volume clears
+    # the floor (else its hedge 500s -> naked). Thin markets are still TAKE-able. Reads the
+    # volume captured per-market in the Polymarket venue's scan meta. 0 = no gate.
+    _maker_vol_floor = settings.exec_maker_min_volume_24h
+    _venue_by_name = {v.name: v for v in venues}
+
+    def maker_eligible(venue_name: str, market_id: str) -> bool:
+        if _maker_vol_floor <= 0:
+            return True
+        v = _venue_by_name.get(venue_name)
+        meta = (getattr(v, "_meta", {}) or {}).get(market_id) or {}
+        vol = meta.get("volume24hr")
+        return vol is None or vol >= _maker_vol_floor   # unknown volume -> allow (fail open)
+
     engine = StreamingEngine(
         executor=executor, fee_models=fee_models, min_edge=fire_threshold, depth_fetch=depth_fetch,
+        maker_eligible=maker_eligible,
+        max_plausible_edge=settings.exec_max_plausible_edge,
+        empirical_min_obs=settings.match_empirical_min_obs,
+        empirical_sum_floor=settings.match_empirical_sum_floor,
         max_ws_quote_age=settings.stream_max_ws_quote_age,
         min_leg_price=settings.stream_min_leg_price, store=store,
         maker_mode=settings.exec_maker_mode,
@@ -671,6 +712,7 @@ async def stream(
         reconcile_halt=settings.exec_reconcile_halt,
         edge_snapshot_top=settings.stream_edge_snapshot_top,
         edge_persist_secs=settings.stream_edge_persist_secs,
+        sync_window_secs=settings.stream_sync_window_secs,
         prime_concurrency=settings.stream_prime_concurrency,
     )
 
@@ -695,7 +737,7 @@ async def stream(
         if snaps:
             executor.set_balances(snaps)
             if settings.risk_caps_from_balance:
-                apply_balance_caps(risk, snaps)
+                apply_balance_caps(risk, snaps, settings.risk.max_position_fraction)
             # Cross-venue naked-exposure backstop: catch a position whose hedge never
             # landed (the failure mode behind the Ruzic loss), not just at startup.
             engine.reconcile_positions(snaps)
@@ -717,6 +759,7 @@ async def stream(
             use_fingerprint=settings.match_use_fingerprint,
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
+            combine_verdicts=settings.match_combine_verdicts,
         )
         return await build_watchlist(cached, res.scanned, venues, store=store,
                                      min_poly_depth=settings.stream_min_poly_depth)
@@ -773,12 +816,15 @@ async def stream(
     # Seed sizing balances from the guard's snapshots (refreshed each cycle thereafter).
     executor.set_balances(guard.snapshots)
     if settings.risk_caps_from_balance:
-        apply_balance_caps(risk, guard.snapshots)
+        apply_balance_caps(risk, guard.snapshots, settings.risk.max_position_fraction)
 
     private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
     private_tasks += [asyncio.create_task(feed_lifecycle(v)) for v in venues]
-    log.warning("matching mode: fingerprint=%s metrics=%s (MATCH_USE_FINGERPRINT)",
-                settings.match_use_fingerprint,
+    log.warning("matching mode: %s metrics=%s (MATCH_USE_FINGERPRINT/MATCH_COMBINE_VERDICTS)",
+                ("fingerprint+LLM verdicts UNION"
+                 if settings.match_use_fingerprint and settings.match_combine_verdicts
+                 else "fingerprint sweep" if settings.match_use_fingerprint
+                 else "LLM verdicts"),
                 sorted(settings.match_fingerprint_metrics) or "all")
     log.warning("discovery: %s (STREAM_DISCOVERY)",
                 "embedding+LLM pass each cycle -> match_verdicts" if settings.stream_discovery
@@ -1091,6 +1137,7 @@ def show_watchlist(settings: Settings, *, limit: int = 500) -> int:
                 use_fingerprint=settings.match_use_fingerprint,
                 fingerprint_metrics=settings.match_fingerprint_metrics or None,
                 sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
+                combine_verdicts=settings.match_combine_verdicts,
             )
             # No wide scan needed: build_watchlist probes each cached leg directly.
             live = await build_watchlist(cached, set(), venues)
@@ -1351,6 +1398,7 @@ def inspect_matches(
             use_fingerprint=settings.match_use_fingerprint,
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
+            combine_verdicts=settings.match_combine_verdicts,
         )
         if tradeable_only:
             # Exactly what the streamer will trade — audit this before going live.
@@ -1519,6 +1567,7 @@ def poly_depth_report(settings: Settings, *, top: int = 40) -> int:
         use_fingerprint=settings.match_use_fingerprint,
         fingerprint_metrics=settings.match_fingerprint_metrics or None,
         sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
+        combine_verdicts=settings.match_combine_verdicts,
     )
 
     def _best_edge(qa, qb):

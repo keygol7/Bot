@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
 
 from bot.execution.executor import Executor
@@ -65,6 +66,10 @@ class StreamingEngine:
         executor: Executor,
         fee_models: dict[str, FeeModel] | None = None,
         min_edge: float = 0.01,
+        max_plausible_edge: float = 0.0,
+        empirical_min_obs: int = 0,
+        empirical_sum_floor: float = 0.93,
+        maker_eligible=None,
         cooldown: float = 5.0,
         livebook: LiveBook | None = None,
         clock=time.monotonic,
@@ -78,11 +83,31 @@ class StreamingEngine:
         reconcile_halt: bool = True,
         edge_snapshot_top: int = 5,
         edge_persist_secs: float = 0.0,
+        sync_window_secs: float = 0.0,
         prime_concurrency: int = 8,
     ) -> None:
         self.executor = executor
         self.fee_models = fee_models or {}
         self.min_edge = min_edge
+        # Implausible-edge guard: a genuine cross-venue arb is bounded by arbitrage to a few
+        # percent — an "edge" above this is the signature of a FALSE MATCH (two different
+        # events whose independent prices momentarily summed < $1), not a profit. e.g. the
+        # R6-vs-CoD mismatch showed a 39% "edge" (YES+NO ≈ 0.68). Skip those, never trade
+        # them. 0 = disabled. This is the cheap fire-path half of the empirical matcher.
+        self.max_plausible_edge = max_plausible_edge
+        # EMPIRICAL same-event confirmation: a structural/LLM match is only a HYPOTHESIS;
+        # two markets are truly the same event iff their prices behave as complements —
+        # YES_A + NO_B stays near $1. We sample that sum on every tick (in-memory, per pair)
+        # and only let a pair TRADE once it has >= empirical_min_obs samples whose MEAN sum
+        # is >= empirical_sum_floor. A false match (R6 vs CoD: mean sum ~0.68) never qualifies;
+        # a real pair (mean ~1.0) confirms within minutes. min_obs 0 = disabled (no gate).
+        self.empirical_min_obs = empirical_min_obs
+        self.empirical_sum_floor = empirical_sum_floor
+        self._sum_obs: dict[tuple, deque] = defaultdict(lambda: deque(maxlen=200))
+        # Optional callable (venue, market_id) -> bool: may this market host a resting MAKER?
+        # Used to keep makers off thin Polymarket markets (hedge would 500 -> naked) while
+        # still allowing them to be TAKEN. None = no gate (any market can rest a maker).
+        self.maker_eligible = maker_eligible
         self.cooldown = cooldown
         self.livebook = livebook or LiveBook()
         self.clock = clock
@@ -123,6 +148,10 @@ class StreamingEngine:
         # Require an edge to persist this many seconds before acting (distinguishes a real
         # venue-lag from a fleeting cross-feed timing artifact). 0 = act on first sighting.
         self.edge_persist_secs = edge_persist_secs
+        # SUB-100ms path: if BOTH legs ticked within this tight window (very recent AND
+        # close to each other -> the cross-feed is synced NOW, not one venue leading), a
+        # deep edge is real immediately and fires WITHOUT the persist wait. 0 = disabled.
+        self.sync_window_secs = sync_window_secs
         # Max concurrent REST snapshot fetches in prime_and_sweep (the rest are paced by
         # the per-venue rate limiters). Higher = faster watchlist refresh.
         self.prime_concurrency = prime_concurrency
@@ -226,7 +255,26 @@ class StreamingEngine:
                 return False
         return True
 
-    async def _confirm_depth(self, p: ConfirmedPair):
+    def _ws_synced(self, yq, nq) -> bool:
+        """True when BOTH legs ticked within a TIGHT window — each very recent AND close to
+        the other in time — so the cross-feed is synchronized RIGHT NOW. That rules out the
+        cross-feed flicker (one venue leading the other, whose timestamps would be far apart
+        or one stale), so a synced+sized edge is real and can fire in tens of ms WITHOUT the
+        persist wait. 0 window disables (-> normal persist/confirm path). Stricter than
+        :meth:`_ws_book_fresh`, which only bounds age (~2s) and ignores inter-leg skew."""
+        w = self.sync_window_secs
+        if w <= 0 or yq.yes_ask_size <= 0 or nq.no_ask_size <= 0:
+            return False
+        ts_y = getattr(yq, "timestamp", 0.0) or 0.0
+        ts_n = getattr(nq, "timestamp", 0.0) or 0.0
+        if ts_y <= 0 or ts_n <= 0:
+            return False
+        now = time.time()
+        if now - ts_y > w or now - ts_n > w:        # both legs must be VERY recent
+            return False
+        return abs(ts_y - ts_n) <= w                 # and synced with each other (no lead)
+
+    async def _confirm_depth(self, p: ConfirmedPair, *, quiet: bool = False):
         """Re-fetch real order-book depth for both legs and recompute the best
         direction with true sizes + fresh prices. Returns the eval tuple or None.
 
@@ -234,7 +282,12 @@ class StreamingEngine:
         sampled on a snapshot as near-simultaneous as the network allows. Fetching them
         sequentially would leave the books tens of ms apart — and on a fast in-play market
         that residual skew is itself a source of phantom edges (the very thing this confirm
-        exists to reject)."""
+        exists to reject).
+
+        ``quiet`` suppresses the per-pair "depth not two-sided" line — set it for bulk
+        snapshot confirms (where one-sided books are expected and 20+ such lines would be
+        noise); on the trade path it stays on so a "price edge but never trades" pair is
+        explainable."""
         if self.depth_fetch is None:
             return None
         try:
@@ -246,7 +299,7 @@ class StreamingEngine:
             log.warning("depth fetch failed for %s: %s", p.event_key, exc)
             return None
         ev = self._eval_direction(da, db)
-        if ev is None:
+        if ev is None and not quiet:
             # A leg had no usable two-sided quote (illiquid / one-sided book). Show
             # what came back so a "price edge but never trades" pair is explainable.
             log.info("STREAM %s: depth not two-sided — %s=%s %s=%s",
@@ -262,6 +315,28 @@ class StreamingEngine:
                 p.event_key, yq.venue, nq.venue, yq.yes_ask, nq.no_ask, edge, size, outcome)
         except Exception as exc:
             log.warning("edge log failed for %s: %s", p.event_key, exc)
+
+    def _maybe_blacklist(self, p, key, reason: str) -> None:
+        """Persist a CONFIRMED false match to the store blacklist so it's excluded from
+        matching across restarts. Only once the verdict is backed by enough samples (not a
+        one-off data blip) — the empirical mean must be both available and far from $1."""
+        if self.store is None or self.empirical_min_obs <= 0:
+            return
+        obs = self._sum_obs.get(key)
+        n = len(obs) if obs else 0
+        if n < self.empirical_min_obs:
+            return                                   # not enough evidence yet — just skip
+        mean_sum = sum(obs) / n
+        if mean_sum >= self.empirical_sum_floor:
+            return                                   # behaves like a real complement — don't blacklist
+        try:
+            self.store.blacklist_pair(
+                p.venue_a, p.market_a, p.venue_b, p.market_b,
+                reason=reason, mean_sum=round(mean_sum, 4), samples=n)
+            log.warning("STREAM %s: BLACKLISTED as a false match (%s, mean sum %.3f over %d) "
+                        "— excluded from matching from now on", p.event_key, reason, mean_sum, n)
+        except Exception as exc:
+            log.warning("blacklist write failed for %s: %s", p.event_key, exc)
 
     def _build_opp(self, p, edge, yq, nq, size) -> ArbOpportunity:
         gross = yq.yes_ask + nq.no_ask
@@ -294,15 +369,64 @@ class StreamingEngine:
         if ev is None:
             return None
         edge, yq, nq, size = ev
+        # EMPIRICAL observation: sample this pair's YES+NO sum on EVERY tick (incl. no-edge
+        # ticks where the sum is >= 1), building the price-behavior history the same-event
+        # gate below relies on. Cheap, in-memory, bounded.
+        if self.empirical_min_obs > 0 and yq.yes_ask is not None and nq.no_ask is not None:
+            self._sum_obs[key].append(yq.yes_ask + nq.no_ask)
         if edge <= self.min_edge:                # price-edge gate (size checked below)
             self._edge_since.pop(key, None)      # edge gone -> reset persistence timer
             return None
+        # Implausible-edge guard (empirical sanity): an edge this large can't be a real arb —
+        # it means the two legs are NOT complements (a false same-event match). Skip + record
+        # it so the empirical observer learns the pair's sum sits far from $1.
+        if self.max_plausible_edge > 0 and edge > self.max_plausible_edge:
+            log.warning("STREAM %s: edge %+.3f > max plausible %.3f — likely FALSE MATCH "
+                        "(legs not complementary), skipping", p.event_key, edge,
+                        self.max_plausible_edge)
+            self._observe(p, edge, yq, nq, size, "implausible_edge_false_match")
+            self._backoff_until[key] = self.clock() + self._backoff_cap   # park it hard
+            # Persist as a confirmed false match once the anomaly is repeated (not a one-off
+            # data blip): a pair that keeps showing an impossible edge over many samples is
+            # not the same event -> blacklist it so it's never matched again (across restarts).
+            self._maybe_blacklist(p, key, f"implausible edge {edge:+.3f}")
+            return None
+        # EMPIRICAL same-event gate: only TRADE a pair once its observed YES+NO sum confirms
+        # the legs are complements. Insufficient history -> OBSERVE, don't trade yet (a new
+        # real pair confirms within minutes as ticks accrue). Mean sum below the floor -> a
+        # false match (its prices don't sum to ~$1) -> never trade. This is the authority;
+        # the structural/LLM match only nominated the pair.
+        if self.empirical_min_obs > 0:
+            obs = self._sum_obs.get(key)
+            n = len(obs) if obs else 0
+            if n < self.empirical_min_obs:
+                if n == 1 or n == self.empirical_min_obs // 2:   # occasional heartbeat
+                    log.info("STREAM %s: observing (%d/%d samples) before trading",
+                             p.event_key, n, self.empirical_min_obs)
+                return None
+            mean_sum = sum(obs) / n
+            if mean_sum < self.empirical_sum_floor:
+                log.warning("STREAM %s: empirical reject — mean YES+NO sum %.3f < %.3f over "
+                            "%d samples (legs not complementary -> FALSE MATCH)",
+                            p.event_key, mean_sum, self.empirical_sum_floor, n)
+                self._observe(p, edge, yq, nq, size, "empirical_reject_false_match")
+                self._backoff_until[key] = self.clock() + self._backoff_cap
+                self._maybe_blacklist(p, key, f"mean sum {mean_sum:.3f} < {self.empirical_sum_floor}")
+                return None
+        # SUB-100ms SYNC PATH: when BOTH legs just ticked within the tight sync window the
+        # cross-feed is synchronized NOW, so this is a genuine edge — not a one-sided flicker.
+        # Skip the persist wait entirely and take it in tens of ms. Gated to deep books (the
+        # TAKE path; a stale top unwinds cleanly, bounded by the per-order cap). Everything
+        # else keeps the persist guard below.
+        deep = self.hybrid_take_depth > 0 and size >= self.hybrid_take_depth
+        sync_fast_take = self.maker_mode and deep and self._ws_synced(yq, nq)
         # Persistence filter: a cross-feed timing artifact (one venue's WS leading the other
         # for a beat) flickers — it appears for ~100ms and vanishes when the lagging leg
         # catches up. A REAL venue-lag edge persists for the duration of the lag (seconds).
         # So only act once the edge has held continuously for ``edge_persist_secs``, which
-        # separates genuine lag from skew without a slow REST round-trip. 0 = disabled.
-        if self.edge_persist_secs > 0:
+        # separates genuine lag from skew without a slow REST round-trip. 0 = disabled. The
+        # sync path above proves sync directly, so it bypasses this wait.
+        if not sync_fast_take and self.edge_persist_secs > 0:
             first = self._edge_since.get(key)
             if first is None:
                 self._edge_since[key] = self.clock()
@@ -314,15 +438,17 @@ class StreamingEngine:
         if self.clock() - self._last_acted.get(key, -1e9) < self.cooldown:
             return None
         self._last_acted[key] = self.clock()      # cooldown set now to avoid REST storms
-        # Both legs now stream a sized top-of-book (Polymarket full book + Kalshi ticker
-        # sizes). If the live book is fresh + sized, trust it and fire — no REST round
-        # trip. Otherwise re-fetch the real book (covers sizeless/stale/primed quotes);
-        # the executor's bounded-aggressive limits absorb any residual move.
-        # MAKER mode ALWAYS confirms first: resting a maker on a phantom WS edge just gets
-        # cancelled by the drift guard and then backs the pair off for cooldowns — wasteful
-        # on volatile in-play books where the WS top can briefly lead the real book. The
-        # per-pair cooldown (set above) bounds this to one REST round-trip per cooldown.
-        if self.depth_fetch is not None and (self.maker_mode or not self._ws_book_fresh(yq, nq)):
+        # LATENCY FAST PATH: a FRESH, SIZED WS book deep enough to TAKE fires WITHOUT the
+        # REST depth-confirm round-trip — so we beat slower actors to the edge instead of
+        # losing it in the ~35ms confirm window (the "edge gone after depth check" misses).
+        # Limited to deep hybrid TAKEs (both legs FOK -> a stale WS top just unwinds, bounded
+        # by the per-order cap), and the executor's hedge-fillable check still re-reads the
+        # taker book before committing leg 1 — so no leg is fired truly blind. Maker rests
+        # and thin/sizeless books still REST-confirm first (resting on a phantom edge is
+        # wasteful, and a maker can't unwind as cleanly as a FOK take).
+        ws_fresh = self._ws_book_fresh(yq, nq)
+        fast_take = sync_fast_take or (self.maker_mode and ws_fresh and deep)
+        if self.depth_fetch is not None and not fast_take and (self.maker_mode or not ws_fresh):
             log.info("STREAM %s: price edge %.4f -> confirming real depth", p.event_key, edge)
             ev = await self._confirm_depth(p)
             if ev is None:
@@ -336,8 +462,10 @@ class StreamingEngine:
         elif size < 1:
             return None
         else:
-            log.info("STREAM %s: edge %.4f from fresh WS book (sz %g) -> executing",
-                     p.event_key, edge, size)
+            log.info("STREAM %s: edge %.4f from fresh WS book (sz %g) -> fast executing "
+                     "(%s)", p.event_key, edge, size,
+                     "SYNC sub-100ms TAKE" if sync_fast_take
+                     else "deep TAKE, no REST confirm" if fast_take else "fresh WS")
         # State guard: never fire into a non-OPEN market (halted/suspended/pre-open/
         # closing-auction/settled) — it would reject or settle against us.
         if not (self._quote_open(yq) and self._quote_open(nq)):
@@ -376,6 +504,17 @@ class StreamingEngine:
                               status.value if status is not None else "executed")
                 self._note_outcome(key, p, report)
                 return report
+            # Maker-volume gate: only REST a maker when the Polymarket HEDGE market is liquid
+            # enough that its hedge will reliably fill. On a thin market the hedge 500s and
+            # leaves the maker fill naked (the incident). Such markets stay TAKE-able above —
+            # a 500 on a taker leg is a clean skip via the leg-order fix — just never rested.
+            if self.maker_eligible is not None:
+                poly_v, poly_m = ((p.venue_a, p.market_a) if p.venue_a == "polymarket_us"
+                                  else (p.venue_b, p.market_b))
+                if not self.maker_eligible(poly_v, poly_m):
+                    log.info("STREAM %s: maker NOT rested — hedge market below volume floor "
+                             "(thin -> TAKE-only, never naked)", p.event_key)
+                    return None
             # Rest a maker and complete it asynchronously so a pending maker doesn't
             # block the quote loop (it may wait seconds to fill). Tracked + shielded.
             self._maker_inflight.add(key)
@@ -425,9 +564,9 @@ class StreamingEngine:
             self._backoff_until.pop(key, None)
             return
         reason = getattr(report, "reason", "") or ""
-        if status is ExecStatus.SKIPPED and "preview" in reason:
-            # The hedge can't fill at the edge price right now (thin/phantom top-of-book —
-            # a real, fillable edge would have passed the preview). Don't re-confirm it every
+        if status is ExecStatus.SKIPPED and "hedge unfillable" in reason:
+            # The hedge can't fill at the edge price right now (thin top-of-book — a real,
+            # fillable edge would have cleared the live-book check). Don't re-confirm it every
             # cooldown; back the pair off briefly so we stop hammering REST on an unfillable
             # edge. It re-enters naturally once the book actually supports the hedge.
             self._backoff_until[key] = self.clock() + self._preview_backoff
@@ -623,7 +762,11 @@ class StreamingEngine:
         Returns ``[(edge, pair, yes_quote, no_quote, size), ...]`` sorted best-first,
         only for pairs that have a two-sided quote (both legs present in the book).
         This is proof that WS prices are matched to the right events: an entry can only
-        exist if both of a pair's markets have a current quote in the livebook."""
+        exist if both of a pair's markets have a current quote in the livebook.
+
+        Sizes here may be 0 (the Kalshi ticker is sizeless and an empty book side shows
+        as a ``1 - bid`` artifact). This is the cheap WS *candidate* ordering; the
+        tradeable view is :meth:`log_edge_snapshot`, which re-confirms real depth."""
         rows = []
         for p in self._pairs.values():
             ev = self._best_direction(p)
@@ -635,22 +778,51 @@ class StreamingEngine:
         return rows[: top if top is not None else self.edge_snapshot_top]
 
     async def log_edge_snapshot(self, top: int | None = None) -> None:
-        snap = self.edge_snapshot(top)
-        priced = sum(1 for p in self._pairs.values() if self._best_direction(p) is not None)
-        if not snap:
+        """Log the top *tradeable* edges: ranked by REAL order-book depth, not the
+        sizeless/sentinel WS book. Every priced pair is re-confirmed against its actual
+        book (bounded concurrency) and only genuinely two-sided pairs with fillable size
+        (>= 1 contract) qualify — so empty-book ``1.00``-sentinel rows that can never fill
+        no longer dominate the snapshot. Ranking is by the confirmed edge."""
+        top = top if top is not None else self.edge_snapshot_top
+        # FULL set of pairs with a two-sided WS quote — NOT capped at edge_snapshot_top
+        # (that cap is only for how many rows we DISPLAY). This is the honest "priced"
+        # denominator: how many watchlist pairs are actually streaming a two-sided book.
+        priced = [(ev, p) for p in self._pairs.values()
+                  if (ev := self._best_direction(p)) is not None]
+        if not priced:
             log.info("edge snapshot: 0/%d pairs have two-sided WS quotes yet "
                      "(book still warming up?)", len(self._pairs))
             return
-        # The live WS book has no Kalshi size (ticker is sizeless), so re-fetch the real
-        # order book for the shown rows — the displayed price/size/edge then reflect
-        # actual depth, not the sizeless WS quote. (Bounded: only the top rows.)
-        rows = []
-        for edge, p, yq, nq, size in snap:
-            ev = await self._confirm_depth(p)
-            rows.append(ev if ev is not None else (edge, yq, nq, size))
-        log.info("edge snapshot (real book): %d/%d pairs two-sided, top %d:",
-                 priced, len(self._pairs), len(snap))
-        for edge, yq, nq, size in rows:
+        priced.sort(key=lambda r: r[0][0], reverse=True)   # best WS edge first
+        if self.depth_fetch is None:
+            # No depth source to confirm against — fall back to the raw WS book (sizes
+            # may be 0 / sentinel; this path is for tests/diagnostics, not live trading).
+            shown = priced[:top]
+            log.info("edge snapshot (WS book): %d/%d pairs two-sided, top %d:",
+                     len(priced), len(self._pairs), len(shown))
+            for (edge, yq, nq, size), p in shown:
+                log.info("  %s yes=%.2f + %s no=%.2f = %.2f | edge=%+.3f sz=%g",
+                         yq.venue, yq.yes_ask, nq.venue, nq.no_ask,
+                         yq.yes_ask + nq.no_ask, edge, size)
+            return
+        # Confirm real depth on the best WS candidates first, bounded so a large watchlist
+        # can't flood the rate limiter / starve trade-path depth fetches. Keep only
+        # genuinely two-sided pairs with fillable size (>= 1 contract).
+        cap = max(top * 6, 24)
+        sem = asyncio.Semaphore(self.prime_concurrency)
+
+        async def _confirm(p):
+            async with sem:
+                return await self._confirm_depth(p, quiet=True)
+
+        evs = await asyncio.gather(*(_confirm(p) for _, p in priced[:cap]))
+        rows = [ev for ev in evs if ev is not None and ev[3] >= 1]  # ev[3] = fillable size
+        rows.sort(key=lambda r: r[0], reverse=True)
+        shown = rows[:top]
+        note = "" if len(priced) <= cap else f"; depth-checked top {cap}"
+        log.info("edge snapshot: %d/%d pairs two-sided on WS, %d tradeable, top %d%s:",
+                 len(priced), len(self._pairs), len(rows), len(shown), note)
+        for edge, yq, nq, size in shown:
             log.info("  %s yes=%.2f + %s no=%.2f = %.2f | edge=%+.3f sz=%g",
                      yq.venue, yq.yes_ask, nq.venue, nq.no_ask,
                      yq.yes_ask + nq.no_ask, edge, size)

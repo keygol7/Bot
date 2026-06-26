@@ -159,6 +159,18 @@ def test_poly_positions_object_keyed_by_market():
     assert {p.market_id for p in pos} == {"mkt-a", "mkt-b"}
 
 
+def test_poly_positions_real_netposition_field():
+    # The LIVE API keys held size as "netPosition" (decimal string) — reading only the
+    # older field names reported every open position as flat (the startup-guard blind spot).
+    body = {"positions": {
+        "aec-mlb-chc-mil-2026-06-26": {"netPosition": "4", "qtyBought": "4", "qtySold": "0"},
+        "aec-mlb-kc-cws-2026-06-26": {"netPosition": "-4"},   # short side
+        "aec-mlb-flat": {"netPosition": "0"},                  # flat -> dropped
+    }}
+    pos = {p.market_id: p.quantity for p in _parse_positions(body)}
+    assert pos == {"aec-mlb-chc-mil-2026-06-26": 4.0, "aec-mlb-kc-cws-2026-06-26": -4.0}
+
+
 def test_poly_positions_unknown_shape_raises():
     # Fail closed: an unrecognized payload must NOT be read as a flat account.
     with pytest.raises(ValueError):

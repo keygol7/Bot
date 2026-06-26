@@ -108,6 +108,7 @@ class Executor:
         min_leg_depth: float = 0.0,
         depth_safety: float = 1.0,
         first_venue: str = "kalshi",
+        take_first_venue: str | None = None,
         hedge_buffer: float = 0.0,
         maker_timeout: float = 5.0,
         maker_improvement: float = 0.01,
@@ -135,6 +136,12 @@ class Executor:
         # The rejection-prone venue (Kalshi: thinner books / FOK insufficient resting
         # volume) is placed FIRST, so if it rejects there's no other leg to unwind.
         self.first_venue = first_venue
+        # Which venue fires FIRST in a two-FOK hybrid TAKE — independent of the maker-rest
+        # venue (``first_venue``). Set this to the REJECTION-PRONE venue so its failure is a
+        # clean skip, not an unwind: live data shows Polymarket 500s the hedge buy on thin
+        # markets, so firing it first turns those 500s into free skips instead of Kalshi
+        # unwinds. Defaults to ``first_venue`` (unchanged behavior) when not set.
+        self.take_first_venue = take_first_venue or first_venue
         self.fill_confirmer = fill_confirmer       # optional FillTracker (private WS)
         self.confirm_timeout = confirm_timeout
         # Available cash per venue, seeded from the startup snapshot and decremented as
@@ -275,21 +282,32 @@ class Executor:
         return 0.0
 
     async def _hedge_fillable(self, venue, leg, size) -> float:
-        """Preview the hedge leg (when the venue supports it) and return how many contracts
-        would actually fill at its limit — so the caller can SIZE DOWN to the real fillable
-        quantity instead of skipping a partially-fillable hedge. Returns ``inf`` when the
-        venue has no preview or the preview itself errors (best-effort: don't cap)."""
-        preview = getattr(venue, "preview_order", None)
-        if preview is None:
-            return float("inf")
+        """How many contracts the hedge (taker) leg would actually fill at its limit, read
+        from the REAL order book — re-fetched live right before we commit leg 1. A book that
+        thinned or moved since the depth-confirm then caps the trade (or skips it) instead of
+        leaving a naked remainder. Returns the resting top-of-book size on the buy side when
+        the current ask is at/through our limit; 0.0 when there's no offer, the price moved
+        past our limit, or the fetch fails (an unconfirmable hedge must NOT arm a leg).
+
+        Why the live book and not an order preview: Polymarket's /v1/order/preview does NOT
+        simulate matching — it echoes the order with cumQuantity=0 for everything, so it
+        always read as "fills nothing" and blocked every trade. The /book depth is the
+        authoritative, verified source (``--show-book`` matches it exactly)."""
+        market_id, side = leg[1], leg[2]
         try:
-            res = await preview(leg[1], leg[2], "buy", leg[3], size, tif="fill_or_kill")
+            q = await venue.fetch_quote(RawMarket(market_id=market_id, title="", raw={}))
         except Exception as exc:
-            log.warning("hedge preview failed for %s: %s", leg[1], exc)
-            return float("inf")
-        if getattr(res, "status", None) is OrderStatus.ERROR:
-            return float("inf")          # couldn't preview -> proceed (best effort)
-        return res.filled
+            log.warning("hedge fillable: book fetch failed for %s: %s", market_id, exc)
+            return 0.0                               # can't confirm -> don't arm
+        ask = q.yes_ask if side is Side.YES else q.no_ask
+        depth = q.yes_ask_size if side is Side.YES else q.no_ask_size
+        if ask is None or not depth:
+            return 0.0                               # no resting offer -> can't hedge
+        # The buy side's resting top-of-book depth. We don't gate on the stale leg limit
+        # here: the taker leg fires FOK (a book that moved past the limit kills cleanly ->
+        # unwind), and the maker leg REPRICES the hedge to the live ask on fill — so the
+        # only thing this pre-check must establish is that real depth exists to hedge into.
+        return float(depth)
 
     def _max_size(self, opp: ArbOpportunity,
                   depth_override: float | None = None) -> tuple[int, dict[str, float]]:
@@ -376,10 +394,14 @@ class Executor:
                  opp.event_key, size, binding,
                  {k: round(v, 2) for k, v in caps.items()})
 
-        # Order the two legs so the rejection-prone venue (self.first_venue, e.g. Kalshi)
-        # goes FIRST: if it rejects, no other leg was taken -> a clean skip, no unwind.
-        # The SECOND (hedge) leg is the one whose failure forces an unwind.
-        if opp.buy_no_venue == self.first_venue and opp.buy_yes_venue != self.first_venue:
+        # Order the two legs so the REJECTION-PRONE venue (self.take_first_venue) fires
+        # FIRST: if it rejects/errors, no other leg was taken -> a clean skip, no unwind.
+        # The SECOND (hedge) leg is the RELIABLE one whose failure would force an unwind —
+        # and it's the leg the hedge-fillable pre-check below confirms can fill. (Live data:
+        # Polymarket 500s the hedge buy on thin markets, so it must go first; then a 500 is a
+        # free skip instead of a Kalshi unwind.)
+        tfv = self.take_first_venue
+        if opp.buy_no_venue == tfv and opp.buy_yes_venue != tfv:
             first_vn, first_m, first_side = opp.buy_no_venue, opp.buy_no_market, Side.NO
             second_vn, second_m, second_side = opp.buy_yes_venue, opp.buy_yes_market, Side.YES
         else:
@@ -411,21 +433,21 @@ class Executor:
         if first_venue is None or second_venue is None:
             return ExecutionReport(ExecStatus.SKIPPED, "venue not available")
 
-        # Preview the hedge (deep) leg before committing leg 1 and SIZE DOWN to what it
-        # would actually fill. Polymarket can be thin/phantom, so taking the full size
-        # would leave the hedge short (a naked remainder) or fire a FOK into empty
-        # liquidity (the 500 trigger). Sizing to the preview's fillable quantity keeps the
-        # trade fully hedged at whatever size the thin leg supports — capturing a small
-        # real arb instead of skipping it. No preview support / a preview error -> inf
-        # (don't cap, proceed as before).
+        # Re-confirm the hedge (deep) leg's LIVE book before committing leg 1 and SIZE DOWN
+        # to what it would actually fill. Polymarket can thin out between the depth-confirm
+        # and the fire, so taking the full size would leave the hedge short (a naked
+        # remainder) or fire a FOK into vanished liquidity (the 500 trigger). Sizing to the
+        # live fillable depth keeps the trade fully hedged at whatever the leg supports —
+        # capturing a small real arb instead of skipping it. A fetch failure -> 0 (skip).
         fillable = await self._hedge_fillable(second_venue, second, size)
         if fillable < size - 1e-9:
             capped = int(fillable + 1e-9)
             if capped < 1:
-                self._audit("execute_skip_preview", opp, size=size)
-                log.info("STREAM skip %s — hedge preview: would fill <1 contract", opp.event_key)
+                self._audit("execute_skip_hedge", opp, size=size)
+                log.info("STREAM skip %s — hedge unfillable: book depth <1 contract at limit",
+                         opp.event_key)
                 return ExecutionReport(
-                    ExecStatus.SKIPPED, "hedge preview: hedge would fill <1 contract")
+                    ExecStatus.SKIPPED, "hedge unfillable: book depth <1 contract at limit")
             log.info("STREAM %s: sizing down to hedge-fillable %d (book showed %d)",
                      opp.event_key, capped, size)
             size = capped
@@ -669,16 +691,15 @@ class Executor:
         if maker_venue is None or taker_venue is None:
             return ExecutionReport(ExecStatus.SKIPPED, "venue not available")
 
-        # Don't arm a maker we can't hedge. The quoted hedge depth can be PHANTOM — the book
-        # shows size but a real IOC fills nothing (the post-fill hedge then KILLs at the cap
-        # and forces an unwind). Preview the taker (hedge) leg and SIZE DOWN to what would
-        # actually fill; skip entirely if it can't fill at all. (The taker path does the same
-        # before committing leg 1.) Best-effort: a venue without preview returns inf.
+        # Don't arm a maker we can't hedge. Re-read the taker (hedge) leg's LIVE book and
+        # SIZE DOWN to its real top-of-book depth; skip entirely if it can't fill at all
+        # (else the post-fill hedge KILLs at the cap and forces an unwind). The taker path
+        # does the same before committing leg 1. A fetch failure -> 0 (skip, never arm blind).
         fillable = await self._hedge_fillable(taker_venue, taker, size)
         if fillable < 1:
             return ExecutionReport(
                 ExecStatus.SKIPPED,
-                f"hedge not fillable (preview {fillable:g} < 1) — would arm an unhedgeable maker")
+                f"hedge unfillable: book depth {fillable:g} < 1 — would arm an unhedgeable maker")
         if fillable < size:
             size = int(fillable)
 

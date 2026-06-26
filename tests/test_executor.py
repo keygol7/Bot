@@ -7,7 +7,7 @@ from bot.execution.executor import ExecStatus, Executor
 from bot.execution.orders import OrderResult, OrderStatus
 from bot.execution.risk import RiskLimits, RiskManager
 from bot.fees import ZeroFeeModel
-from bot.models import Side
+from bot.models import MarketQuote, Side
 from bot.strategies.arbitrage import ArbOpportunity
 
 
@@ -28,17 +28,30 @@ def res(venue, side, status, filled, avg, action="buy", requested=2):
 
 
 class FakeVenue:
-    """Returns programmed OrderResults in sequence; records calls."""
+    """Returns programmed OrderResults in sequence; records calls.
 
-    def __init__(self, name, responses):
+    ``hedge_depth`` is the top-of-book size its ``fetch_quote`` reports — the live-book
+    read the executor's hedge-fillability check uses. Default huge = ample (won't cap);
+    set small/0 to exercise the size-down / skip paths. Ask is quoted low so it's always
+    at/through the hedge limit (the check gates on price, then returns this depth)."""
+
+    def __init__(self, name, responses, hedge_depth=1e9):
         self.name = name
         self._responses = list(responses)
         self.calls = []
+        self.hedge_depth = hedge_depth
 
     async def place_order(self, market_id, side, action, price, contracts, *,
                           tif="fill_or_kill", post_only=False, expiration_ts=None):
         self.calls.append((market_id, side.value, action, price, contracts, tif, post_only))
         return self._responses.pop(0)
+
+    async def fetch_quote(self, market):
+        return MarketQuote(
+            venue=self.name, market_id=getattr(market, "market_id", ""), title="",
+            yes_ask=0.01, yes_ask_size=self.hedge_depth,
+            no_ask=0.01, no_ask_size=self.hedge_depth,
+        )
 
 
 def make_exec(venues, max_order_contracts=2, limits=None, store=None):
@@ -75,6 +88,24 @@ def test_leg2_killed_unwinds_leg1():
     assert round(report.realized_pnl, 4) == round(2 * (0.38 - 0.40), 4)  # small loss
     assert not risk.is_killed                       # unwind succeeded -> keep trading
     assert yes.calls[1][2] == "sell"                 # second yes call was the unwind
+
+
+def test_take_first_venue_fires_rejection_prone_leg_first():
+    # With take_first_venue = the rejection-prone venue (poly), it fires FIRST. A poly KILL/
+    # 500 is then a CLEAN SKIP (no kalshi leg placed, no unwind) instead of a kalshi unwind —
+    # the structural fix for "Polymarket 500s the hedge -> kalshi unwind" seen in live data.
+    poly = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)])  # leg1 fails
+    kalshi = FakeVenue("kalshi", [])                  # the hedge leg — must never be placed
+    risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor(
+        {v.name: v for v in [poly, kalshi]}, risk,
+        fee_models={v.name: ZeroFeeModel() for v in [poly, kalshi]},
+        max_order_contracts=2, take_first_venue="poly",
+    )
+    report = asyncio.run(ex.execute(opp(yv="kalshi", nv="poly")))   # poly is the NO leg
+    assert len(poly.calls) == 1                        # poly fired FIRST
+    assert kalshi.calls == []                          # its KILL -> clean skip, no hedge leg
+    assert report.status is ExecStatus.SKIPPED and not risk.is_killed
 
 
 def test_leg1_partial_unwinds_not_halts():
@@ -416,15 +447,41 @@ def test_execute_maker_gtc_cancels_unfilled_on_timeout():
     assert poly.calls == []                          # never hedged
 
 
+def test_hedge_fillable_reads_live_book_not_preview():
+    # _hedge_fillable must source from the live order book (the preview API can't simulate
+    # fills): returns the buy-side top-of-book depth, 0 when there's no offer, 0 on a fetch
+    # error (never proceed blind).
+    yes = FakeVenue("kalshi", [])
+    ex, _ = make_exec([yes, FakeVenue("poly", [])])
+
+    class BookVenue:
+        def __init__(self, q): self._q = q; self.name = "poly"
+        async def fetch_quote(self, m): return self._q
+    class BoomVenue:
+        name = "poly"
+        async def fetch_quote(self, m): raise RuntimeError("network")
+
+    leg = ("poly", "P1", Side.NO, 0.55)
+    # NO buy: depth comes from no_ask_size when a no_ask exists
+    deep = BookVenue(MarketQuote(venue="poly", market_id="P1", title="",
+                                 no_ask=0.46, no_ask_size=37.0))
+    assert asyncio.run(ex._hedge_fillable(deep, leg, 5)) == 37.0
+    # no resting offer on the side -> 0
+    empty = BookVenue(MarketQuote(venue="poly", market_id="P1", title="", no_ask=None))
+    assert asyncio.run(ex._hedge_fillable(empty, leg, 5)) == 0.0
+    # fetch failure -> 0 (don't arm a leg we can't confirm)
+    assert asyncio.run(ex._hedge_fillable(BoomVenue(), leg, 5)) == 0.0
+
+
 def test_execute_maker_skips_when_hedge_preview_fills_nothing():
-    # The hedge book is PHANTOM: quoted depth but a preview shows it would fill nothing.
-    # Don't arm a maker we can't hedge (else the post-fill hedge KILLs and forces an unwind).
+    # The hedge leg's live book shows NO depth -> can't hedge. Don't arm a maker we can't
+    # hedge (else the post-fill hedge KILLs and forces an unwind).
     kalshi = FakeVenue("kalshi", [])                # maker must never be placed
     poly = PreviewVenue("poly", [], preview_filled=0)
     ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.40, no_price=0.55)))
-    assert report.status is ExecStatus.SKIPPED and "not fillable" in report.reason
+    assert report.status is ExecStatus.SKIPPED and "hedge unfillable" in report.reason
     assert kalshi.calls == []                        # never armed the maker
 
 
@@ -563,15 +620,11 @@ def test_leg2_error_halts_and_trips_kill_switch():
 
 
 class PreviewVenue(FakeVenue):
-    """FakeVenue that also answers preview_order (the hedge fillability pre-check)."""
+    """FakeVenue whose hedge leg's live book shows ``preview_filled`` contracts of depth —
+    the quantity the executor's hedge-fillability check will read and size to / skip on."""
 
     def __init__(self, name, responses, preview_filled):
-        super().__init__(name, responses)
-        self._preview_filled = preview_filled
-
-    async def preview_order(self, market_id, side, action, price, contracts, *,
-                            tif="fill_or_kill"):
-        return res(self.name, side, OrderStatus.PARTIAL, self._preview_filled, None)
+        super().__init__(name, responses, hedge_depth=preview_filled)
 
 
 def test_hedge_preview_skips_when_would_fill_nothing():
@@ -763,14 +816,22 @@ def test_liquidity_guard_allows_deep_book():
 
 
 class QuotingVenue(FakeVenue):
-    """FakeVenue that also answers fetch_quote (for the unwind's bid lookup)."""
+    """FakeVenue that also answers fetch_quote (for the unwind's bid lookup and the
+    hedge-fillability pre-check). Injects ``hedge_depth`` where the quote names a price
+    but no size, so the hedge check sees real depth (these tests assert on price, not size)."""
 
     def __init__(self, name, responses, quote):
         super().__init__(name, responses)
         self._quote = quote
 
     async def fetch_quote(self, market):
-        return self._quote
+        from dataclasses import replace
+        q = self._quote
+        return replace(
+            q,
+            yes_ask_size=q.yes_ask_size or (self.hedge_depth if q.yes_ask is not None else 0.0),
+            no_ask_size=q.no_ask_size or (self.hedge_depth if q.no_ask is not None else 0.0),
+        )
 
 
 def test_unwind_crosses_real_bid():

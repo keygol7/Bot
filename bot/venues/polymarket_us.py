@@ -222,8 +222,9 @@ def _parse_positions(body: Any):
             continue
         slug = (r.get("marketSlug") or r.get("slug") or r.get("market_id")
                 or r.get("ticker") or slug_hint or "")
-        qty = _amount(r.get("quantity") or r.get("netQuantity") or r.get("size")
-                      or r.get("position") or r.get("netSize") or r.get("netShares")) or 0.0
+        qty = _amount(r.get("netPosition") or r.get("quantity") or r.get("netQuantity")
+                      or r.get("size") or r.get("position") or r.get("netSize")
+                      or r.get("netShares")) or 0.0
         resting = int(r.get("openOrders") or r.get("restingOrders")
                       or r.get("resting_orders_count") or 0)
         pos = VenuePosition(slug, qty, resting)
@@ -512,23 +513,111 @@ class PolymarketUSVenue:
             out.append(RawMarket(market_id=slug, title=build_market_title(m), raw=m))
         return out
 
+    def _market_to_quote(
+        self, m: dict[str, Any], max_close_ts: int | None
+    ) -> MarketQuote | None:
+        """Build a phase-1 price-only ``MarketQuote`` from one raw market dict — works
+        for both the flat ``/v1/markets`` feed and a nested ``/v1/events`` market. Records
+        the order-constraint meta for ``place_order``. Returns ``None`` to skip (no slug,
+        or closing past a targeted ``max_close_ts`` window; unknown close is kept).
+
+        Event-nested markets carry no ``bestBid``/``bestAsk`` (prices come from ``/book``
+        in phase 2), so their phase-1 ask is ``None`` — fine: matching is structural
+        (title/slug) and the streaming watchlist re-fetches real depth before trading.
+        """
+        slug = m.get("slug") or m.get("id")
+        if not slug:
+            return None
+        # Real 24h traded volume — the reliable "the hedge will fill" signal (the phantom
+        # /book depth is not). Captured in meta so the executor can keep a resting MAKER off
+        # thin markets (whose hedge 500s and goes naked) while still TAKING them (a 500 on a
+        # taker leg is a clean skip via the leg-order fix). The optional universe-level gate
+        # (min_volume_24h) drops them from the scan entirely; 0 = keep them, gate the maker.
+        v24 = _amount(m.get("volume24hr"))
+        floor = getattr(self.cfg, "min_volume_24h", 0.0) or 0.0
+        if floor > 0 and v24 is not None and v24 < floor:
+            return None
+        # Capture order constraints for place_order (don't infer from slug/type).
+        self._meta[slug] = {
+            "tick": _amount(m.get("orderPriceMinTickSize")),
+            "min_qty": _amount(m.get("minimumTradeQty")),
+            "volume24hr": v24,
+        }
+        close_time = parse_iso8601(m.get("endDate"))
+        # Targeted window: skip markets closing past it (keep unknown close).
+        if max_close_ts is not None and close_time is not None and close_time > max_close_ts:
+            return None
+        best_ask = _amount(m.get("bestAsk"))
+        best_bid = _amount(m.get("bestBid"))
+        return MarketQuote(
+            venue=VENUE,
+            market_id=slug,
+            title=build_market_title(m),
+            yes_ask=best_ask,
+            yes_ask_size=0.0,
+            no_ask=round(1.0 - best_bid, 6) if best_bid is not None else None,
+            no_ask_size=0.0,
+            close_time=close_time,
+        )
+
+    async def _scan_event_markets(
+        self, *, max_close_ts: int | None = None
+    ) -> list[MarketQuote]:
+        """Phase 1, part 2: the per-GAME markets (live moneylines, totals, spreads,
+        player props) live NESTED under ``/v1/events`` — the flat ``/v1/markets`` feed is
+        season futures + a few standalones and does NOT contain them. Enumerate active
+        events and flatten each event's ``markets[]`` so the live game catalog is
+        scannable (and matchable against Kalshi's per-game lines). Deduped by slug;
+        prices are filled later from ``/book``."""
+        out: list[MarketQuote] = []
+        seen: set[str] = set()
+        offset = 0
+        while True:
+            await self._limiter.wait()
+            resp = await self._gateway().get(
+                "/v1/events",
+                params={"limit": 500, "active": "true", "closed": "false", "offset": offset},
+            )
+            resp.raise_for_status()
+            events = resp.json().get("events", [])
+            if not events:
+                break
+            new = 0
+            for ev in events:
+                for m in ev.get("markets") or []:
+                    # Skip a settled sub-market inside an otherwise-live event.
+                    if not m.get("active", True) or m.get("closed"):
+                        continue
+                    slug = m.get("slug") or m.get("id")
+                    if not slug or slug in seen:
+                        continue
+                    seen.add(slug)
+                    new += 1
+                    q = self._market_to_quote(m, max_close_ts)
+                    if q is not None:
+                        out.append(q)
+            offset += len(events)
+            # Offset ignored (same page) or end of feed -> stop.
+            if new == 0 or len(events) < 500:
+                break
+        return out
+
     async def scan_quotes(
         self, limit: int = 500, *, max_close_ts: int | None = None
     ) -> list[MarketQuote]:
-        """Phase 1: paginate /v1/markets -> price-only quotes (bestBid/bestAsk).
+        """Phase 1: price-only quotes for the whole board (sizes come from
+        :meth:`fetch_quote` for shortlisted markets only). Two sources, merged + deduped:
 
-        Sizes are not in the list payload, so this is the cheap wide scan; the sized
-        quote comes from :meth:`fetch_quote` (BBO) for shortlisted markets only.
-
-        ``limit`` is a TOTAL cap across pages. We page via ``offset`` and dedupe by
-        slug; if the gateway ignores ``offset`` (returns the same page) we get no new
-        slugs and stop, so this is safe whether or not paging is supported. ``limit <= 0``
-        scans the ENTIRE feed (paginate until a short/empty page).
+        * ``/v1/markets`` — the flat feed (season futures + standalones), paginated by
+          ``offset``. ``limit`` is a TOTAL cap across pages (``<= 0`` = the entire feed);
+          if the gateway ignores ``offset`` we get no new slugs and stop.
+        * ``/v1/events`` — the per-GAME markets nested under each event (live moneylines,
+          props, totals). NOT capped by ``limit`` — these are the live game lines we most
+          want to match, so we always take them all.
 
         ``max_close_ts`` (Unix seconds) enables a TARGETED scan: only markets closing
-        at/before that time (from ``endDate``) are returned. The public gateway has no
-        documented close-time query param, so this is enforced client-side; markets
-        with no close_time are kept (never drop a live market on missing data).
+        at/before that time (from ``endDate``) are returned; markets with no close_time
+        are kept (never drop a live market on missing data).
         """
         out: list[MarketQuote] = []
         seen: set[str] = set()
@@ -560,37 +649,28 @@ class PolymarketUSVenue:
                     continue
                 seen.add(slug)
                 new += 1  # progress through the feed (counts even if out-of-window)
-                # Capture order constraints for place_order (don't infer from slug/type).
-                self._meta[slug] = {
-                    "tick": _amount(m.get("orderPriceMinTickSize")),
-                    "min_qty": _amount(m.get("minimumTradeQty")),
-                }
-                close_time = parse_iso8601(m.get("endDate"))
-                # Targeted window: skip markets closing past it (keep unknown close).
-                if (
-                    max_close_ts is not None
-                    and close_time is not None
-                    and close_time > max_close_ts
-                ):
-                    continue
-                best_ask = _amount(m.get("bestAsk"))
-                best_bid = _amount(m.get("bestBid"))
-                out.append(
-                    MarketQuote(
-                        venue=VENUE,
-                        market_id=slug,
-                        title=build_market_title(m),
-                        yes_ask=best_ask,
-                        yes_ask_size=0.0,
-                        no_ask=round(1.0 - best_bid, 6) if best_bid is not None else None,
-                        no_ask_size=0.0,
-                        close_time=close_time,
-                    )
-                )
+                q = self._market_to_quote(m, max_close_ts)
+                if q is not None:
+                    out.append(q)
             offset += len(markets)
             # No new slugs (offset ignored / end of feed), or a short page -> done.
             if new == 0 or len(markets) < page_size:
                 break
+
+        # Merge in the per-game markets nested under /v1/events (the flat feed above
+        # misses them). Isolated: an events-feed hiccup must not lose the /v1/markets scan.
+        try:
+            event_quotes = await self._scan_event_markets(max_close_ts=max_close_ts)
+            added = 0
+            for q in event_quotes:
+                if q.market_id not in seen:
+                    seen.add(q.market_id)
+                    out.append(q)
+                    added += 1
+            log.info("polymarket scan: %d flat markets + %d per-game (events) = %d total",
+                     len(out) - added, added, len(out))
+        except Exception as exc:
+            log.warning("polymarket /v1/events scan failed (%s); flat /v1/markets only", exc)
         return out
 
     async def fetch_quote(self, market: RawMarket) -> MarketQuote | None:

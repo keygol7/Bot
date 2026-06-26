@@ -250,6 +250,54 @@ def test_kalshi_scan_quotes_paginates_cursor():
     assert seen_params[1]["limit"] == "500"              # remaining cap, not a full page
 
 
+def test_polymarket_scan_quotes_volume_gate_drops_thin_markets():
+    # The liquidity gate drops low-24h-volume markets (the thin set whose Polymarket hedge
+    # 500s -> naked maker) and keeps liquid ones — using real traded volume, not /book depth.
+    def handler(req):
+        if req.url.path.endswith("/v1/events"):
+            return httpx.Response(200, json={"events": []})
+        return httpx.Response(200, json={"markets": [
+            {"slug": "liquid-game", "question": "Liquid", "bestAsk": "0.40", "bestBid": "0.38",
+             "volume24hr": "9000"},
+            {"slug": "thin-prop", "question": "Thin", "bestAsk": "0.02", "bestBid": "0.01",
+             "volume24hr": "120"},
+            {"slug": "no-vol-field", "question": "Unknown", "bestAsk": "0.40", "bestBid": "0.38"},
+        ]})
+
+    cfg = QcexConfig(min_volume_24h=1000)
+    v = PolymarketUSVenue(cfg)
+    v._gateway_client = _client(handler, cfg.gateway_base)
+    ids = {q.market_id for q in asyncio.run(v.scan_quotes(5000))}
+    assert "liquid-game" in ids       # vol 9000 >= 1000 -> kept
+    assert "thin-prop" not in ids     # vol 120 < 1000 -> dropped (the 500-prone set)
+    assert "no-vol-field" in ids      # missing volume -> fail open (kept)
+
+
+def test_kalshi_account_snapshot_reads_position_fp():
+    # The LIVE positions API carries the signed contract count as "position_fp" (decimal
+    # string); the older "position" field is absent. Reading only "position" reported every
+    # held position as flat -> the startup guard could trade on top of an open position.
+    def handler(req):
+        if req.url.path.endswith("/portfolio/balance"):
+            return httpx.Response(200, json={"balance_dollars": "138.34"})
+        return httpx.Response(200, json={"market_positions": [
+            {"ticker": "KXMLBGAME-26JUN271610KCCWS-KC", "position_fp": "4.00",
+             "resting_orders_count": 0},
+            {"ticker": "KXMLBGAME-26JUN271910CHCMIL-CHC", "position_fp": "-4.00",
+             "resting_orders_count": 0},
+            {"ticker": "KX-FLAT", "position_fp": "0.00", "resting_orders_count": 0},
+        ]})
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    snap = asyncio.run(v.account_snapshot())
+    held = {p.market_id: p.quantity for p in snap.positions}
+    assert held == {"KXMLBGAME-26JUN271610KCCWS-KC": 4.0,
+                    "KXMLBGAME-26JUN271910CHCMIL-CHC": -4.0}   # flat row dropped
+    assert snap.balance == 138.34
+
+
 def test_kalshi_scan_quotes_unbounded_scans_whole_board():
     # limit<=0 -> scan the ENTIRE feed: follow the cursor across pages until exhausted,
     # requesting full 1000-market pages (not a shrinking remainder).
@@ -298,6 +346,9 @@ def test_polymarket_scan_quotes_paginates_offset():
     seen_offsets = []
 
     def handler(req):
+        # /v1/events is the per-game source (empty here — this test covers /v1/markets paging).
+        if req.url.path.endswith("/v1/events"):
+            return httpx.Response(200, json={"events": []})
         off = int(req.url.params.get("offset", "0"))
         seen_offsets.append(off)
         return httpx.Response(200, json=page("A", 500) if off == 0 else page("B", 100))
@@ -323,6 +374,42 @@ def test_polymarket_scan_quotes_stops_when_offset_ignored():
     v._gateway_client = _client(handler, cfg.gateway_base)
     quotes = asyncio.run(v.scan_quotes(5000))
     assert len(quotes) == 500                      # only the unique first page kept
+
+
+def test_polymarket_scan_quotes_includes_per_game_event_markets():
+    # The per-GAME markets live nested under /v1/events, not the flat /v1/markets feed.
+    # scan_quotes must flatten them in (deduped) so live game lines are matchable.
+    def handler(req):
+        if req.url.path.endswith("/v1/events"):
+            if int(req.url.params.get("offset", "0")) != 0:
+                return httpx.Response(200, json={"events": []})
+            return httpx.Response(200, json={"events": [
+                {"ticker": "mlb-kc-tb-2026-06-25", "markets": [
+                    {"slug": "aec-mlb-kc-tb-2026-06-25", "active": True, "closed": False,
+                     "question": "Kansas City Royals vs. Tampa Bay Rays",
+                     "endDate": "2026-06-25T23:59:00Z"},
+                    {"slug": "astatc-mlb-kc-tb-2026-06-25-xi", "active": True, "closed": False,
+                     "question": "Will KC vs TB go to extra innings?",
+                     "endDate": "2026-07-09T16:10:00Z"},
+                    # a settled sub-market inside the live event -> must be skipped
+                    {"slug": "astatc-mlb-kc-tb-2026-06-25-yrfi", "active": True, "closed": True,
+                     "question": "Yes run first inning?"},
+                ]},
+            ]})
+        # flat /v1/markets feed: one futures market
+        return httpx.Response(200, json={"markets": [
+            {"slug": "tec-mlb-champ-2026-09-27-tb", "question": "World Series Champion",
+             "bestAsk": "0.10", "bestBid": "0.08"}]})
+
+    cfg = QcexConfig()
+    v = PolymarketUSVenue(cfg)
+    v._gateway_client = _client(handler, cfg.gateway_base)
+    quotes = asyncio.run(v.scan_quotes(5000))
+    ids = {q.market_id for q in quotes}
+    assert "tec-mlb-champ-2026-09-27-tb" in ids          # flat feed kept
+    assert "aec-mlb-kc-tb-2026-06-25" in ids             # per-game moneyline added
+    assert "astatc-mlb-kc-tb-2026-06-25-xi" in ids       # per-game prop added
+    assert "astatc-mlb-kc-tb-2026-06-25-yrfi" not in ids  # settled sub-market skipped
 
 
 def test_kalshi_scan_quotes_targeted_close_window():
@@ -455,7 +542,7 @@ def test_polymarket_scan_sends_end_date_max_and_captures_meta():
     asyncio.run(v.scan_quotes(50, max_close_ts=window))
     expected = datetime.fromtimestamp(window, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     assert seen[0]["endDateMax"] == expected          # server-side filter sent
-    assert v._meta["m1"] == {"tick": 0.005, "min_qty": 0.01}   # constraints captured
+    assert v._meta["m1"] == {"tick": 0.005, "min_qty": 0.01, "volume24hr": None}  # constraints + vol captured
 
 
 def test_polymarket_place_order_snaps_to_tick_and_min_qty():

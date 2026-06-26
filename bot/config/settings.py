@@ -82,6 +82,10 @@ class QcexConfig:
     # Read request budget (req/min) for the public gateway. 300 (5/s) is a safe default;
     # raise toward the gateway's real limit for a faster refresh, lower it on HTTP 429s.
     read_rate_per_min: float = 300.0
+    # Liquidity gate: drop markets whose 24h traded volume is below this from the scan. Real
+    # volume (NOT the phantom /book depth) is the reliable signal for "the hedge will fill" —
+    # thin markets are where Polymarket 500s the hedge and a resting maker goes naked. 0 = off.
+    min_volume_24h: float = 0.0
 
     @property
     def is_trading_configured(self) -> bool:
@@ -122,6 +126,11 @@ class Settings:
     # (are_complementary) instead of the series/title allowlists. Optionally restrict to
     # specific metrics (e.g. "winner") for a staged rollout; empty = all matchable.
     match_use_fingerprint: bool = False
+    # When true AND match_use_fingerprint is on, the watchlist is the UNION of the
+    # deterministic fingerprint sweep and the LLM match_verdicts cache (max recall: a pair
+    # either matcher finds is admitted; a shared fan-out backstop drops pairs the two
+    # disagree on). Requires STREAM_DISCOVERY=true so the verdict half stays populated.
+    match_combine_verdicts: bool = False
     match_fingerprint_metrics: frozenset = field(default_factory=frozenset)
     # Fingerprint sweep recency: drop markets whose EVENT date is more than this many days
     # in the past. Settled games linger in the markets table (never pruned); without this
@@ -168,6 +177,10 @@ class Settings:
     # real venue-lag edge holds for seconds. So this filters skew-phantoms without a slow
     # REST confirm. 0 = act on first sighting (off). ~0.75 is a reasonable in-play value.
     stream_edge_persist_secs: float = 0.0
+    # Sub-100ms sync path: if BOTH legs tick within this tight window (synced cross-feed,
+    # not a one-sided flicker), a deep edge fires WITHOUT the persist wait. ~0.05 (50ms) is
+    # a reasonable value; 0 = disabled (always use the persist path).
+    stream_sync_window_secs: float = 0.0
     # Streaming slow-loop cadence (s): how often the watchlist is rebuilt + re-primed. Lower
     # = newly-listed markets enter the watchlist sooner, at the cost of more REST traffic.
     # The prime is now concurrent (below), so a lower value is feasible.
@@ -185,6 +198,24 @@ class Settings:
     # firing threshold = RISK_MIN_EDGE + this. 0 = off (chase thin edges, may unwind).
     # Ignored in maker mode (the maker captures the spread, so thin edges need no buffer).
     exec_hedge_buffer: float = 0.03
+    # Which venue fires FIRST in a two-FOK hybrid TAKE (the rejection-prone one, so its
+    # failure is a clean skip not an unwind). "" = same as the maker-rest venue. Set to
+    # "polymarket_us" so its 500s on thin markets become free skips instead of Kalshi unwinds.
+    exec_take_first_venue: str = ""
+    # Implausible-edge guard: skip any "arb" whose edge exceeds this — a real cross-venue arb
+    # is bounded by arbitrage to a few %, so a larger edge means the legs aren't complements
+    # (a false same-event match). ~0.06-0.08 is sane; 0 = off.
+    exec_max_plausible_edge: float = 0.0
+    # Empirical same-event confirmation: a pair must show >= this many YES+NO-sum samples
+    # whose MEAN is >= match_empirical_sum_floor before it can TRADE (price behavior is the
+    # authority, not the structural/LLM match). 0 = disabled. Floor ~0.93 separates real
+    # arbs (mean ~1.0) from false matches (R6-vs-CoD mean ~0.68).
+    match_empirical_min_obs: int = 0
+    match_empirical_sum_floor: float = 0.93
+    # Maker-volume gate: a market may host a resting MAKER only if its 24h volume clears this
+    # (thin hedges 500 -> naked maker). Thin markets stay TAKE-able (a 500 there is a clean
+    # skip via the leg-order fix). 0 = no gate. Distinct from QCEX_MIN_VOLUME_24H (universe).
+    exec_maker_min_volume_24h: float = 0.0
     # Maker mode: capture THIN edges by RESTING the fee-heavy (Kalshi) leg as a maker
     # (no slippage / lower fee), then TAKING the deep (Polymarket) leg the instant it
     # fills. The firing threshold drops to just RISK_MIN_EDGE (no hedge buffer needed).
@@ -261,6 +292,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
             ),
             use_sandbox=(env("QCEX_USE_SANDBOX", "false") or "false").lower() == "true",
             read_rate_per_min=_env_float("QCEX_READ_RATE_PER_MIN", QcexConfig.read_rate_per_min),
+            min_volume_24h=_env_float("QCEX_MIN_VOLUME_24H", 0.0),
         ),
         llm=LLMConfig(
             base_url=env("LLM_BASE_URL", LLMConfig.base_url),
@@ -273,6 +305,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
             max_daily_loss=_env_float("RISK_MAX_DAILY_LOSS", 500.0),
             min_edge=_env_float("RISK_MIN_EDGE", 0.01),
             max_order_contracts=_env_float("RISK_MAX_ORDER_CONTRACTS", 2.0),
+            max_position_fraction=_env_float("RISK_MAX_POSITION_FRACTION", 1.0),
         ),
         db_path=env("BOT_DB_PATH", "data/bot.db"),
         startup_min_balance=_env_float("STARTUP_MIN_BALANCE", 0.0),
@@ -284,6 +317,9 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         ).lower() == "true",
         match_use_fingerprint=(
             env("MATCH_USE_FINGERPRINT", "false") or "false"
+        ).lower() == "true",
+        match_combine_verdicts=(
+            env("MATCH_COMBINE_VERDICTS", "false") or "false"
         ).lower() == "true",
         # Keep ONLY recognized metric names — so a malformed value (e.g. an inline
         # comment captured as the value, or a stray token) degrades to "all matchable"
@@ -302,10 +338,16 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         stream_min_leg_price=_env_float("STREAM_MIN_LEG_PRICE", 0.02),
         stream_edge_snapshot_top=int(_env_float("STREAM_EDGE_SNAPSHOT_TOP", 5)),
         stream_edge_persist_secs=_env_float("STREAM_EDGE_PERSIST_SECS", 0.0),
+        stream_sync_window_secs=_env_float("STREAM_SYNC_WINDOW_SECS", 0.0),
         stream_refresh_secs=_env_float("STREAM_REFRESH_SECS", 300.0),
         stream_prime_concurrency=int(_env_float("STREAM_PRIME_CONCURRENCY", 8)),
         stream_min_poly_depth=_env_float("STREAM_MIN_POLY_DEPTH", 0.0),
         exec_hedge_buffer=_env_float("EXEC_HEDGE_BUFFER", 0.03),
+        exec_take_first_venue=(env("EXEC_TAKE_FIRST_VENUE", "") or "").strip(),
+        exec_max_plausible_edge=_env_float("EXEC_MAX_PLAUSIBLE_EDGE", 0.0),
+        match_empirical_min_obs=int(_env_float("MATCH_EMPIRICAL_MIN_OBS", 0)),
+        match_empirical_sum_floor=_env_float("MATCH_EMPIRICAL_SUM_FLOOR", 0.93),
+        exec_maker_min_volume_24h=_env_float("EXEC_MAKER_MIN_VOLUME_24H", 0.0),
         exec_maker_mode=(env("EXEC_MAKER_MODE", "false") or "false").lower() == "true",
         exec_maker_timeout=_env_float("EXEC_MAKER_TIMEOUT", 5.0),
         exec_maker_improvement=_env_float("EXEC_MAKER_IMPROVEMENT", 0.01),

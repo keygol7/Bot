@@ -119,6 +119,22 @@ CREATE TABLE IF NOT EXISTS audit_log (
     kind    TEXT,
     payload TEXT
 );
+
+-- Empirical false-match learning loop: pairs CONFIRMED to not be the same event (their
+-- prices don't behave as complements). Persists the engine's empirical verdict so a known
+-- false match (e.g. R6 vs CoD) is excluded from matching across restarts — never re-observed,
+-- never re-traded. Order-independent key (venue_a/market_a < venue_b/market_b).
+CREATE TABLE IF NOT EXISTS match_blacklist (
+    venue_a   TEXT NOT NULL,
+    market_a  TEXT NOT NULL,
+    venue_b   TEXT NOT NULL,
+    market_b  TEXT NOT NULL,
+    reason    TEXT,
+    mean_sum  REAL,
+    samples   INTEGER,
+    ts        REAL,
+    PRIMARY KEY (venue_a, market_a, venue_b, market_b)
+);
 """
 
 
@@ -241,6 +257,40 @@ class Store:
         # Order-independent: a pair is the same regardless of argument order.
         return tuple(sorted([(va, ma), (vb, mb)]))[0] + tuple(sorted([(va, ma), (vb, mb)]))[1]
 
+    # ---- empirical false-match blacklist (Layer 2 learning loop) ----
+    def blacklist_pair(self, va: str, ma: str, vb: str, mb: str, *,
+                       reason: str = "", mean_sum: float | None = None,
+                       samples: int | None = None) -> None:
+        """Persist a CONFIRMED false match so it's excluded from matching forever (the
+        engine calls this when a pair's price behavior empirically proves the legs aren't
+        complements). Order-independent; idempotent (keeps the latest verdict)."""
+        a, ma2, b, mb2 = self._pair_key(va, ma, vb, mb)
+        self.conn.execute(
+            """INSERT INTO match_blacklist
+                 (venue_a, market_a, venue_b, market_b, reason, mean_sum, samples, ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(venue_a, market_a, venue_b, market_b) DO UPDATE SET
+                 reason=excluded.reason, mean_sum=excluded.mean_sum,
+                 samples=excluded.samples, ts=excluded.ts""",
+            (a, ma2, b, mb2, reason, mean_sum, samples, time.time()),
+        )
+        self.conn.commit()
+
+    def blacklisted_keys(self) -> set:
+        """All confirmed false-match pairs as order-independent keys, for fast exclusion."""
+        return {
+            (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
+            for r in self.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM match_blacklist")
+        }
+
+    def _drop_blacklisted(self, pairs: list[tuple]) -> list[tuple]:
+        """Remove any confirmed false-match pairs from a watchlist result."""
+        bl = self.blacklisted_keys()
+        if not bl:
+            return pairs
+        return [p for p in pairs if self._pair_key(p[0], p[1], p[2], p[3]) not in bl]
+
     def cache_verdict(
         self, va: str, ma: str, vb: str, mb: str, *,
         same_event: bool, confidence: float, rationale: str = "",
@@ -267,12 +317,25 @@ class Store:
         self, min_confidence: float = 0.85, max_fanout: Optional[int] = 1,
         drop_scope_mismatch: bool = True, safe_types_only: bool = True,
         use_fingerprint: bool = False, fingerprint_metrics: Optional[frozenset] = None,
-        sweep_max_past_s: Optional[float] = None,
+        sweep_max_past_s: Optional[float] = None, combine_verdicts: bool = False,
     ) -> list[tuple]:
         """Cached tradeable pairs: (venue_a, market_a, venue_b, market_b, event_key).
 
         The durable source of truth for the streaming watchlist — independent of
-        per-cycle embedding/LLM variance. Four gates are applied:
+        per-cycle embedding/LLM variance. Three matcher modes:
+
+        * ``use_fingerprint=False`` — LLM ``match_verdicts`` cache only (with the
+          scope/type/series + fan-out guards below).
+        * ``use_fingerprint=True, combine_verdicts=False`` — deterministic fingerprint
+          sweep only (``_fingerprint_sweep``); the verdict cache is ignored.
+        * ``use_fingerprint=True, combine_verdicts=True`` — **UNION** of both, for the
+          most matches without losing precision: a pair from EITHER matcher is admitted,
+          deduped by order-independent pair key (a pair both find counts once = mutually
+          confirmed), then a SINGLE shared fan-out backstop drops any market the two
+          disagree on (mapped to >1 counterparty → ambiguous). Net recall ≥ either method
+          alone; each survivor is vetted by its own precision bar and conflicts are caught.
+
+        Verdict-side gates (also applied to the verdict half of the union):
 
         1. The SAME confidence gate as ``MatchVerdict.tradeable`` (confirmed same-event
            AND ``confidence >= min_confidence``). Without it the streamer would trade
@@ -289,8 +352,38 @@ class Store:
            market maps to many counterparties (see :func:`drop_fanout_pairs`). Pass
            ``None`` to disable.
         """
-        if use_fingerprint:
-            return self._fingerprint_sweep(fingerprint_metrics, max_fanout, sweep_max_past_s)
+        if use_fingerprint and not combine_verdicts:
+            return self._drop_blacklisted(
+                self._fingerprint_sweep(fingerprint_metrics, max_fanout, sweep_max_past_s))
+
+        verdict = self._verdict_pairs(min_confidence, drop_scope_mismatch, safe_types_only)
+        if not use_fingerprint:
+            # LLM verdict cache only.
+            return self._drop_blacklisted(
+                drop_fanout_pairs(verdict, max_fanout=max_fanout)
+                if max_fanout is not None else verdict)
+
+        # UNION mode: merge the deterministic sweep with the LLM verdicts. Fingerprint
+        # legs are kalshi-first and "kalshi" sorts before "polymarket_us", so both
+        # sources put the Kalshi leg in slot A — the shared fan-out below counts degree
+        # consistently across them. Pull the sweep WITHOUT its own fan-out so the backstop
+        # runs once over the combined set (a market the two map to different counterparties
+        # is ambiguous and both pairs drop). Dedup keeps the first occurrence per pair key.
+        fp = self._fingerprint_sweep(fingerprint_metrics, None, sweep_max_past_s)
+        merged: dict = {}
+        for p in (*fp, *verdict):
+            merged.setdefault(self._pair_key(p[0], p[1], p[2], p[3]), p)
+        pairs = list(merged.values())
+        if max_fanout is not None:
+            pairs = drop_fanout_pairs(pairs, max_fanout=max_fanout)
+        return self._drop_blacklisted(pairs)
+
+    def _verdict_pairs(
+        self, min_confidence: float, drop_scope_mismatch: bool, safe_types_only: bool,
+    ) -> list[tuple]:
+        """LLM ``match_verdicts`` confirmed same-event pairs with the scope/type/series
+        precision guards applied. Pre-fan-out — the caller owns the fan-out backstop so it
+        can run once over a union. See :meth:`confirmed_pairs` for gate descriptions."""
         rows = self.conn.execute(
             """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b, v.event_key,
                       ma.title AS title_a, mb.title AS title_b
@@ -319,8 +412,6 @@ class Store:
             pairs.append(
                 (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], r["event_key"])
             )
-        if max_fanout is not None:
-            pairs = drop_fanout_pairs(pairs, max_fanout=max_fanout)
         return pairs
 
     def _fingerprint_sweep(

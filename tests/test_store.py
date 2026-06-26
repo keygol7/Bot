@@ -174,6 +174,23 @@ def test_confirmed_pairs_returns_only_same_event():
     s.close()
 
 
+def test_blacklist_excludes_confirmed_false_match():
+    # Layer 2 learning loop: a pair persisted to the false-match blacklist is excluded from
+    # the watchlist forever (across restarts) — order-independent, regardless of matcher mode.
+    s = Store(":memory:")
+    s.cache_verdict("kalshi", "K1", "polymarket_us", "P1", same_event=True, confidence=0.95, event_key="E1")
+    s.cache_verdict("kalshi", "K2", "polymarket_us", "P2", same_event=True, confidence=0.95, event_key="E2")
+    assert len({(p[0], p[1]) for p in s.confirmed_pairs(safe_types_only=False)}) == 2
+    # Blacklist the K1/P1 pair (e.g. R6-vs-CoD: empirically not complements). Use the OTHER
+    # argument order to prove order-independence.
+    s.blacklist_pair("polymarket_us", "P1", "kalshi", "K1", reason="mean sum 0.68", samples=36)
+    pairs = s.confirmed_pairs(safe_types_only=False)
+    assert {(p[0], p[1]) for p in pairs} == {("kalshi", "K2")}   # K1/P1 gone, K2/P2 kept
+    assert ("kalshi", "K1", "polymarket_us", "P1") in s.blacklisted_keys() \
+        or ("polymarket_us", "P1", "kalshi", "K1") in s.blacklisted_keys()
+    s.close()
+
+
 def test_confirmed_pairs_applies_confidence_floor():
     # A same_event=True but LOW-confidence verdict must NOT reach the watchlist —
     # it isn't tradeable, so the streamer must never see it.

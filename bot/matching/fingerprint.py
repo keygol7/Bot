@@ -70,7 +70,13 @@ _KALSHI_SERIES_METRIC: list[tuple[str, str]] = [
 # wins, so more specific needles precede generic ones.
 _LEAGUE_RULES: list[tuple[str, str]] = [
     ("VALORANT", "valorant"), ("DOTA2", "dota2"), ("DOTA", "dota2"),
-    ("CS2", "cs2"), ("CSGO", "cs2"), ("LOL", "lol"), ("COD", "cod"),
+    ("CS2", "cs2"), ("CSGO", "cs2"), ("CS", "cs2"), ("LOL", "lol"),
+    # Distinct esports titles — orgs (100T, Thieves, FaZe...) field teams in SEVERAL of
+    # these, so without a league tag a shared org token cross-matches DIFFERENT games
+    # (the R6-vs-CoD false match). Tag each title so the league guard separates them.
+    ("CALLOFDUTY", "cod"), ("COD", "cod"), ("RAINBOW", "rainbow6"), ("R6", "rainbow6"),
+    ("ROCKETLEAGUE", "rocketleague"), ("RL", "rocketleague"), ("OVERWATCH", "overwatch"),
+    ("HALO", "halo"), ("APEX", "apex"), ("FORTNITE", "fortnite"),
     ("UFC", "mma"), ("BELLATOR", "mma"), ("PFL", "mma"),
     ("ATP", "tennis"), ("WTA", "tennis"), ("ITF", "tennis"), ("TENNIS", "tennis"),
     ("WNBA", "basketball"), ("NBA", "basketball"),
