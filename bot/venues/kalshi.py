@@ -655,7 +655,11 @@ class KalshiVenue:
     async def cancel_order(self, order_id: str) -> dict:
         if not self.authenticated:
             raise OrderNotPermitted("Kalshi credentials not configured")
-        path = f"/portfolio/orders/{order_id}"
+        # V2 cancel. The legacy DELETE /portfolio/orders/{id} was deprecated -> HTTP 410
+        # "deprecated_v1_order_endpoint" (live 2026-06-26), which silently broke maker
+        # cancel-on-timeout/drift. The V2 path mirrors the create endpoint family
+        # (POST /portfolio/events/orders); only the self-expiry was still cancelling makers.
+        path = f"/portfolio/events/orders/{order_id}"
         await self._limiter.wait()
         resp = await self._http().request(
             "DELETE", path, headers=self._auth_headers("DELETE", path)
@@ -729,7 +733,14 @@ class KalshiVenue:
             return None
         order = data.get("order") if isinstance(data, dict) else None
         order = order if isinstance(order, dict) else (data if isinstance(data, dict) else {})
-        fc = order.get("fill_count")
+        # The order RECORD reports fills as the fixed-point string `fill_count_fp` (e.g.
+        # "0.00"/"2.00") — NOT `fill_count` (which is null here). Reading the wrong field
+        # returned None for a cleanly-unfilled maker, which the executor's fail-closed
+        # path read as "venue unreadable" and HALTED on. Prefer fill_count_fp; "0.00"
+        # is an authoritative ZERO fill (clean no-trade), not an unreadable state.
+        fc = order.get("fill_count_fp")
+        if fc in (None, ""):
+            fc = order.get("fill_count")
         return float(fc) if fc not in (None, "") else None
 
     async def fills(self, *, limit: int = 200, ticker: str | None = None) -> list[dict]:
