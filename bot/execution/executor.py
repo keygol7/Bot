@@ -515,6 +515,28 @@ class Executor:
 
         self._audit("execute_start", opp, size=size)
 
+        # Reserve the estimated leg cost in the cached balance SYNCHRONOUSLY (before any
+        # await) so a CONCURRENT fast-loop execution sees the drain immediately and doesn't
+        # over-commit a draining venue -> a leg's insufficient_balance reject -> unwind. The
+        # cache otherwise only refreshes on the slow (~minutes) loop and decrements at settle,
+        # so two arbs firing together both read the full balance. Released in finally; the
+        # real per-fill accounting stays in _settle_success / _unwind.
+        reservation: dict[str, float] = {}
+        reservation[first[0]] = reservation.get(first[0], 0.0) + first[3] * size
+        reservation[second[0]] = reservation.get(second[0], 0.0) + second[3] * size
+        for _v, _amt in reservation.items():
+            self._spend(_v, _amt)
+        try:
+            return await self._fire_and_settle(
+                opp, size, first, second, first_venue, second_venue)
+        finally:
+            for _v, _amt in reservation.items():
+                self._spend(_v, -_amt)
+
+    async def _fire_and_settle(self, opp, size, first, second, first_venue, second_venue):
+        """Fire leg 1 (rejection-prone) then leg 2 (hedge), then resolve the outcome:
+        settle a locked arb, unwind a clean leg-2 failure, or halt on an ambiguous state.
+        Split out of execute() so its balance reservation can wrap this in try/finally."""
         # ----- Leg 1: the rejection-prone leg, fill-or-kill -----
         leg1 = await self._place(
             first_venue, first[1], first[2], "buy", first[3], size, "fill_or_kill"

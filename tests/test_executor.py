@@ -90,6 +90,53 @@ def test_leg2_killed_unwinds_leg1():
     assert yes.calls[1][2] == "sell"                 # second yes call was the unwind
 
 
+def test_reservation_drains_cache_before_legs_fire():
+    # The fire-time reservation must reduce the cached balance for BOTH legs BEFORE any
+    # order is placed — so a concurrent fast-loop execution sees the drain and won't
+    # over-commit a draining venue (the insufficient_balance-reject -> unwind bug).
+    holder, seen = {}, {}
+
+    class CheckVenue(FakeVenue):
+        async def place_order(self, market_id, side, action, price, contracts, **k):
+            seen.setdefault(self.name, holder["ex"]._balance(self.name))  # cache AT fire
+            return await super().place_order(market_id, side, action, price, contracts, **k)
+
+    kalshi = CheckVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    poly = CheckVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
+    ex, risk = make_exec([kalshi, poly])
+    holder["ex"] = ex
+    ex._balances = {"kalshi": 100.0, "poly": 100.0}
+    rep = asyncio.run(ex.execute(opp(yv="kalshi", nv="poly", yes_price=0.40, no_price=0.55)))
+    assert rep.status is ExecStatus.SUCCESS
+    assert seen["kalshi"] < 100.0 and seen["poly"] < 100.0   # reserved before firing
+
+
+def test_reservation_releases_leaving_only_actual_spend():
+    # After the trade, the reservation is released and only the ACTUAL fill cost remains
+    # debited (kalshi 2*0.40, poly 2*0.55) — the reserve nets out, no double-counting.
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    poly = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
+    ex, risk = make_exec([kalshi, poly])
+    ex._balances = {"kalshi": 100.0, "poly": 100.0}
+    asyncio.run(ex.execute(opp(yv="kalshi", nv="poly", yes_price=0.40, no_price=0.55)))
+    assert round(ex._balances["kalshi"], 2) == round(100.0 - 2 * 0.40, 2)
+    assert round(ex._balances["poly"], 2) == round(100.0 - 2 * 0.55, 2)
+
+
+def test_reservation_released_on_skip_leaves_balance_intact():
+    # Leg 1 doesn't fill -> clean skip. The reservation must be released so the cache is
+    # unchanged (no phantom drain that would wrongly throttle the next trade).
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.KILLED, 0, None)])
+    poly = FakeVenue("poly", [])
+    risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({v.name: v for v in [kalshi, poly]}, risk,
+                  fee_models={v.name: ZeroFeeModel() for v in [kalshi, poly]},
+                  max_order_contracts=2, take_first_venue="kalshi")
+    ex._balances = {"kalshi": 100.0, "poly": 100.0}
+    asyncio.run(ex.execute(opp(yv="kalshi", nv="poly", yes_price=0.40, no_price=0.55)))
+    assert ex._balances["kalshi"] == 100.0 and ex._balances["poly"] == 100.0
+
+
 def test_min_venue_balance_skips_drained_hedge_leg():
     # A venue too drained to fund its leg must NOT trade — else we'd fire the first leg and
     # the second rejects for insufficient_balance, leaving a naked position (Kalshi at $0.38).
