@@ -667,6 +667,14 @@ async def stream(
             return None
         return await v.fetch_quote(RawMarket(market_id=market_id, title="", raw={}))
 
+    async def open_check(venue_name: str, market_id: str):
+        # Authoritative open/settled status for one market (reads the venue's status field,
+        # which the orderbook quote omits) — lets the reconcile tell a settled-leg leftover
+        # from a stranded hedge. True=open, False=settled/closed, None=unknown.
+        v = venue_by_name.get(venue_name)
+        fn = getattr(v, "is_open", None) if v is not None else None
+        return await fn(market_id) if fn is not None else None
+
     # Maker mode captures the spread (no slippage), so thin edges need no hedge buffer —
     # fire at just min_edge. Taker mode requires the buffer (fire at min_edge + buffer)
     # so the hedge fills through movement instead of unwinding.
@@ -704,6 +712,7 @@ async def stream(
 
     engine = StreamingEngine(
         executor=executor, fee_models=fee_models, min_edge=fire_threshold, depth_fetch=depth_fetch,
+        open_check=open_check,
         maker_eligible=maker_eligible,
         max_plausible_edge=settings.exec_max_plausible_edge,
         empirical_min_obs=settings.match_empirical_min_obs,

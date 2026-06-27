@@ -74,6 +74,7 @@ class StreamingEngine:
         livebook: LiveBook | None = None,
         clock=time.monotonic,
         depth_fetch=None,
+        open_check=None,
         max_ws_quote_age: float = 2.0,
         min_leg_price: float = 0.0,
         store=None,
@@ -166,6 +167,10 @@ class StreamingEngine:
         # WS ticker feeds carry no size (Kalshi), so before firing on a price edge we
         # re-fetch real order-book depth (which also re-validates the price).
         self.depth_fetch = depth_fetch
+        # open_check(venue, market) -> True/False/None: authoritative settled status from the
+        # venue's status field (the orderbook quote omits it — Kalshi reports state=None even
+        # when finalized). Lets the reconcile tell a settled-leg leftover from a stranded leg.
+        self.open_check = open_check
         self._pairs: dict[tuple, ConfirmedPair] = {}
         self._index: dict[tuple[str, str], set] = {}   # (venue,market) -> set of pair keys
         self._last_acted: dict[tuple, float] = {}
@@ -696,19 +701,27 @@ class StreamingEngine:
         return imbalanced
 
     async def _pair_leg_settled(self, p) -> bool:
-        """True if either of a pair's legs has a SETTLED/non-OPEN market (live-checked) — so
-        a 0-vs-N imbalance is a realized arb leftover, not a stranded hedge. A leg we can't
+        """True if either of a pair's legs has a SETTLED market — so a 0-vs-N imbalance is a
+        realized arb leftover, not a stranded hedge. Checks the venue's authoritative status
+        (open_check: Kalshi reports finalized/settled here but state=None in the quote) and,
+        as a fallback, a non-OPEN quote state (Poly reports EXPIRED there). A leg we can't
         read is left as-is (fail toward halting -> a human verifies)."""
-        if self.depth_fetch is None:
-            return False
         for venue, market in ((p.venue_a, p.market_a), (p.venue_b, p.market_b)):
-            try:
-                q = await self.depth_fetch(venue, market)
-            except Exception:
-                q = None
-            state = getattr(q, "state", None) if q is not None else None
-            if state is not None and state != self._OPEN_STATE:
-                return True
+            if self.open_check is not None:
+                try:
+                    is_open = await self.open_check(venue, market)
+                except Exception:
+                    is_open = None
+                if is_open is False:               # authoritatively settled/closed
+                    return True
+            if self.depth_fetch is not None:
+                try:
+                    q = await self.depth_fetch(venue, market)
+                except Exception:
+                    q = None
+                state = getattr(q, "state", None) if q is not None else None
+                if state is not None and state != self._OPEN_STATE:
+                    return True
         return False
 
     async def prime_and_sweep(self):

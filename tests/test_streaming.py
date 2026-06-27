@@ -79,22 +79,50 @@ def test_reconcile_skips_actively_trading_pair_then_halts_when_quiesced():
     assert fe.risk.is_killed
 
 
-def test_reconcile_does_not_halt_on_settled_leg_leftover():
-    # A hedged arb whose Poly leg EXPIRED (settled -> position 0) while the Kalshi leg
-    # remains is a REALIZED arb awaiting the other venue, not a stranded hedge. Live market
-    # state (one leg non-OPEN) must exclude it from the halt.
+def _settled_engine(open_states, depth_states):
     fe = _ExecR()
-    async def fetch(v, m):
-        return _open_quote("MARKET_STATE_EXPIRED" if v == "poly" else "MARKET_STATE_OPEN")
+    async def oc(v, m): return open_states.get(v)          # True/False/None per venue
+    async def fetch(v, m): return _open_quote(depth_states.get(v))
     eng = StreamingEngine(
         executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
         min_edge=0.01, cooldown=100.0, clock=lambda: 5000.0, reconcile_halt=True,
-        depth_fetch=fetch)
+        depth_fetch=fetch, open_check=oc)
     eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
-    snaps = [_snap("kalshi", [("K1", 2)]), _snap("poly", [])]   # kalshi=2 vs poly=0 (settled)
+    return eng, fe
+
+
+def test_reconcile_skips_poly_settled_leg_leftover():
+    # Poly leg EXPIRED (settled -> 0) while Kalshi remains: realized arb, not stranded.
+    eng, fe = _settled_engine(
+        open_states={"kalshi": True, "poly": False},
+        depth_states={"kalshi": "MARKET_STATE_OPEN", "poly": "MARKET_STATE_EXPIRED"})
+    snaps = [_snap("kalshi", [("K1", 2)]), _snap("poly", [])]
     asyncio.run(eng.reconcile_positions(snaps))
-    asyncio.run(eng.reconcile_positions(snaps))                 # would persist+halt if not skipped
-    assert not fe.risk.is_killed                                # settled leg -> no halt
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
+
+
+def test_reconcile_skips_kalshi_finalized_leg_leftover():
+    # Kalshi market FINALIZED (settled -> 0) while Poly remains open: Kalshi's quote state is
+    # None, so this relies on open_check (status field) reporting it settled -> no halt.
+    eng, fe = _settled_engine(
+        open_states={"kalshi": False, "poly": True},
+        depth_states={"kalshi": None, "poly": "MARKET_STATE_OPEN"})
+    snaps = [_snap("kalshi", []), _snap("poly", [("P1", 2)])]   # kalshi=0 vs poly=2
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
+
+
+def test_reconcile_halts_when_both_legs_open_real_naked():
+    # Both markets OPEN but imbalanced -> a genuine stranded hedge -> still halts.
+    eng, fe = _settled_engine(
+        open_states={"kalshi": True, "poly": True},
+        depth_states={"kalshi": "MARKET_STATE_OPEN", "poly": "MARKET_STATE_OPEN"})
+    snaps = [_snap("kalshi", []), _snap("poly", [("P1", 2)])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert fe.risk.is_killed
 
 
 def test_index_built_from_pairs():
