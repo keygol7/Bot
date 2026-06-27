@@ -621,7 +621,7 @@ class StreamingEngine:
                 report = r
         return report
 
-    def reconcile_positions(self, snapshots) -> list:
+    async def reconcile_positions(self, snapshots) -> list:
         """Cross-venue naked-exposure backstop, run each refresh cycle from the venue
         account snapshots. A locked arb holds EQUAL contracts on its two legs (YES on one
         venue, NO on the other), so for every confirmed pair the leg sizes should match;
@@ -630,6 +630,11 @@ class StreamingEngine:
         blip this warns on first sight and only trips the kill switch when the SAME pair is
         still imbalanced on the next check. Positions on markets not in any active pair are
         logged for visibility (their hedge can't be auto-verified). Returns the imbalances.
+
+        A leg whose market has SETTLED before its hedge (the recurring poly-settles-first
+        case: poly EXPIRED -> position 0, kalshi leg still open) is a REALIZED arb awaiting
+        the other venue's settlement, not a stranded leg — verified by live market state and
+        excluded from the halt (genuine stranded legs are caught at execution time).
         """
         pos: dict[tuple[str, str], float] = {}
         for snap in snapshots or []:
@@ -658,6 +663,19 @@ class StreamingEngine:
             log.info("RECONCILE: %d held position(s) on unpaired markets (verify hedged): %s",
                      len(untracked), ", ".join(f"{v}:{m}={q:g}" for v, m, q in untracked[:8]))
 
+        # Drop imbalances where a leg's market has SETTLED — a realized arb leftover, not a
+        # stranded hedge (those halt at execution time). Checked only on imbalance (rare).
+        if imbalanced:
+            kept = []
+            for p, qa, qb in imbalanced:
+                if await self._pair_leg_settled(p):
+                    log.info("RECONCILE: %s imbalanced (%s=%g vs %s=%g) but a leg has SETTLED "
+                             "— realized arb awaiting the other venue, not naked",
+                             p.event_key, p.venue_a, qa, p.venue_b, qb)
+                    continue
+                kept.append((p, qa, qb))
+            imbalanced = kept
+
         if not imbalanced:
             self._imbalanced_prev = set()
             return []
@@ -676,6 +694,22 @@ class StreamingEngine:
                          "until flat. Manually flatten the unhedged leg(s), then restart.",
                          len(repeat))
         return imbalanced
+
+    async def _pair_leg_settled(self, p) -> bool:
+        """True if either of a pair's legs has a SETTLED/non-OPEN market (live-checked) — so
+        a 0-vs-N imbalance is a realized arb leftover, not a stranded hedge. A leg we can't
+        read is left as-is (fail toward halting -> a human verifies)."""
+        if self.depth_fetch is None:
+            return False
+        for venue, market in ((p.venue_a, p.market_a), (p.venue_b, p.market_b)):
+            try:
+                q = await self.depth_fetch(venue, market)
+            except Exception:
+                q = None
+            state = getattr(q, "state", None) if q is not None else None
+            if state is not None and state != self._OPEN_STATE:
+                return True
+        return False
 
     async def prime_and_sweep(self):
         """Seed the live book with a REST snapshot of every watchlist market, then

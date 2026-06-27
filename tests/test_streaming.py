@@ -48,6 +48,11 @@ def _snap(venue, positions):
         positions=[SimpleNamespace(market_id=m, quantity=q, is_open=True) for m, q in positions])
 
 
+def _open_quote(state):
+    from types import SimpleNamespace
+    return SimpleNamespace(state=state)
+
+
 def test_reconcile_skips_actively_trading_pair_then_halts_when_quiesced():
     # A pair traded within the grace window shows a TRANSIENT burst imbalance (Poly fills
     # land instantly; Kalshi /positions lags) — it must NOT false-halt while active. Only
@@ -56,21 +61,40 @@ def test_reconcile_skips_actively_trading_pair_then_halts_when_quiesced():
     fe = _ExecR()
     eng = StreamingEngine(
         executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
-        min_edge=0.01, cooldown=100.0, clock=lambda: t[0], reconcile_halt=True)
+        min_edge=0.01, cooldown=100.0, clock=lambda: t[0], reconcile_halt=True,
+        depth_fetch=lambda v, m: _open_quote("MARKET_STATE_OPEN"))   # both legs OPEN
     eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
     key = next(iter(eng._pairs))
     snaps = [_snap("kalshi", [("K1", 34)]), _snap("poly", [("P1", 46)])]  # Δ12 mid-burst
 
     eng._last_acted[key] = 1000.0                       # pair just traded
-    eng.reconcile_positions(snaps)
-    eng.reconcile_positions(snaps)                      # two checks INSIDE the grace window
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))         # two checks INSIDE the grace window
     assert not fe.risk.is_killed                        # no false halt while actively trading
 
     t[0] = 1000.0 + 30.0                                # trading quiesces (> 25s grace)
-    eng.reconcile_positions(snaps)                      # first sighting after quiesce -> warn
+    asyncio.run(eng.reconcile_positions(snaps))         # first sighting after quiesce -> warn
     assert not fe.risk.is_killed
-    eng.reconcile_positions(snaps)                      # still imbalanced -> persistent -> halt
+    asyncio.run(eng.reconcile_positions(snaps))         # still imbalanced -> persistent -> halt
     assert fe.risk.is_killed
+
+
+def test_reconcile_does_not_halt_on_settled_leg_leftover():
+    # A hedged arb whose Poly leg EXPIRED (settled -> position 0) while the Kalshi leg
+    # remains is a REALIZED arb awaiting the other venue, not a stranded hedge. Live market
+    # state (one leg non-OPEN) must exclude it from the halt.
+    fe = _ExecR()
+    async def fetch(v, m):
+        return _open_quote("MARKET_STATE_EXPIRED" if v == "poly" else "MARKET_STATE_OPEN")
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 5000.0, reconcile_halt=True,
+        depth_fetch=fetch)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    snaps = [_snap("kalshi", [("K1", 2)]), _snap("poly", [])]   # kalshi=2 vs poly=0 (settled)
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))                 # would persist+halt if not skipped
+    assert not fe.risk.is_killed                                # settled leg -> no halt
 
 
 def test_index_built_from_pairs():
@@ -955,11 +979,12 @@ def test_reconcile_flags_and_halts_on_persistent_naked():
     eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
 
     # Kalshi holds 140, Polymarket holds nothing -> naked. First check warns, no halt.
+    # No depth_fetch -> can't verify a settled leg -> fails toward halt (real naked).
     snaps = [_snap("kalshi", [("K1", 140)]), _snap("poly", [])]
-    out = eng.reconcile_positions(snaps)
+    out = asyncio.run(eng.reconcile_positions(snaps))
     assert len(out) == 1 and not exc.risk.is_killed     # warned, not yet halted
     # Still naked on the next check -> trip the kill switch.
-    eng.reconcile_positions(snaps)
+    asyncio.run(eng.reconcile_positions(snaps))
     assert exc.risk.is_killed
 
 
@@ -972,7 +997,7 @@ def test_reconcile_balanced_pair_is_clean():
     eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
     # Equal contracts on both legs = a locked arb, not naked.
     snaps = [_snap("kalshi", [("K1", 140)]), _snap("poly", [("P1", 140)])]
-    assert eng.reconcile_positions(snaps) == []
+    assert asyncio.run(eng.reconcile_positions(snaps)) == []
 
 
 def test_preview_no_fill_backs_off_pair():

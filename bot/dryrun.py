@@ -744,7 +744,7 @@ async def stream(
                 apply_balance_caps(risk, snaps, settings.risk.max_position_fraction)
             # Cross-venue naked-exposure backstop: catch a position whose hedge never
             # landed (the failure mode behind the Ruzic loss), not just at startup.
-            engine.reconcile_positions(snaps)
+            await engine.reconcile_positions(snaps)
 
     async def refresh_specs():
         # Discovery cycle: scans markets + confirms/caches new pairs (embeddings/LLM).
