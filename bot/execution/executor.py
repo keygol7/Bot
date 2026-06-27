@@ -401,22 +401,24 @@ class Executor:
         return math.floor(max(0.0, min(caps.values()))), caps
 
     def _reliability_cap(self, venue: str, market_id: str) -> float:
-        """Contract ceiling a market's empirical FOK history earns it: full once it has
-        proven real depth (>= market_proven_fills fills), excluded once it has failed
-        >= market_max_fails times (consecutively, or without ever proving), else a tiny
-        probe to find out."""
+        """Contract ceiling a market's empirical FOK history earns it. Unproven markets get
+        a tiny probe; proven markets RAMP up with accumulated fills (not a jump to full);
+        a consecutive-fail streak (or repeated fails before proving) excludes."""
         fills, fails, streak = self._market_rel.get((venue, market_id), (0, 0, 0))
         # CONSECUTIVE fails exclude EVEN a once-proven market: a Valorant/tennis market that
-        # filled early then had its depth drain as the game wound down kept firing full size
-        # into vanished volume (5 fills/3 fails) -> repeated hedge-reject unwinds. A live fill
-        # resets the streak, so a healthy market with the odd miss stays uncapped.
+        # filled early then had its depth drain as the game wound down kept firing into
+        # vanished volume -> repeated hedge-reject unwinds. A live fill resets the streak.
         if streak >= self.market_max_fails:
             return 0.0
-        if fills >= self.market_proven_fills:
-            return math.inf
-        if fails >= self.market_max_fails:
-            return 0.0
-        return float(self.probe_contracts)
+        if fills < self.market_proven_fills:
+            if fails >= self.market_max_fails:
+                return 0.0
+            return float(self.probe_contracts)
+        # Proven -> RAMP, don't jump. Three 2-contract probe fills prove "2 fill", not "20
+        # do" — so a market whose depth is only good for small size must not immediately fire
+        # full size and unwind (the -$0.60 Lamine-Yamal jump). Each fill past the proving bar
+        # earns +probe_contracts; a fail trips the streak/exclusion before size grows large.
+        return float(self.probe_contracts) * (fills - self.market_proven_fills + 1)
 
     def _leg_limits(self, opp: ArbOpportunity, first_side, second_side) -> tuple[float, float]:
         """Limit prices for the (first, second) legs that may pay worse than the quoted

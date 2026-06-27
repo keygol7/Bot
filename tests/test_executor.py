@@ -192,16 +192,20 @@ def test_reliability_caps_unproven_market_to_probe_size():
     assert caps["reliability"] == 2 and size == 2
 
 
-def test_reliability_scales_proven_market_to_full_size():
-    # After 3 recorded fills the market is proven and the reliability cap lifts (inf),
-    # so other caps (depth/order) govern — the good low-volume arb scales up.
-    yes = FakeVenue("kalshi", [])
-    no = FakeVenue("poly", [])
-    ex = _rel_exec([yes, no])
-    ex._market_rel[("kalshi", "K1")] = (3, 0, 0)
+def test_reliability_ramps_proven_market_not_jump_to_full():
+    # Proving (3 small fills) must NOT jump straight to full size — the cap RAMPS with fills
+    # (probe * (fills - proven + 1)) so a market only proven at small size can't fire 20 and
+    # unwind (the Lamine-Yamal -$0.60 jump). At proving the cap still == probe.
+    ex = _rel_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])])
+    ex._market_rel[("kalshi", "K1")] = (3, 0, 0)       # just proven
     ex._market_rel[("poly", "P1")] = (3, 0, 0)
     _, caps = ex._max_size(opp(max_contracts=100))
-    assert caps["reliability"] == float("inf")
+    assert caps["reliability"] == 2                    # probe*(3-3+1) — no jump
+    # more fills earn more size: fills=8 -> probe*(8-3+1) = 12
+    ex._market_rel[("kalshi", "K1")] = (8, 0, 0)
+    ex._market_rel[("poly", "P1")] = (8, 0, 0)
+    _, caps2 = ex._max_size(opp(max_contracts=100))
+    assert caps2["reliability"] == 12
 
 
 def test_reliability_excludes_repeatedly_failing_market():
@@ -225,10 +229,10 @@ def test_reliability_excludes_proven_market_on_consecutive_fail_streak():
     ex._market_rel[("poly", "P1")] = (8, 0, 0)
     size, caps = ex._max_size(opp(max_contracts=100))
     assert caps["reliability"] == 0 and size == 0
-    # ...and a single fresh fill resets the streak -> the market is uncapped again.
+    # ...and a single fresh fill resets the streak -> the market trades again (ramped, not 0).
     ex._market_rel[("kalshi", "K1")] = (6, 3, 0)
     _, caps2 = ex._max_size(opp(max_contracts=100))
-    assert caps2["reliability"] == float("inf")
+    assert caps2["reliability"] == 2 * (6 - 3 + 1)      # ramp resumes, no longer excluded
 
 
 def test_reliability_records_fok_outcomes_and_persists():
