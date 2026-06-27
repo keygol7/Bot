@@ -185,6 +185,12 @@ class Settings:
     # = newly-listed markets enter the watchlist sooner, at the cost of more REST traffic.
     # The prime is now concurrent (below), so a lower value is feasible.
     stream_refresh_secs: float = 300.0
+    # How often to re-read venue balances/positions, INDEPENDENT of the (slow, ~minutes)
+    # discovery cycle. The cache otherwise only refreshed at the end of each discovery pass,
+    # so a fresh deposit took minutes to register -> spurious low-balance skips after a
+    # refill. A short tick picks up deposits/settlements (and re-runs the naked-leg
+    # reconcile) within seconds. 0 = off (refresh only on the discovery cycle).
+    stream_balance_refresh_secs: float = 30.0
     # Max concurrent REST snapshots when re-priming the watchlist each cycle (the rest are
     # paced by the per-venue rate limiters). Higher = faster refresh (seconds vs >a minute).
     stream_prime_concurrency: int = 8
@@ -351,6 +357,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         stream_edge_persist_secs=_env_float("STREAM_EDGE_PERSIST_SECS", 0.0),
         stream_sync_window_secs=_env_float("STREAM_SYNC_WINDOW_SECS", 0.0),
         stream_refresh_secs=_env_float("STREAM_REFRESH_SECS", 300.0),
+        stream_balance_refresh_secs=_env_float("STREAM_BALANCE_REFRESH_SECS", 30.0),
         stream_prime_concurrency=int(_env_float("STREAM_PRIME_CONCURRENCY", 8)),
         stream_min_poly_depth=_env_float("STREAM_MIN_POLY_DEPTH", 0.0),
         exec_hedge_buffer=_env_float("EXEC_HEDGE_BUFFER", 0.03),

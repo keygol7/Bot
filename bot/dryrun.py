@@ -768,6 +768,22 @@ async def stream(
         return await build_watchlist(cached, res.scanned, venues, store=store,
                                      min_poly_depth=settings.stream_min_poly_depth)
 
+    async def poll_balances():
+        # Fast, INDEPENDENT balance refresh — decoupled from the slow (~minutes) discovery
+        # cycle so a deposit/settlement registers within seconds instead of waiting for the
+        # next scan pass (which otherwise caused low-balance skips right after a refill).
+        secs = settings.stream_balance_refresh_secs
+        if secs <= 0:
+            return
+        try:
+            while True:
+                await asyncio.sleep(secs)
+                await refresh_balances()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("balance poll ended: %s", exc)
+
     async def feed_private(v):
         try:
             async for ev in v.stream_private():
@@ -824,6 +840,7 @@ async def stream(
 
     private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
     private_tasks += [asyncio.create_task(feed_lifecycle(v)) for v in venues]
+    private_tasks.append(asyncio.create_task(poll_balances()))
     log.warning("matching mode: %s metrics=%s (MATCH_USE_FINGERPRINT/MATCH_COMBINE_VERDICTS)",
                 ("fingerprint+LLM verdicts UNION"
                  if settings.match_use_fingerprint and settings.match_combine_verdicts
@@ -847,6 +864,11 @@ async def stream(
     log.warning("settling guard: skip fires when a leg is <= $%.2f or >= $%.2f "
                 "(STREAM_MIN_LEG_PRICE)", settings.stream_min_leg_price,
                 1.0 - settings.stream_min_leg_price)
+    log.warning("balance refresh: %s (STREAM_BALANCE_REFRESH_SECS) — independent of the "
+                "discovery cycle, so deposits/settlements register fast",
+                f"every {settings.stream_balance_refresh_secs:g}s"
+                if settings.stream_balance_refresh_secs > 0
+                else "discovery-cycle only (no fast poll)")
     if settings.exec_maker_mode:
         guard = (f"cancel-on-drift every {settings.exec_maker_poll:g}s"
                  if settings.exec_maker_poll > 0 else "NO drift guard")
