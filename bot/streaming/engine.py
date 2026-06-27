@@ -142,6 +142,12 @@ class StreamingEngine:
         # trips the kill switch so the bot stops until a human flattens. False = warn only.
         self.reconcile_halt = reconcile_halt
         self._reconcile_tol = 1.0               # contracts; below this is rounding, not naked
+        # Don't flag a pair traded within this many seconds: Poly fills land instantly but
+        # Kalshi's /positions read lags, so a rapid burst shows a TRANSIENT imbalance that
+        # settles once trading stops. Without this, a frequent reconcile (every 30s via the
+        # balance poll) caught a burst mid-flight and FALSE-halted on a pair that was fully
+        # hedged seconds later. A real stranded leg persists after trading quiesces.
+        self._reconcile_grace = 25.0
         self._imbalanced_prev: set = set()      # pairs imbalanced last check (persistence)
         # How many of the best edges the periodic snapshot logs each interval.
         self.edge_snapshot_top = edge_snapshot_top
@@ -639,6 +645,10 @@ class StreamingEngine:
             qa = pos.get((p.venue_a, p.market_a), 0.0)
             qb = pos.get((p.venue_b, p.market_b), 0.0)
             if abs(qa - qb) > self._reconcile_tol:
+                # Skip pairs still actively trading — their venue positions haven't settled
+                # (a transient burst imbalance, not a stranded leg). Caught once trading stops.
+                if self.clock() - self._last_acted.get(p.key, -1e9) < self._reconcile_grace:
+                    continue
                 imbalanced.append((p, qa, qb))
 
         # Held positions on markets the watchlist no longer pairs — can't auto-verify the

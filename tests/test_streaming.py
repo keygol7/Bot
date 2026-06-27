@@ -32,6 +32,47 @@ def make_engine(executor, cooldown=100.0, now=0.0):
     return eng
 
 
+class _Risk:
+    def __init__(self): self.is_killed = False
+    def trip_kill_switch(self, reason): self.is_killed = True
+
+
+class _ExecR(FakeExec):
+    def __init__(self): super().__init__(); self.risk = _Risk()
+
+
+def _snap(venue, positions):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        venue=venue,
+        positions=[SimpleNamespace(market_id=m, quantity=q, is_open=True) for m, q in positions])
+
+
+def test_reconcile_skips_actively_trading_pair_then_halts_when_quiesced():
+    # A pair traded within the grace window shows a TRANSIENT burst imbalance (Poly fills
+    # land instantly; Kalshi /positions lags) — it must NOT false-halt while active. Only
+    # once trading quiesces past the grace does a persistent imbalance trip the kill switch.
+    t = [1000.0]
+    fe = _ExecR()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: t[0], reconcile_halt=True)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    key = next(iter(eng._pairs))
+    snaps = [_snap("kalshi", [("K1", 34)]), _snap("poly", [("P1", 46)])]  # Δ12 mid-burst
+
+    eng._last_acted[key] = 1000.0                       # pair just traded
+    eng.reconcile_positions(snaps)
+    eng.reconcile_positions(snaps)                      # two checks INSIDE the grace window
+    assert not fe.risk.is_killed                        # no false halt while actively trading
+
+    t[0] = 1000.0 + 30.0                                # trading quiesces (> 25s grace)
+    eng.reconcile_positions(snaps)                      # first sighting after quiesce -> warn
+    assert not fe.risk.is_killed
+    eng.reconcile_positions(snaps)                      # still imbalanced -> persistent -> halt
+    assert fe.risk.is_killed
+
+
 def test_index_built_from_pairs():
     eng = make_engine(FakeExec())
     assert ("kalshi", "K1") in eng._index and ("poly", "P1") in eng._index
