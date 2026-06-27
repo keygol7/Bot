@@ -321,6 +321,27 @@ def test_polymarket_scan_quotes_volume_gate_drops_thin_markets():
     assert "no-vol-field" in ids      # missing volume -> fail open (kept)
 
 
+def test_polymarket_close_time_falls_back_to_slug_date():
+    # Per-game markets carry endDate=null; the game date is in the slug. close_time must
+    # fall back to the slug date so the matcher's resolve-date guard has a date to compare
+    # (else it fails open and pairs same-teams games on DIFFERENT dates -> stranded leg).
+    from datetime import datetime, timezone
+
+    def handler(req):
+        if req.url.path.endswith("/v1/events"):
+            return httpx.Response(200, json={"events": []})
+        return httpx.Response(200, json={"markets": [
+            {"slug": "aec-mlb-kc-cws-2026-06-26", "question": "KC@CWS",
+             "bestAsk": "0.40", "bestBid": "0.38", "endDate": None},
+        ]})
+
+    cfg = QcexConfig()
+    v = PolymarketUSVenue(cfg)
+    v._gateway_client = _client(handler, cfg.gateway_base)
+    q = next(q for q in asyncio.run(v.scan_quotes(5000)) if q.market_id == "aec-mlb-kc-cws-2026-06-26")
+    assert q.close_time == datetime(2026, 6, 26, tzinfo=timezone.utc).timestamp()
+
+
 def test_kalshi_account_snapshot_reads_position_fp():
     # The LIVE positions API carries the signed contract count as "position_fp" (decimal
     # string); the older "position" field is absent. Reading only "position" reported every

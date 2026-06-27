@@ -21,6 +21,7 @@ import asyncio
 import base64
 import logging
 import math
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
@@ -109,6 +110,21 @@ _TIF = {
 _TERMINAL_FILLED = "ORDER_STATE_FILLED"
 _REJECTED = {"ORDER_STATE_REJECTED"}
 _KILLED = {"ORDER_STATE_CANCELED", "ORDER_STATE_EXPIRED"}
+
+
+_SLUG_DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+
+def _date_from_slug(slug: str) -> float | None:
+    """Game date embedded in a per-game slug (e.g. ``aec-mlb-kc-cws-2026-06-26``) as a UTC
+    timestamp, or None. Fallback for the matcher's resolve-date guard when endDate is null."""
+    m = _SLUG_DATE.search(slug or "")
+    if not m:
+        return None
+    try:
+        return datetime(int(m[1]), int(m[2]), int(m[3]), tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
 
 
 def _amount(value: Any) -> float | None:
@@ -543,7 +559,12 @@ class PolymarketUSVenue:
             "min_qty": _amount(m.get("minimumTradeQty")),
             "volume24hr": v24,
         }
-        close_time = parse_iso8601(m.get("endDate"))
+        # Per-game markets often carry endDate=None, which left the matcher's resolve-date
+        # guard with no Polymarket date to compare -> it failed OPEN and matched same-teams
+        # games on DIFFERENT dates (a Kalshi June-30 KC@CWS paired with a Poly June-26 one;
+        # when June-26 settled the Kalshi leg was stranded). The game date is in the slug
+        # (...-2026-06-26...), so fall back to it so the date-gap guard can actually fire.
+        close_time = parse_iso8601(m.get("endDate")) or _date_from_slug(slug)
         # Targeted window: skip markets closing past it (keep unknown close).
         if max_close_ts is not None and close_time is not None and close_time > max_close_ts:
             return None
