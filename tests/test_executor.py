@@ -254,20 +254,22 @@ def test_reliability_caps_unproven_market_to_probe_size():
     assert caps["reliability"] == 2 and size == 2
 
 
-def test_reliability_ramps_proven_market_not_jump_to_full():
-    # Proving (3 small fills) must NOT jump straight to full size — the cap RAMPS with fills
-    # (probe * (fills - proven + 1)) so a market only proven at small size can't fire 20 and
-    # unwind (the Lamine-Yamal -$0.60 jump). At proving the cap still == probe.
-    ex = _rel_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])])
-    ex._market_rel[("kalshi", "K1")] = (3, 0, 0)       # just proven
-    ex._market_rel[("poly", "P1")] = (3, 0, 0)
+def test_reliability_scales_proven_market_on_demonstrated_fill_size():
+    # A proven market scales on the LARGEST size it actually FILLED (geometric), not a slow
+    # per-fill count: cap = max(probe, ramp_factor x max_fill). Reaches full size in a few
+    # fills (no lost edge); a market only proven small can't jump past ramp_factor x what it
+    # proved (so a phantom-at-size book can't strand a big naked leg). ramp_factor default 3.
+    ex = _rel_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])])   # probe 2, ramp 3
+    # proven, largest fill so far = 2 (the probes) -> cap = max(2, 3*2) = 6
+    ex._market_rel[("kalshi", "K1")] = (3, 0, 0, 2.0)
+    ex._market_rel[("poly", "P1")] = (3, 0, 0, 2.0)
     _, caps = ex._max_size(opp(max_contracts=100))
-    assert caps["reliability"] == 2                    # probe*(3-3+1) — no jump
-    # more fills earn more size: fills=8 -> probe*(8-3+1) = 12
-    ex._market_rel[("kalshi", "K1")] = (8, 0, 0)
-    ex._market_rel[("poly", "P1")] = (8, 0, 0)
+    assert caps["reliability"] == 6
+    # after a 6-contract fill, max_fill=6 -> cap = 18 (the old linear ramp would still be ~8)
+    ex._market_rel[("kalshi", "K1")] = (4, 0, 0, 6.0)
+    ex._market_rel[("poly", "P1")] = (4, 0, 0, 6.0)
     _, caps2 = ex._max_size(opp(max_contracts=100))
-    assert caps2["reliability"] == 12
+    assert caps2["reliability"] == 18
 
 
 def test_reliability_excludes_repeatedly_failing_market():
@@ -275,7 +277,7 @@ def test_reliability_excludes_repeatedly_failing_market():
     yes = FakeVenue("kalshi", [])
     no = FakeVenue("poly", [])
     ex = _rel_exec([yes, no])
-    ex._market_rel[("poly", "P1")] = (0, 2, 2)         # poly leg proven phantom
+    ex._market_rel[("poly", "P1")] = (0, 2, 2, 0.0)    # poly leg proven phantom
     size, caps = ex._max_size(opp(max_contracts=100))
     assert caps["reliability"] == 0 and size == 0
 
@@ -287,14 +289,14 @@ def test_reliability_excludes_proven_market_on_consecutive_fail_streak():
     yes = FakeVenue("kalshi", [])
     no = FakeVenue("poly", [])
     ex = _rel_exec([yes, no])
-    ex._market_rel[("kalshi", "K1")] = (5, 3, 2)       # proven, but 2 consecutive fails now
-    ex._market_rel[("poly", "P1")] = (8, 0, 0)
+    ex._market_rel[("kalshi", "K1")] = (5, 3, 2, 6.0)  # proven, but 2 consecutive fails now
+    ex._market_rel[("poly", "P1")] = (8, 0, 0, 6.0)
     size, caps = ex._max_size(opp(max_contracts=100))
     assert caps["reliability"] == 0 and size == 0
-    # ...and a single fresh fill resets the streak -> the market trades again (ramped, not 0).
-    ex._market_rel[("kalshi", "K1")] = (6, 3, 0)
+    # ...and a single fresh fill resets the streak -> trades again (scaled on max_fill, not 0).
+    ex._market_rel[("kalshi", "K1")] = (6, 3, 0, 6.0)
     _, caps2 = ex._max_size(opp(max_contracts=100))
-    assert caps2["reliability"] == 2 * (6 - 3 + 1)      # ramp resumes, no longer excluded
+    assert caps2["reliability"] == 3 * 6.0             # ramp_factor x max_fill, no longer excluded
 
 
 def test_reliability_records_fok_outcomes_and_persists():
@@ -304,20 +306,20 @@ def test_reliability_records_fok_outcomes_and_persists():
     no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)])
     ex = _rel_exec([yes, no], store=store)
     asyncio.run(ex.execute(opp()))
-    # kalshi YES filled -> (1,0,0); poly NO killed -> (0,1,1)
-    assert ex._market_rel[("kalshi", "K1")] == (1, 0, 0)
-    assert ex._market_rel[("poly", "P1")] == (0, 1, 1)
-    assert store.market_reliability()[("poly", "P1")] == (0, 1, 1)
+    # kalshi YES filled 2 -> (1 fill, 0 fails, 0 streak, max_fill 2); poly NO killed -> (0,1,1,0)
+    assert ex._market_rel[("kalshi", "K1")] == (1, 0, 0, 2.0)
+    assert ex._market_rel[("poly", "P1")] == (0, 1, 1, 0.0)
+    assert store.market_reliability()[("poly", "P1")] == (0, 1, 1, 0.0)
 
 
 def test_reliability_streak_resets_on_fill_in_store():
-    # fail, fail -> streak 2; then a fill resets streak to 0 (fills/fails cumulative).
+    # fail, fail -> streak 2; then a fill (size 5) resets streak to 0 and sets max_fill=5.
     store = Store(":memory:")
     store.record_market_outcome("kalshi", "K1", ok=False)
     store.record_market_outcome("kalshi", "K1", ok=False)
-    assert store.market_reliability()[("kalshi", "K1")] == (0, 2, 2)
-    store.record_market_outcome("kalshi", "K1", ok=True)
-    assert store.market_reliability()[("kalshi", "K1")] == (1, 2, 0)
+    assert store.market_reliability()[("kalshi", "K1")] == (0, 2, 2, 0.0)
+    store.record_market_outcome("kalshi", "K1", ok=True, fill_size=5.0)
+    assert store.market_reliability()[("kalshi", "K1")] == (1, 2, 0, 5.0)
 
 
 def test_reliability_loads_history_from_store_on_init():
@@ -325,7 +327,7 @@ def test_reliability_loads_history_from_store_on_init():
     store.record_market_outcome("poly", "P1", ok=False)
     store.record_market_outcome("poly", "P1", ok=False)
     ex = _rel_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], store=store)
-    assert ex._market_rel[("poly", "P1")] == (0, 2, 2)  # excluded from the first tick after restart
+    assert ex._market_rel[("poly", "P1")] == (0, 2, 2, 0.0)  # excluded from the first tick after restart
 
 
 def test_leg1_partial_unwinds_not_halts():

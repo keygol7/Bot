@@ -108,6 +108,7 @@ class Executor:
         probe_contracts: float = 0.0,
         market_proven_fills: int = 3,
         market_max_fails: int = 2,
+        market_ramp_factor: float = 3.0,
         scarcity_balance: float = 0.0,
         scarcity_min_edge: float = 0.02,
         min_lock_edge: float | None = None,
@@ -167,6 +168,9 @@ class Executor:
         self.probe_contracts = probe_contracts
         self.market_proven_fills = market_proven_fills
         self.market_max_fails = market_max_fails
+        # Proven markets scale to ramp_factor x their largest demonstrated fill (see
+        # _reliability_cap) — fast geometric scale-up on real depth, bounded by what's proven.
+        self.market_ramp_factor = market_ramp_factor
         # Capital-scarcity edge gate (see _scarce_skip): reserve a nearly-drained venue's
         # last cash for the fattest edges instead of FIFO-locking it into a 1c arb.
         self.scarcity_balance = scarcity_balance
@@ -273,23 +277,26 @@ class Executor:
         # a KILL/REJECT/ERROR/partial proves it's phantom (the naked-leg source). Record per
         # market (not on unwinds — sells, which we only do to recover) to drive probe sizing.
         if action == "buy" and self.probe_contracts > 0:
+            ok = result.status is OrderStatus.FILLED
             self._record_market_reliability(
-                getattr(venue, "name", "?"), market_id,
-                result.status is OrderStatus.FILLED)
+                getattr(venue, "name", "?"), market_id, ok,
+                result.filled if ok else 0.0)
         return result
 
-    def _record_market_reliability(self, venue: str, market_id: str, ok: bool) -> None:
+    def _record_market_reliability(self, venue: str, market_id: str, ok: bool,
+                                   fill_size: float = 0.0) -> None:
         key = (venue, market_id)
-        fills, fails, streak = self._market_rel.get(key, (0, 0, 0))
+        fills, fails, streak, max_fill = self._market_rel.get(key, (0, 0, 0, 0.0))
         self._market_rel[key] = (fills + (1 if ok else 0), fails + (0 if ok else 1),
-                                 0 if ok else streak + 1)
+                                 0 if ok else streak + 1,
+                                 max(max_fill, fill_size) if ok else max_fill)
         if self.store is not None:
             try:
-                self.store.record_market_outcome(venue, market_id, ok)
+                self.store.record_market_outcome(venue, market_id, ok, fill_size)
             except Exception as exc:
                 log.warning("market reliability write failed for %s: %s", market_id, exc)
         if not ok:
-            f, x, s = self._market_rel[key]
+            f, x, s, _mf = self._market_rel[key]
             log.info("reliability: %s:%s FOK failed (%d fills/%d fails/%d streak) — "
                      "%s", venue, market_id, f, x, s,
                      "EXCLUDED (depth vanished)" if s >= self.market_max_fails
@@ -419,9 +426,11 @@ class Executor:
 
     def _reliability_cap(self, venue: str, market_id: str) -> float:
         """Contract ceiling a market's empirical FOK history earns it. Unproven markets get
-        a tiny probe; proven markets RAMP up with accumulated fills (not a jump to full);
-        a consecutive-fail streak (or repeated fails before proving) excludes."""
-        fills, fails, streak = self._market_rel.get((venue, market_id), (0, 0, 0))
+        a tiny probe; once PROVEN real, a market scales on the largest size it has actually
+        FILLED (geometric, fast) rather than a slow per-fill count; a consecutive-fail streak
+        (or repeated fails before proving) excludes."""
+        fills, fails, streak, max_fill = self._market_rel.get(
+            (venue, market_id), (0, 0, 0, 0.0))
         # CONSECUTIVE fails exclude EVEN a once-proven market: a Valorant/tennis market that
         # filled early then had its depth drain as the game wound down kept firing into
         # vanished volume -> repeated hedge-reject unwinds. A live fill resets the streak.
@@ -431,11 +440,13 @@ class Executor:
             if fails >= self.market_max_fails:
                 return 0.0
             return float(self.probe_contracts)
-        # Proven -> RAMP, don't jump. Three 2-contract probe fills prove "2 fill", not "20
-        # do" — so a market whose depth is only good for small size must not immediately fire
-        # full size and unwind (the -$0.60 Lamine-Yamal jump). Each fill past the proving bar
-        # earns +probe_contracts; a fail trips the streak/exclusion before size grows large.
-        return float(self.probe_contracts) * (fills - self.market_proven_fills + 1)
+        # Proven real -> scale on DEMONSTRATED depth: allow up to ramp_factor x the largest
+        # size a FOK has actually filled here. A real deep market reaches full size in a few
+        # fills (each success roughly multiplies the ceiling), so we don't lose edge to a slow
+        # per-fill count; a market that only ever fills small can't jump past ramp_factor x
+        # what it proved, so a phantom-at-size book can't strand a large naked leg. The live
+        # deep-cushion (_hedge_fillable) and order cap still bind each actual fire.
+        return max(float(self.probe_contracts), max_fill * self.market_ramp_factor)
 
     def _leg_limits(self, opp: ArbOpportunity, first_side, second_side) -> tuple[float, float]:
         """Limit prices for the (first, second) legs that may pay worse than the quoted

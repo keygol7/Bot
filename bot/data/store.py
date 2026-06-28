@@ -146,6 +146,7 @@ CREATE TABLE IF NOT EXISTS market_reliability (
     fills      INTEGER NOT NULL DEFAULT 0,
     fails      INTEGER NOT NULL DEFAULT 0,
     streak     INTEGER NOT NULL DEFAULT 0,   -- CONSECUTIVE fails (reset to 0 on a fill)
+    max_fill   REAL NOT NULL DEFAULT 0,       -- largest size a real FOK has FILLED (for scale-up)
     ts         REAL,
     PRIMARY KEY (venue, market_id)
 );
@@ -168,11 +169,15 @@ class Store:
         except sqlite3.OperationalError:
             pass  # e.g. :memory: — fall back to defaults
         self.conn.executescript(_SCHEMA)
-        # Migration: add market_reliability.streak to DBs created before it existed.
-        if "streak" not in {r["name"] for r in
-                            self.conn.execute("PRAGMA table_info(market_reliability)")}:
+        # Migrations: add market_reliability columns to DBs created before they existed.
+        _rel_cols = {r["name"] for r in
+                     self.conn.execute("PRAGMA table_info(market_reliability)")}
+        if "streak" not in _rel_cols:
             self.conn.execute(
                 "ALTER TABLE market_reliability ADD COLUMN streak INTEGER NOT NULL DEFAULT 0")
+        if "max_fill" not in _rel_cols:
+            self.conn.execute(
+                "ALTER TABLE market_reliability ADD COLUMN max_fill REAL NOT NULL DEFAULT 0")
         self.conn.commit()
 
     def close(self) -> None:
@@ -311,28 +316,33 @@ class Store:
         return [p for p in pairs if self._pair_key(p[0], p[1], p[2], p[3]) not in bl]
 
     # ---- empirical per-market fill reliability (probe-then-scale) ----
-    def record_market_outcome(self, venue: str, market_id: str, ok: bool) -> None:
+    def record_market_outcome(self, venue: str, market_id: str, ok: bool,
+                              fill_size: float = 0.0) -> None:
         """Record one FOK outcome for a market: ok=filled (real depth) / not (phantom).
         ``streak`` is the CONSECUTIVE-fail count (reset to 0 on a fill) — it catches a
-        once-proven market whose depth later vanishes (game-ending liquidity drain)."""
+        once-proven market whose depth later vanishes. ``max_fill`` tracks the LARGEST size
+        a real FOK actually filled, so the sizer can scale up on demonstrated depth instead
+        of a slow per-fill count."""
+        mf = float(fill_size) if ok else 0.0
         self.conn.execute(
-            """INSERT INTO market_reliability (venue, market_id, fills, fails, streak, ts)
-               VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO market_reliability (venue, market_id, fills, fails, streak, max_fill, ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(venue, market_id) DO UPDATE SET
                  fills=fills+?, fails=fails+?,
                  streak=CASE WHEN ?=1 THEN 0 ELSE streak+1 END,
+                 max_fill=MAX(max_fill, ?),
                  ts=excluded.ts""",
-            (venue, market_id, 1 if ok else 0, 0 if ok else 1, 0 if ok else 1, time.time(),
-             1 if ok else 0, 0 if ok else 1, 1 if ok else 0),
+            (venue, market_id, 1 if ok else 0, 0 if ok else 1, 0 if ok else 1, mf, time.time(),
+             1 if ok else 0, 0 if ok else 1, 1 if ok else 0, mf),
         )
         self.conn.commit()
 
     def market_reliability(self) -> dict:
-        """All markets' (fills, fails, streak) keyed by (venue, market_id), for the gate."""
+        """All markets' (fills, fails, streak, max_fill) by (venue, market_id), for the gate."""
         return {
-            (r["venue"], r["market_id"]): (r["fills"], r["fails"], r["streak"])
+            (r["venue"], r["market_id"]): (r["fills"], r["fails"], r["streak"], r["max_fill"])
             for r in self.conn.execute(
-                "SELECT venue, market_id, fills, fails, streak FROM market_reliability")
+                "SELECT venue, market_id, fills, fails, streak, max_fill FROM market_reliability")
         }
 
     def cache_verdict(

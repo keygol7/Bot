@@ -651,6 +651,7 @@ async def stream(
         probe_contracts=settings.exec_probe_contracts,
         market_proven_fills=settings.exec_market_proven_fills,
         market_max_fails=settings.exec_market_max_fails,
+        market_ramp_factor=settings.exec_market_ramp_factor,
         hedge_buffer=settings.exec_hedge_buffer,
         maker_timeout=settings.exec_maker_timeout,
         maker_improvement=settings.exec_maker_improvement,

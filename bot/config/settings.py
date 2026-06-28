@@ -247,6 +247,11 @@ class Settings:
     exec_probe_contracts: float = 0.0
     exec_market_proven_fills: int = 3
     exec_market_max_fails: int = 2
+    # Once a market is proven real, the sizer allows up to this x the LARGEST size a FOK has
+    # actually filled there — a fast geometric scale-up on demonstrated depth (vs the old slow
+    # +1-per-fill ramp that lost edge), bounded by what's been proven so a phantom-at-size book
+    # can't strand a big naked leg.
+    exec_market_ramp_factor: float = 3.0
     # Maker mode: capture THIN edges by RESTING the fee-heavy (Kalshi) leg as a maker
     # (no slippage / lower fee), then TAKING the deep (Polymarket) leg the instant it
     # fills. The firing threshold drops to just RISK_MIN_EDGE (no hedge buffer needed).
@@ -387,6 +392,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_probe_contracts=_env_float("EXEC_PROBE_CONTRACTS", 0.0),
         exec_market_proven_fills=int(_env_float("EXEC_MARKET_PROVEN_FILLS", 3)),
         exec_market_max_fails=int(_env_float("EXEC_MARKET_MAX_FAILS", 2)),
+        exec_market_ramp_factor=_env_float("EXEC_MARKET_RAMP_FACTOR", 3.0),
         exec_maker_mode=(env("EXEC_MAKER_MODE", "false") or "false").lower() == "true",
         exec_maker_timeout=_env_float("EXEC_MAKER_TIMEOUT", 5.0),
         exec_maker_improvement=_env_float("EXEC_MAKER_IMPROVEMENT", 0.01),
