@@ -673,7 +673,7 @@ class StreamingEngine:
         if imbalanced:
             kept = []
             for p, qa, qb in imbalanced:
-                if await self._pair_leg_settled(p):
+                if await self._pair_leg_settled(p, qa, qb):
                     log.info("RECONCILE: %s imbalanced (%s=%g vs %s=%g) but a leg has SETTLED "
                              "— realized arb awaiting the other venue, not naked",
                              p.event_key, p.venue_a, qa, p.venue_b, qb)
@@ -700,14 +700,20 @@ class StreamingEngine:
                          len(repeat))
         return imbalanced
 
-    async def _pair_leg_settled(self, p) -> bool:
-        """True if either of a pair's legs has a SETTLED market — so a 0-vs-N imbalance is a
-        realized arb leftover, not a stranded hedge. Checks the venue's authoritative status
-        (open_check: Kalshi reports finalized/settled here but state=None in the quote) and,
-        as a fallback, a non-OPEN quote state (Poly reports EXPIRED there). A leg we can't
-        read is left as-is (fail toward halting -> a human verifies)."""
-        for venue, market in ((p.venue_a, p.market_a), (p.venue_b, p.market_b)):
+    async def _pair_leg_settled(self, p, qa, qb) -> bool:
+        """True if either of a pair's legs has SETTLED — so a 0-vs-N imbalance is a realized
+        arb leftover, not a stranded hedge. Three settled signals, in order:
+          - open_check is False  (Kalshi reports finalized/settled in its status field,
+            though state=None in the quote);
+          - a non-OPEN quote state (Poly reports MARKET_STATE_EXPIRED);
+          - the leg's POSITION is 0 AND its market is now UNREADABLE (404 after the venue
+            pruned the resolved market). A REAL stranded leg's market is still OPEN and reads
+            fine, so it isn't caught here; a transient unread clears on the next 30s check."""
+        for venue, market, qty in (
+                (p.venue_a, p.market_a, qa), (p.venue_b, p.market_b, qb)):
+            checked, is_open, state = False, None, None
             if self.open_check is not None:
+                checked = True
                 try:
                     is_open = await self.open_check(venue, market)
                 except Exception:
@@ -715,6 +721,7 @@ class StreamingEngine:
                 if is_open is False:               # authoritatively settled/closed
                     return True
             if self.depth_fetch is not None:
+                checked = True
                 try:
                     q = await self.depth_fetch(venue, market)
                 except Exception:
@@ -722,6 +729,12 @@ class StreamingEngine:
                 state = getattr(q, "state", None) if q is not None else None
                 if state is not None and state != self._OPEN_STATE:
                     return True
+            # 0-position leg whose market is UNREADABLE despite an attempted read (404 after
+            # the venue pruned the resolved market) -> settled+pruned. Only when we actually
+            # checked: with no checker configured, fail toward halt (a human verifies).
+            if (checked and abs(qty) <= self._reconcile_tol
+                    and is_open is None and state is None):
+                return True
         return False
 
     async def prime_and_sweep(self):

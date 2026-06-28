@@ -125,6 +125,19 @@ def test_reconcile_halts_when_both_legs_open_real_naked():
     assert fe.risk.is_killed
 
 
+def test_reconcile_skips_settled_and_removed_leg_404():
+    # Poly settled AND was pruned -> /book 404 -> is_open None AND quote state None. The
+    # 0-position leg whose market is now unreadable is a settled leftover (not a stranded
+    # leg, whose market would still read OPEN). Must NOT halt.
+    eng, fe = _settled_engine(
+        open_states={"kalshi": True, "poly": None},     # poly 404 -> unknown
+        depth_states={"kalshi": "MARKET_STATE_OPEN", "poly": None})
+    snaps = [_snap("kalshi", [("K1", 66)]), _snap("poly", [])]  # kalshi=66 vs poly=0 (pruned)
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
+
+
 def test_index_built_from_pairs():
     eng = make_engine(FakeExec())
     assert ("kalshi", "K1") in eng._index and ("poly", "P1") in eng._index
