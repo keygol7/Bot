@@ -393,6 +393,7 @@ async def run(
             max_order_contracts=settings.risk.max_order_contracts,
             min_leg_depth=settings.exec_min_leg_depth,
             depth_safety=settings.exec_depth_fraction,
+            hedge_depth_fraction=settings.exec_hedge_depth_fraction,
         )
         log.warning(
             "LIVE EXECUTION ENABLED (mode=%s) — placing REAL orders, max %s contracts/order, "
@@ -642,6 +643,7 @@ async def stream(
         max_order_contracts=settings.risk.max_order_contracts, fill_confirmer=tracker,
         min_leg_depth=settings.exec_min_leg_depth,
         depth_safety=settings.exec_depth_fraction,
+        hedge_depth_fraction=settings.exec_hedge_depth_fraction,
         take_first_venue=settings.exec_take_first_venue or None,
         min_venue_balance=settings.exec_min_venue_balance,
         probe_contracts=settings.exec_probe_contracts,

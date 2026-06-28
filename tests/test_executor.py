@@ -712,6 +712,26 @@ def test_hedge_fillable_reads_live_book_not_preview():
     assert asyncio.run(ex._hedge_fillable(BoomVenue(), leg, 5)) == 0.0
 
 
+def test_hedge_fillable_deep_cushion_fraction():
+    # The deep-cushion: _hedge_fillable commits only `hedge_depth_fraction` of the shown
+    # hedge depth, so a partial vanish before the FOK can't reject it. Deep books still let
+    # the trade fire full size (the caller caps at min(size, this)); thin hedges size down.
+    risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({"kalshi": FakeVenue("kalshi", []), "poly": FakeVenue("poly", [])}, risk,
+                  fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+                  hedge_depth_fraction=0.5)
+
+    class BookVenue:
+        def __init__(self, q): self._q = q; self.name = "poly"
+        async def fetch_quote(self, m): return self._q
+    leg = ("poly", "P1", Side.NO, 0.55)
+    # shown hedge depth 40 -> commit only 20 (50% cushion). A deep book (40 >> a size of 5)
+    # still fills the full 5 downstream; a thin book would cap the trade to 20.
+    deep = BookVenue(MarketQuote(venue="poly", market_id="P1", title="",
+                                 no_ask=0.46, no_ask_size=40.0))
+    assert asyncio.run(ex._hedge_fillable(deep, leg, 5)) == 20.0
+
+
 def test_execute_maker_skips_when_hedge_preview_fills_nothing():
     # The hedge leg's live book shows NO depth -> can't hedge. Don't arm a maker we can't
     # hedge (else the post-fill hedge KILLs and forces an unwind).

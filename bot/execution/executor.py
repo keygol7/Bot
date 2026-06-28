@@ -112,6 +112,7 @@ class Executor:
         leg2_slippage_share: float = 0.6,
         min_leg_depth: float = 0.0,
         depth_safety: float = 1.0,
+        hedge_depth_fraction: float = 1.0,
         first_venue: str = "kalshi",
         take_first_venue: str | None = None,
         hedge_buffer: float = 0.0,
@@ -138,6 +139,10 @@ class Executor:
         # Fraction of shown top-of-book depth to actually trade (headroom so a FOK still
         # fills if the book thins between the quote and the order). 1.0 = use it all.
         self.depth_safety = depth_safety
+        # Deep-cushion fraction applied to the LIVE hedge book read (see _hedge_fillable):
+        # commit the FOK to only this fraction of shown hedge depth so a partial vanish can't
+        # reject it. Deep books are unaffected (fraction still exceeds the trade size).
+        self.hedge_depth_fraction = hedge_depth_fraction
         # The rejection-prone venue (Kalshi: thinner books / FOK insufficient resting
         # volume) is placed FIRST, so if it rejects there's no other leg to unwind.
         self.first_venue = first_venue
@@ -346,7 +351,12 @@ class Executor:
         # here: the taker leg fires FOK (a book that moved past the limit kills cleanly ->
         # unwind), and the maker leg REPRICES the hedge to the live ask on fill — so the
         # only thing this pre-check must establish is that real depth exists to hedge into.
-        return float(depth)
+        # DEEP CUSHION: commit the FOK to only a FRACTION of the shown depth so a partial
+        # vanish in the ~tens of ms before the order lands can't reject it (the dominant
+        # unwind cause). Deep books (depth >> size) keep firing full size — the caller caps
+        # at min(size, this); only thin hedges size down. Latency-neutral (this read already
+        # happens on every path).
+        return float(depth) * self.hedge_depth_fraction
 
     def _max_size(self, opp: ArbOpportunity,
                   depth_override: float | None = None) -> tuple[int, dict[str, float]]:
