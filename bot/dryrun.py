@@ -646,6 +646,8 @@ async def stream(
         hedge_depth_fraction=settings.exec_hedge_depth_fraction,
         take_first_venue=settings.exec_take_first_venue or None,
         min_venue_balance=settings.exec_min_venue_balance,
+        scarcity_balance=settings.exec_scarcity_balance,
+        scarcity_min_edge=settings.exec_scarcity_min_edge,
         probe_contracts=settings.exec_probe_contracts,
         market_proven_fills=settings.exec_market_proven_fills,
         market_max_fails=settings.exec_market_max_fails,

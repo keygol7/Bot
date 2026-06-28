@@ -120,6 +120,38 @@ def test_unwind_failure_without_store_hard_halts():
     assert report.status is ExecStatus.HALTED and risk.is_killed
 
 
+def test_scarcity_gate_reserves_capital_for_fat_edges():
+    # When a venue is nearly drained, a THIN edge is skipped (reserve the last cash for a
+    # fat edge); a FAT edge still fires; and with ample balance, the thin edge fires.
+    def fresh():
+        return (FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)]),
+                FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.57)]))
+
+    # scarce kalshi ($10 < $20 floor) + thin 1c edge -> reserved (skipped, nothing fired)
+    y, n = fresh()
+    ex, _ = make_exec([y, n])
+    ex.scarcity_balance, ex.scarcity_min_edge = 20.0, 0.02
+    ex._balances = {"kalshi": 10.0, "poly": 100.0}
+    rep = asyncio.run(ex.execute(opp(yes_price=0.40, no_price=0.59)))   # edge 0.01
+    assert rep.status is ExecStatus.SKIPPED and "scarce" in rep.reason and y.calls == []
+
+    # same scarce balance but a FAT 3c edge -> fires
+    y, n = fresh()
+    ex, _ = make_exec([y, n])
+    ex.scarcity_balance, ex.scarcity_min_edge = 20.0, 0.02
+    ex._balances = {"kalshi": 10.0, "poly": 100.0}
+    rep = asyncio.run(ex.execute(opp(yes_price=0.40, no_price=0.57)))   # edge 0.03
+    assert rep.status is ExecStatus.SUCCESS
+
+    # ample balance + thin 1c edge -> NOT gated (capital isn't scarce)
+    y, n = fresh()
+    ex, _ = make_exec([y, n])
+    ex.scarcity_balance, ex.scarcity_min_edge = 20.0, 0.02
+    ex._balances = {"kalshi": 100.0, "poly": 100.0}
+    rep = asyncio.run(ex.execute(opp(yes_price=0.40, no_price=0.59)))   # edge 0.01
+    assert rep.status is ExecStatus.SUCCESS
+
+
 def test_reservation_drains_cache_before_legs_fire():
     # The fire-time reservation must reduce the cached balance for BOTH legs BEFORE any
     # order is placed — so a concurrent fast-loop execution sees the drain and won't

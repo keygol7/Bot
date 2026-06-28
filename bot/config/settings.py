@@ -232,6 +232,13 @@ class Settings:
     # Min venue balance ($) to fire a leg there: a drained venue can't fund its hedge ->
     # naked. Below this, that leg's trades are skipped (self-healing). 0 = off.
     exec_min_venue_balance: float = 0.0
+    # Capital-scarcity edge gate: when a venue's spendable cash falls below
+    # exec_scarcity_balance, RESERVE it for the fattest edges rather than locking the last
+    # dollars into a thin (1c ~= 1%/cycle) arb. Below the floor, only edges >=
+    # exec_scarcity_min_edge fire. Keeps scarce capital flowing to the best returns instead
+    # of FIFO. 0 balance = off (no scarcity gate).
+    exec_scarcity_balance: float = 0.0
+    exec_scarcity_min_edge: float = 0.02
     # Empirical fill-reliability (probe-then-scale): the live, learned replacement for the
     # volume proxy. Untested markets trade at exec_probe_contracts until their FOK orders
     # have FILLED exec_market_proven_fills times (real depth proven), then scale to full
@@ -375,6 +382,8 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         match_empirical_sum_floor=_env_float("MATCH_EMPIRICAL_SUM_FLOOR", 0.93),
         exec_maker_min_volume_24h=_env_float("EXEC_MAKER_MIN_VOLUME_24H", 0.0),
         exec_min_venue_balance=_env_float("EXEC_MIN_VENUE_BALANCE", 0.0),
+        exec_scarcity_balance=_env_float("EXEC_SCARCITY_BALANCE", 0.0),
+        exec_scarcity_min_edge=_env_float("EXEC_SCARCITY_MIN_EDGE", 0.02),
         exec_probe_contracts=_env_float("EXEC_PROBE_CONTRACTS", 0.0),
         exec_market_proven_fills=int(_env_float("EXEC_MARKET_PROVEN_FILLS", 3)),
         exec_market_max_fails=int(_env_float("EXEC_MARKET_MAX_FAILS", 2)),

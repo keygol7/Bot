@@ -108,6 +108,8 @@ class Executor:
         probe_contracts: float = 0.0,
         market_proven_fills: int = 3,
         market_max_fails: int = 2,
+        scarcity_balance: float = 0.0,
+        scarcity_min_edge: float = 0.02,
         min_lock_edge: float | None = None,
         leg2_slippage_share: float = 0.6,
         min_leg_depth: float = 0.0,
@@ -165,6 +167,10 @@ class Executor:
         self.probe_contracts = probe_contracts
         self.market_proven_fills = market_proven_fills
         self.market_max_fails = market_max_fails
+        # Capital-scarcity edge gate (see _scarce_skip): reserve a nearly-drained venue's
+        # last cash for the fattest edges instead of FIFO-locking it into a 1c arb.
+        self.scarcity_balance = scarcity_balance
+        self.scarcity_min_edge = scarcity_min_edge
         self._market_rel: dict[tuple, tuple] = (
             self.store.market_reliability() if self.store is not None else {})
         self._balances: dict[str, float] = {}
@@ -454,9 +460,26 @@ class Executor:
         second_limit = min(0.99, round(px(second_side) + hedge, 4))
         return first_limit, second_limit
 
+    def _scarce_skip(self, opp: ArbOpportunity) -> str | None:
+        """When a venue's spendable cash is below the scarcity floor, reserve it for the
+        fattest edges — skip a thin edge so the last capital isn't FIFO-locked into a ~1%
+        arb when a 2-3% one may follow. Returns a skip reason, or None to proceed."""
+        if self.scarcity_balance <= 0 or opp.edge_per_contract >= self.scarcity_min_edge:
+            return None
+        bals = [b for b in (self._balance(opp.buy_yes_venue), self._balance(opp.buy_no_venue))
+                if b is not None]
+        if bals and min(bals) < self.scarcity_balance:
+            return (f"capital scarce (${min(bals):.0f} < ${self.scarcity_balance:.0f}); "
+                    f"reserving for edge >= {self.scarcity_min_edge:.2f} "
+                    f"(this edge {opp.edge_per_contract:.3f})")
+        return None
+
     async def execute(self, opp: ArbOpportunity) -> ExecutionReport:
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
+        scarce = self._scarce_skip(opp)
+        if scarce is not None:
+            return ExecutionReport(ExecStatus.SKIPPED, scarce)
 
         # Liquidity guard: don't fire unless BOTH legs have real resting depth. Thin
         # books are where a leg rejects and we can't hedge/unwind — skip them outright
@@ -747,6 +770,9 @@ class Executor:
         """
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
+        scarce = self._scarce_skip(opp)
+        if scarce is not None:
+            return ExecutionReport(ExecStatus.SKIPPED, scarce)
         if self.fill_confirmer is None:
             return ExecutionReport(ExecStatus.SKIPPED, "maker mode needs a fill confirmer")
 
