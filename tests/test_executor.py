@@ -90,10 +90,10 @@ def test_leg2_killed_unwinds_leg1():
     assert yes.calls[1][2] == "sell"                 # second yes call was the unwind
 
 
-def test_unwind_failure_auto_blacklists_pair():
-    # leg1 fills, leg2 rejects, AND the unwind also fails -> stuck naked leg -> halt. The
-    # pair must be AUTO-BLACKLISTED so the bot never re-fires this illiquid market and a
-    # restart comes up clean (no re-halt on the stranded leg). The recurring thin-prop case.
+def test_unwind_failure_quarantines_and_keeps_trading():
+    # leg1 fills, leg2 rejects, AND the unwind also fails -> stuck naked leg. The market is
+    # AUTO-BLACKLISTED and the trade QUARANTINED (recorded) — but the global kill switch is
+    # NOT tripped, so the bot keeps trading the rest of the book. The recurring thin-prop fix.
     store = Store(":memory:")
     yes = FakeVenue("kalshi", [
         res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),                 # leg1 fills
@@ -102,8 +102,22 @@ def test_unwind_failure_auto_blacklists_pair():
     no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)])  # leg2 rejects
     ex, risk = make_exec([yes, no], store=store)
     report = asyncio.run(ex.execute(opp()))
-    assert report.status is ExecStatus.HALTED and risk.is_killed
+    assert report.status is ExecStatus.QUARANTINED
+    assert not risk.is_killed                              # bot keeps trading other pairs
     assert store.blacklisted_keys() == {store._pair_key("kalshi", "K1", "poly", "P1")}
+
+
+def test_unwind_failure_without_store_hard_halts():
+    # No store -> can't blacklist -> fall back to a HARD halt (fail closed) so a stranded leg
+    # that can't be quarantined still stops the bot.
+    yes = FakeVenue("kalshi", [
+        res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),
+        res("kalshi", Side.YES, OrderStatus.KILLED, 0, None, action="sell"),
+    ])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)])
+    ex, risk = make_exec([yes, no])                        # store=None
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.HALTED and risk.is_killed
 
 
 def test_reservation_drains_cache_before_legs_fire():

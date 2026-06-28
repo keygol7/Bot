@@ -58,6 +58,7 @@ class ExecStatus(str, Enum):
     SKIPPED = "SKIPPED"      # didn't act (risk/size/leg-1 no fill)
     UNWOUND = "UNWOUND"      # leg 1 filled, leg 2 didn't, leg 1 sold back
     HALTED = "HALTED"        # ambiguous/unknown state — kill switch tripped
+    QUARANTINED = "QUARANTINED"  # stuck leg recorded + market blacklisted; KEEP trading others
 
 
 def scaled_hedge_buffer(buffer: float, depth: float, thin_depth: float,
@@ -1068,20 +1069,26 @@ class Executor:
             # pair so the bot never re-fires it (it just stranded a naked leg) and a restart
             # comes up clean (the pair drops the watchlist -> reconcile treats the stuck leg as
             # benign untracked, not a re-halt). Then stop, surfacing both failure reasons.
+            blacklisted = False
             if self.store is not None:
                 try:
                     self.store.blacklist_pair(
                         opp.buy_yes_venue, opp.buy_yes_market,
                         opp.buy_no_venue, opp.buy_no_market,
                         reason=f"unwind failed (stuck naked leg): {reason}")
+                    blacklisted = True
                     log.warning("auto-blacklisted %s after unwind failure (illiquid: hedge "
                                 "AND unwind both rejected)", opp.event_key)
                 except Exception as exc:
                     log.warning("auto-blacklist failed for %s: %s", opp.event_key, exc)
+            # If we quarantined the market (blacklisted), the stuck leg is KNOWN, bounded, and
+            # won't re-fire -> KEEP trading the rest of the book instead of freezing on it.
+            # If blacklisting failed, fall back to a hard halt (fail closed).
             return self._halt(
                 f"UNWIND FAILED ({reason}; unwind {unwind.status.value}: "
-                f"{_reject_reason(unwind)}) — still holding leg1, manual action required",
-                legs,
+                f"{_reject_reason(unwind)}) — leg1 stranded, market "
+                f"{'quarantined' if blacklisted else 'NOT blacklisted'}; manual reconcile",
+                legs, trip=not blacklisted,
             )
 
         sell_avg = unwind.avg_price if unwind.avg_price is not None else sell_px
@@ -1098,14 +1105,18 @@ class Executor:
         log.warning("UNWOUND %s (%s) | pnl=%+.2f", opp.event_key, reason, pnl)
         return ExecutionReport(ExecStatus.UNWOUND, f"{reason}; leg1 unwound", legs, pnl)
 
-    def _halt(self, reason: str, legs: list[OrderResult]) -> ExecutionReport:
-        self.risk.trip_kill_switch(f"executor halt: {reason}")
-        # Record what we were HOLDING so a halt isn't invisible in the books. A halt is an
-        # ambiguous/stuck state, so the SETTLED pnl is unknown — but the fills are factual and
-        # the CASH that moved is real. Record each filled leg + a PROVISIONAL pnl row (the net
-        # cash outflow, conservatively treating held legs as not-yet-recovered). Without this,
-        # a halt's real fills never hit the db and the trade log silently understates losses;
-        # the operator reconciles the provisional figure against venue settlement.
+    def _halt(self, reason: str, legs: list[OrderResult], *, trip: bool = True) -> ExecutionReport:
+        # ``trip=True`` (default): ambiguous/unknown state -> trip the global kill switch and
+        # stop everything (fail closed). ``trip=False`` (QUARANTINE): the stuck leg is KNOWN
+        # and bounded and its market is already blacklisted, so record it but KEEP trading the
+        # rest of the book — freezing the whole bot for a tiny stranded thin-prop leg is
+        # disproportionate, and the reconcile still catches any unexpected/larger naked.
+        if trip:
+            self.risk.trip_kill_switch(f"executor halt: {reason}")
+        # Record what we were HOLDING so the stuck state isn't invisible in the books. The
+        # SETTLED pnl is unknown — but the fills are factual and the CASH that moved is real.
+        # Record each filled leg + a PROVISIONAL pnl row (the net cash outflow, conservatively
+        # treating held legs as not-yet-recovered); the operator reconciles vs settlement.
         cash = 0.0
         for leg in legs or []:
             if leg is None or leg.filled <= 1e-9:
@@ -1116,12 +1127,16 @@ class Executor:
             cash += (price * leg.filled) if is_sell else -(price * leg.filled)
             if self.store is not None:
                 self.store.record_fill(leg.venue, leg.market_id, side, price, leg.filled)
+        tag = "HALT" if trip else "QUARANTINE"
         if self.store is not None:
-            self.store.record_pnl(cash, note=f"HALT provisional, unreconciled ({reason})")
-            self.store.audit("execute_halt", {"reason": reason, "cash": round(cash, 4),
-                                              "legs": [str(leg) for leg in legs]})
-        log.critical("HALT: %s | provisional cash %+.2f recorded for reconciliation", reason, cash)
-        return ExecutionReport(ExecStatus.HALTED, reason, legs, cash)
+            self.store.record_pnl(cash, note=f"{tag} provisional, unreconciled ({reason})")
+            self.store.audit("execute_halt" if trip else "execute_quarantine",
+                             {"reason": reason, "cash": round(cash, 4),
+                              "legs": [str(leg) for leg in legs]})
+        log.critical("%s: %s | provisional cash %+.2f recorded for reconciliation",
+                     tag, reason, cash)
+        return ExecutionReport(ExecStatus.HALTED if trip else ExecStatus.QUARANTINED,
+                               reason, legs, cash)
 
     def _audit(self, kind: str, opp: ArbOpportunity, **extra) -> None:
         if self.store is not None:
