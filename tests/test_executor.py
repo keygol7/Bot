@@ -90,6 +90,22 @@ def test_leg2_killed_unwinds_leg1():
     assert yes.calls[1][2] == "sell"                 # second yes call was the unwind
 
 
+def test_unwind_failure_auto_blacklists_pair():
+    # leg1 fills, leg2 rejects, AND the unwind also fails -> stuck naked leg -> halt. The
+    # pair must be AUTO-BLACKLISTED so the bot never re-fires this illiquid market and a
+    # restart comes up clean (no re-halt on the stranded leg). The recurring thin-prop case.
+    store = Store(":memory:")
+    yes = FakeVenue("kalshi", [
+        res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),                 # leg1 fills
+        res("kalshi", Side.YES, OrderStatus.KILLED, 0, None, action="sell"),  # unwind fails
+    ])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)])  # leg2 rejects
+    ex, risk = make_exec([yes, no], store=store)
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.HALTED and risk.is_killed
+    assert store.blacklisted_keys() == {store._pair_key("kalshi", "K1", "poly", "P1")}
+
+
 def test_reservation_drains_cache_before_legs_fire():
     # The fire-time reservation must reduce the cached balance for BOTH legs BEFORE any
     # order is placed — so a concurrent fast-loop execution sees the drain and won't

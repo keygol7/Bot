@@ -1063,8 +1063,21 @@ class Executor:
 
         legs = [leg1] + ([leg2] if leg2 is not None else []) + [unwind]
         if not unwind.filled_fully:
-            # Couldn't flatten -> we're still holding a one-sided position. Stop
-            # everything, surfacing both WHY we were unwinding and why the unwind failed.
+            # Couldn't flatten -> we're still holding a one-sided position. This market is
+            # illiquid enough that BOTH the hedge AND the unwind rejected — AUTO-BLACKLIST the
+            # pair so the bot never re-fires it (it just stranded a naked leg) and a restart
+            # comes up clean (the pair drops the watchlist -> reconcile treats the stuck leg as
+            # benign untracked, not a re-halt). Then stop, surfacing both failure reasons.
+            if self.store is not None:
+                try:
+                    self.store.blacklist_pair(
+                        opp.buy_yes_venue, opp.buy_yes_market,
+                        opp.buy_no_venue, opp.buy_no_market,
+                        reason=f"unwind failed (stuck naked leg): {reason}")
+                    log.warning("auto-blacklisted %s after unwind failure (illiquid: hedge "
+                                "AND unwind both rejected)", opp.event_key)
+                except Exception as exc:
+                    log.warning("auto-blacklist failed for %s: %s", opp.event_key, exc)
             return self._halt(
                 f"UNWIND FAILED ({reason}; unwind {unwind.status.value}: "
                 f"{_reject_reason(unwind)}) — still holding leg1, manual action required",
