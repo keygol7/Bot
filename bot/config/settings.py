@@ -239,6 +239,12 @@ class Settings:
     # of FIFO. 0 balance = off (no scarcity gate).
     exec_scarcity_balance: float = 0.0
     exec_scarcity_min_edge: float = 0.02
+    # Venue auto-balancing: when a venue's cash dips below exec_rebalance_floor, skip arbs
+    # whose leg on THAT venue is the expensive (> $0.50) side, so new spend shifts to the
+    # funded venue and the scarce side's cash lasts until settlements replenish it. Same edge
+    # captured, just allocated to keep both venues fundable (cuts the "can't-fund" idle skips
+    # from one-way draining). 0 = off.
+    exec_rebalance_floor: float = 0.0
     # Empirical fill-reliability (probe-then-scale): the live, learned replacement for the
     # volume proxy. Untested markets trade at exec_probe_contracts until their FOK orders
     # have FILLED exec_market_proven_fills times (real depth proven), then scale to full
@@ -389,6 +395,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_min_venue_balance=_env_float("EXEC_MIN_VENUE_BALANCE", 0.0),
         exec_scarcity_balance=_env_float("EXEC_SCARCITY_BALANCE", 0.0),
         exec_scarcity_min_edge=_env_float("EXEC_SCARCITY_MIN_EDGE", 0.02),
+        exec_rebalance_floor=_env_float("EXEC_REBALANCE_FLOOR", 0.0),
         exec_probe_contracts=_env_float("EXEC_PROBE_CONTRACTS", 0.0),
         exec_market_proven_fills=int(_env_float("EXEC_MARKET_PROVEN_FILLS", 3)),
         exec_market_max_fails=int(_env_float("EXEC_MARKET_MAX_FAILS", 2)),

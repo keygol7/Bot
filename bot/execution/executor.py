@@ -111,6 +111,7 @@ class Executor:
         market_ramp_factor: float = 3.0,
         scarcity_balance: float = 0.0,
         scarcity_min_edge: float = 0.02,
+        rebalance_floor: float = 0.0,
         min_lock_edge: float | None = None,
         leg2_slippage_share: float = 0.6,
         min_leg_depth: float = 0.0,
@@ -175,6 +176,9 @@ class Executor:
         # last cash for the fattest edges instead of FIFO-locking it into a 1c arb.
         self.scarcity_balance = scarcity_balance
         self.scarcity_min_edge = scarcity_min_edge
+        # Venue auto-balancing (see _rebalance_skip): below this floor, stop firing the arbs
+        # that drain a venue fastest so it self-levels instead of one-way draining to idle.
+        self.rebalance_floor = rebalance_floor
         self._market_rel: dict[tuple, tuple] = (
             self.store.market_reliability() if self.store is not None else {})
         self._balances: dict[str, float] = {}
@@ -485,10 +489,28 @@ class Executor:
                     f"(this edge {opp.edge_per_contract:.3f})")
         return None
 
+    def _rebalance_skip(self, opp: ArbOpportunity) -> str | None:
+        """Keep a draining venue alive: when one venue's cash is below the rebalance floor,
+        skip arbs whose leg on THAT venue is the EXPENSIVE (> $0.50) side. Each arb's two
+        legs sum to ~$0.97, so exactly one venue holds the expensive half — firing only the
+        arbs where the scarce venue holds the CHEAP half shifts new spend to the funded venue
+        and stretches the scarce side's cash until settlements replenish it. Same edge, just
+        allocated to keep both venues fundable (vs one-way draining to 'can't-fund' idle)."""
+        if self.rebalance_floor <= 0:
+            return None
+        for venue, leg_price in ((opp.buy_yes_venue, opp.yes_price),
+                                 (opp.buy_no_venue, opp.no_price)):
+            bal = self._balance(venue)
+            if bal is not None and bal < self.rebalance_floor and leg_price > 0.5:
+                return (f"rebalance: {venue} low (${bal:.0f} < ${self.rebalance_floor:.0f}) and "
+                        f"its leg is the expensive side (${leg_price:.2f}) — reserving for "
+                        f"cheap-on-{venue} arbs to self-level")
+        return None
+
     async def execute(self, opp: ArbOpportunity) -> ExecutionReport:
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
-        scarce = self._scarce_skip(opp)
+        scarce = self._scarce_skip(opp) or self._rebalance_skip(opp)
         if scarce is not None:
             return ExecutionReport(ExecStatus.SKIPPED, scarce)
 
@@ -781,7 +803,7 @@ class Executor:
         """
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
-        scarce = self._scarce_skip(opp)
+        scarce = self._scarce_skip(opp) or self._rebalance_skip(opp)
         if scarce is not None:
             return ExecutionReport(ExecStatus.SKIPPED, scarce)
         if self.fill_confirmer is None:

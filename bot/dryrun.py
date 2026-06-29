@@ -648,6 +648,7 @@ async def stream(
         min_venue_balance=settings.exec_min_venue_balance,
         scarcity_balance=settings.exec_scarcity_balance,
         scarcity_min_edge=settings.exec_scarcity_min_edge,
+        rebalance_floor=settings.exec_rebalance_floor,
         probe_contracts=settings.exec_probe_contracts,
         market_proven_fills=settings.exec_market_proven_fills,
         market_max_fails=settings.exec_market_max_fails,
