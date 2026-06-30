@@ -102,6 +102,7 @@ async def run_cycle(
     use_fingerprint: bool = False,
     fingerprint_metrics=None,
     close_within_days: float = 0.0,
+    kalshi_close_within_days: float = 0.0,
     match_cross_venue: bool = True,
 ) -> CycleResult:
     result = CycleResult()
@@ -115,6 +116,16 @@ async def run_cycle(
     if max_close_ts is not None:
         log.info("targeted scan: markets closing within %.2g days (max_close_ts=%d)",
                  close_within_days, max_close_ts)
+    # Kalshi-only window (see Settings.scan_kalshi_close_within_days): Kalshi's per-game lines
+    # sit past the --limit cap behind far-future noise, so scope IT to imminent markets while
+    # leaving Polymarket's full scan intact (its per-game markets carry far-future endDates).
+    kalshi_max_close_ts: int | None = (
+        int(time.time() + kalshi_close_within_days * 86400)
+        if kalshi_close_within_days > 0 else None
+    )
+    if kalshi_max_close_ts is not None:
+        log.info("kalshi targeted scan: markets closing within %.2g days (unbounded limit)",
+                 kalshi_close_within_days)
 
     # ----- Phase 1: cheap wide price scan (one list call per venue) -----
     # Price-only quotes (no depth) for every market, so we can match/shortlist
@@ -122,8 +133,14 @@ async def run_cycle(
     # down must not kill the cycle.
     quotes_by_venue: dict[str, list[MarketQuote]] = {}
     for v in venues:
+        # Per-venue scan params: Kalshi uses its own close-time window with an UNBOUNDED
+        # limit (the window, not the 5000 cap, bounds it) so its imminent per-game lines are
+        # always covered; every other venue keeps the shared limit + global window.
+        v_limit, v_max_close_ts = limit, max_close_ts
+        if v.name == "kalshi" and kalshi_max_close_ts is not None:
+            v_limit, v_max_close_ts = 0, kalshi_max_close_ts
         try:
-            qs = await v.scan_quotes(limit, max_close_ts=max_close_ts)
+            qs = await v.scan_quotes(v_limit, max_close_ts=v_max_close_ts)
         except Exception as exc:
             log.warning("scan_quotes failed for %s: %s", v.name, exc)
             quotes_by_venue[v.name] = []
@@ -424,6 +441,7 @@ async def run(
                 complete_fn=complete_fn, limit=limit, embed_fn=embed_fn,
                 max_confirms=max_confirms, max_resolve_gap_days=max_resolve_gap_days,
                 executor=executor, close_within_days=close_within_days,
+                kalshi_close_within_days=settings.scan_kalshi_close_within_days,
             )
             log.info("cycle: %s", last.summary())
             if once:
@@ -771,6 +789,7 @@ async def stream(
             use_fingerprint=settings.match_use_fingerprint,
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             close_within_days=settings.scan_close_within_days,
+            kalshi_close_within_days=settings.scan_kalshi_close_within_days,
             match_cross_venue=discover,
         )
         await refresh_balances()

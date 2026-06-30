@@ -81,6 +81,35 @@ def test_close_within_days_passes_max_close_ts_to_scan():
     assert captured == [None]                              # disabled -> no window
 
 
+def test_kalshi_close_within_days_windows_kalshi_only():
+    # The KALSHI-ONLY window scopes Kalshi to imminent markets with an UNBOUNDED limit (its
+    # per-game lines sit past the --limit cap), while Polymarket keeps the shared limit and
+    # NO window (its per-game endDates are far-future, so a window would drop them).
+    import time as _time
+
+    seen = {}
+
+    class RecordingVenue(StubVenue):
+        async def scan_quotes(self, limit=500, *, max_close_ts=None):
+            seen[self.name] = (limit, max_close_ts)
+            return []
+
+    before = _time.time()
+    asyncio.run(run_cycle(
+        [RecordingVenue("kalshi", {}), RecordingVenue("polymarket_us", {})],
+        store=None, risk=generous_risk(),
+        fee_models={"kalshi": ZeroFeeModel(), "polymarket_us": ZeroFeeModel()},
+        min_edge=0.01, match_threshold=0.3, complete_fn=None, limit=5000,
+        close_within_days=0.0, kalshi_close_within_days=30.0,
+    ))
+    after = _time.time()
+    k_limit, k_window = seen["kalshi"]
+    p_limit, p_window = seen["polymarket_us"]
+    assert k_limit == 0 and k_window is not None                 # kalshi: unbounded + windowed
+    assert int(before + 30 * 86400) <= k_window <= int(after + 30 * 86400)
+    assert p_limit == 5000 and p_window is None                  # poly: shared limit, NO window
+
+
 def test_max_confirms_caps_llm_calls_per_cycle():
     # Many candidate pairs, all with a price edge; cap LLM confirmations at 2.
     kalshi = {f"K{i}": mq("kalshi", f"K{i}", f"Team{i} game", yes_ask=0.40, yes_ask_size=100, no_ask=0.65, no_ask_size=100) for i in range(5)}
