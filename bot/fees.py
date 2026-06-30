@@ -57,3 +57,35 @@ class KalshiFeeModel:
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return f"KalshiFeeModel(rate={self.rate})"
+
+
+class PolymarketUSFeeModel:
+    """Polymarket US (QCEX) taker fee: ``rate * C * p * (1-p)`` rounded to the NEAREST
+    cent with banker's rounding (round half to even), per the published schedule
+    (effective 2026-04-03). Same price-dependent shape as Kalshi's but rate 0.05 and
+    nearest-cent rounding (Kalshi rounds UP). The bot always TAKES the Polymarket leg (it
+    rests only Kalshi makers), so the taker rate applies; the maker rebate (-0.0125) is not
+    captured. Fees near p=0 / p=1 round to $0.
+
+    This is decisive for the edge gate: at mid-prices the taker fee is ~1.25c/contract,
+    ABOVE a 1c min-edge — modelling it (vs the old ZeroFeeModel) stops the bot firing arbs
+    that are net-negative after the real fee.
+    """
+
+    def __init__(self, rate: float = 0.05) -> None:
+        if rate < 0:
+            raise ValueError("fee rate must be >= 0")
+        self.rate = rate
+
+    def fee(self, price: float, contracts: float) -> float:
+        if not (0.0 <= price <= 1.0):
+            raise ValueError(f"price must be in [0, 1], got {price}")
+        if contracts < 0:
+            raise ValueError("contracts must be >= 0")
+        raw = self.rate * contracts * price * (1.0 - price)
+        # Polymarket rounds to the NEAREST cent, half-to-even (banker's rounding).
+        from decimal import ROUND_HALF_EVEN, Decimal
+        return float(Decimal(str(raw)).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN))
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return f"PolymarketUSFeeModel(rate={self.rate})"

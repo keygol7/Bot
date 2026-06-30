@@ -8,8 +8,8 @@ Binary mapping (prices in dollars, 0..1): ``bestAsk`` is the cost to buy YES; th
 NO ask is ``1 - bestBid`` (buying NO == taking the YES bid). NOTE: ``askDepth`` /
 ``bidDepth`` in the BBO/lite payload are the NUMBER OF PRICE LEVELS, not contract
 sizes, so real takeable size comes from the full ``/book`` (``offers``/``bids`` with
-``qty``) — see :func:`normalize_book`. Standard markets are ~zero-fee
--> :class:`ZeroFeeModel`.
+``qty``) — see :func:`normalize_book`. Taker trades pay ``0.05 * C * p * (1-p)``
+(published schedule, eff. 2026-04-03) -> :class:`PolymarketUSFeeModel`.
 
 Trading (later) uses the authenticated API (`api.polymarket.us`) with X-PM-* Ed25519
 headers — see :func:`build_auth_headers` / :func:`load_ed25519_key`. Read-only here.
@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 from bot.execution.orders import OrderResult, OrderStatus
-from bot.fees import ZeroFeeModel
+from bot.fees import PolymarketUSFeeModel
 from bot.models import MarketQuote, Side
 from bot.timeutil import parse_iso8601
 from bot.venues.base import OrderNotPermitted, RawMarket
@@ -481,7 +481,7 @@ class PolymarketUSVenue:
 
     def __init__(self, cfg: Any, rate_per_min: float = 100.0) -> None:
         self.cfg = cfg
-        self.fee_model = ZeroFeeModel()
+        self.fee_model = PolymarketUSFeeModel()
         self._gateway_client = None  # public reads
         self._api_client = None      # authenticated trading (later)
         self._key = None
