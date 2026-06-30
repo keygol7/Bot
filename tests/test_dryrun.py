@@ -110,6 +110,28 @@ def test_kalshi_close_within_days_windows_kalshi_only():
     assert p_limit == 5000 and p_window is None                  # poly: shared limit, NO window
 
 
+def test_kalshi_ticker_patterns_filter_kalshi_only():
+    # The per-game pattern allowlist scopes Kalshi to an UNBOUNDED, pattern-filtered scan
+    # (embed only arbable head-to-head markets); Polymarket keeps the shared limit and gets
+    # NO ticker_patterns kwarg.
+    seen = {}
+
+    class RecordingVenue(StubVenue):
+        async def scan_quotes(self, limit=500, *, max_close_ts=None, ticker_patterns=None):
+            seen[self.name] = (limit, max_close_ts, ticker_patterns)
+            return []
+
+    asyncio.run(run_cycle(
+        [RecordingVenue("kalshi", {}), RecordingVenue("polymarket_us", {})],
+        store=None, risk=generous_risk(),
+        fee_models={"kalshi": ZeroFeeModel(), "polymarket_us": ZeroFeeModel()},
+        min_edge=0.01, match_threshold=0.3, complete_fn=None, limit=5000,
+        kalshi_ticker_patterns=("GAME", "MATCH", "FIGHT"),
+    ))
+    assert seen["kalshi"] == (0, None, ("GAME", "MATCH", "FIGHT"))   # unbounded + filtered
+    assert seen["polymarket_us"][0] == 5000 and seen["polymarket_us"][2] is None  # poly untouched
+
+
 def test_max_confirms_caps_llm_calls_per_cycle():
     # Many candidate pairs, all with a price edge; cap LLM confirmations at 2.
     kalshi = {f"K{i}": mq("kalshi", f"K{i}", f"Team{i} game", yes_ask=0.40, yes_ask_size=100, no_ask=0.65, no_ask_size=100) for i in range(5)}

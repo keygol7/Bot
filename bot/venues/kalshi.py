@@ -387,7 +387,8 @@ class KalshiVenue:
         }
 
     async def scan_quotes(
-        self, limit: int = 500, *, max_close_ts: int | None = None
+        self, limit: int = 500, *, max_close_ts: int | None = None,
+        ticker_patterns: tuple[str, ...] | None = None,
     ) -> list[MarketQuote]:
         """Phase 1: price-only quotes for open markets, up to ``limit`` markets total.
 
@@ -402,6 +403,12 @@ class KalshiVenue:
         ``max_close_ts`` query param AND enforced client-side on ``close_time`` as a
         fail-safe — so coverage is correct whether or not the server honors the param.
         Markets with no close_time are kept (don't drop a live market on missing data).
+
+        ``ticker_patterns`` (uppercase substrings) keeps ONLY markets whose ticker contains
+        one of them — the per-game allowlist. Paired with ``limit <= 0`` this scans the whole
+        board cheaply (the list endpoint is fast) but returns only the arbable head-to-head
+        markets (~3.2k of 61k), so the matcher embeds a small set: full per-game coverage at
+        baseline memory. ``None``/empty = no ticker filter.
         """
         out: list[MarketQuote] = []
         cursor: str | None = None
@@ -429,7 +436,12 @@ class KalshiVenue:
             fetched += len(markets)
             # Drop multivariate/parlay markets — not arbitrageable, junk titles.
             for m in markets:
-                if not m.get("ticker") or is_multivariate(m["ticker"]):
+                tk = m.get("ticker")
+                if not tk or is_multivariate(tk):
+                    continue
+                # Per-game allowlist: keep only arbable head-to-head market types, dropping
+                # the election/crypto/streaming bulk before it ever reaches the matcher.
+                if ticker_patterns and not any(p in tk for p in ticker_patterns):
                     continue
                 q = normalize_summary(m)
                 # Client-side fail-safe for the targeted window (server may ignore the

@@ -103,6 +103,7 @@ async def run_cycle(
     fingerprint_metrics=None,
     close_within_days: float = 0.0,
     kalshi_close_within_days: float = 0.0,
+    kalshi_ticker_patterns: tuple[str, ...] = (),
     match_cross_venue: bool = True,
 ) -> CycleResult:
     result = CycleResult()
@@ -126,6 +127,9 @@ async def run_cycle(
     if kalshi_max_close_ts is not None:
         log.info("kalshi targeted scan: markets closing within %.2g days (unbounded limit)",
                  kalshi_close_within_days)
+    if kalshi_ticker_patterns:
+        log.info("kalshi per-game scan: unbounded board filtered to %d ticker patterns (%s)",
+                 len(kalshi_ticker_patterns), ",".join(kalshi_ticker_patterns))
 
     # ----- Phase 1: cheap wide price scan (one list call per venue) -----
     # Price-only quotes (no depth) for every market, so we can match/shortlist
@@ -133,14 +137,19 @@ async def run_cycle(
     # down must not kill the cycle.
     quotes_by_venue: dict[str, list[MarketQuote]] = {}
     for v in venues:
-        # Per-venue scan params: Kalshi uses its own close-time window with an UNBOUNDED
-        # limit (the window, not the 5000 cap, bounds it) so its imminent per-game lines are
-        # always covered; every other venue keeps the shared limit + global window.
-        v_limit, v_max_close_ts = limit, max_close_ts
-        if v.name == "kalshi" and kalshi_max_close_ts is not None:
-            v_limit, v_max_close_ts = 0, kalshi_max_close_ts
+        # Per-venue scan params. Kalshi's arbable head-to-head markets sit behind 61k of
+        # election/crypto noise past the --limit cap, so scope ITS scan: the per-game pattern
+        # allowlist (preferred — unbounded board, embeds only ~3.2k arbable tickers) or a
+        # close-time window, both with an UNBOUNDED limit. Other venues keep the shared
+        # limit + global window. The pattern filter is a Kalshi-only kwarg.
+        v_limit, v_kw = limit, {"max_close_ts": max_close_ts}
+        if v.name == "kalshi" and kalshi_ticker_patterns:
+            v_limit = 0
+            v_kw = {"max_close_ts": None, "ticker_patterns": kalshi_ticker_patterns}
+        elif v.name == "kalshi" and kalshi_max_close_ts is not None:
+            v_limit, v_kw = 0, {"max_close_ts": kalshi_max_close_ts}
         try:
-            qs = await v.scan_quotes(v_limit, max_close_ts=v_max_close_ts)
+            qs = await v.scan_quotes(v_limit, **v_kw)
         except Exception as exc:
             log.warning("scan_quotes failed for %s: %s", v.name, exc)
             quotes_by_venue[v.name] = []
@@ -442,6 +451,7 @@ async def run(
                 max_confirms=max_confirms, max_resolve_gap_days=max_resolve_gap_days,
                 executor=executor, close_within_days=close_within_days,
                 kalshi_close_within_days=settings.scan_kalshi_close_within_days,
+                kalshi_ticker_patterns=settings.kalshi_scan_patterns,
             )
             log.info("cycle: %s", last.summary())
             if once:
@@ -790,6 +800,7 @@ async def stream(
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             close_within_days=settings.scan_close_within_days,
             kalshi_close_within_days=settings.scan_kalshi_close_within_days,
+            kalshi_ticker_patterns=settings.kalshi_scan_patterns,
             match_cross_venue=discover,
         )
         await refresh_balances()

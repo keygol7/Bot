@@ -157,6 +157,14 @@ class Settings:
     # far-future endDates, so a window would drop them (hence the separate, Kalshi-scoped knob).
     # 0 = disabled (fall back to the shared --limit/scan_close_within_days behavior).
     scan_kalshi_close_within_days: float = 0.0
+    # KALSHI-ONLY per-game pattern allowlist (the memory-safe coverage fix). The matcher
+    # embeds every scanned title, so memory tracks scan size. Kalshi's 61k board is mostly
+    # non-arbable (elections/crypto/streaming); the arbable head-to-head markets are
+    # identifiable by ticker substring (GAME/MATCH/FIGHT/quarter-WINNER/World-Cup props).
+    # Scanning UNBOUNDED but keeping only tickers containing one of these returns ~3.2k
+    # markets (FEWER embeds than the 5000 baseline) while covering ~3.4x the per-game lines
+    # AND every currently-confirmed pair. Empty = disabled. Applied to KALSHI only.
+    kalshi_scan_patterns: tuple[str, ...] = ()
     # Max markets to pull per venue per scan (TOTAL across paginated pages). 0 = scan the
     # ENTIRE board (every available market), not just a page. Used by the streaming loop;
     # the matched/tradeable set is still bounded by Polymarket's small universe, so this
@@ -380,6 +388,9 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         ),
         scan_close_within_days=_env_float("SCAN_CLOSE_WITHIN_DAYS", 0.0),
         scan_kalshi_close_within_days=_env_float("SCAN_KALSHI_CLOSE_WITHIN_DAYS", 0.0),
+        kalshi_scan_patterns=tuple(
+            p.strip().upper() for p in os.getenv("KALSHI_SCAN_PATTERNS", "").split(",") if p.strip()
+        ),
         scan_limit=int(_env_float("SCAN_LIMIT", 0)),
         match_sweep_past_days=_env_float("MATCH_SWEEP_PAST_DAYS", 1.0),
         stream_discovery=(env("STREAM_DISCOVERY", "true") or "true").lower() == "true",
