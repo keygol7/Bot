@@ -182,6 +182,10 @@ class Executor:
         self._market_rel: dict[tuple, tuple] = (
             self.store.market_reliability() if self.store is not None else {})
         self._balances: dict[str, float] = {}
+        # Net position per (venue, market_id), signed (+ = net long YES). Seeded from the
+        # startup snapshot, refreshed by the 30s balance poll, and updated on each settled
+        # fill — so the churn guard (_churn_skip) reads it without a hot-path venue call.
+        self._positions: dict[tuple[str, str], float] = {}
         # Bounded-aggressive limit pricing: how much edge to preserve as locked profit
         # (defaults to the risk min_edge floor).
         self.min_lock_edge = min_lock_edge
@@ -230,11 +234,48 @@ class Executor:
             self.hedge_buffer, depth, self.min_leg_depth, self.buffer_deep_depth)
 
     def set_balances(self, snapshots) -> None:
-        """Seed available cash per venue from account snapshots (startup/refresh)."""
+        """Seed available cash AND net positions per venue from account snapshots
+        (startup + the 30s poll). Cached positions drive the churn guard with no hot-path
+        venue read. Positions are rebuilt per venue each call so a settled/closed market
+        drops out of the cache rather than lingering."""
         for snap in snapshots:
             bal = getattr(snap, "balance", None)
             if bal is not None:
                 self._balances[snap.venue] = float(bal)
+            positions = getattr(snap, "positions", None)
+            if positions is not None:
+                for key in [k for k in self._positions if k[0] == snap.venue]:
+                    del self._positions[key]
+                for pos in positions:
+                    if getattr(pos, "is_open", False):
+                        self._positions[(snap.venue, pos.market_id)] = float(pos.quantity)
+
+    def _track_fill(self, yes_venue, yes_market, no_venue, no_market, size) -> None:
+        """Update the cached net position after a settled hedge: +size YES on the yes-leg,
+        -size (i.e. +NO) on the no-leg. Keeps the churn guard accurate between 30s polls."""
+        yk = (yes_venue, yes_market); nk = (no_venue, no_market)
+        self._positions[yk] = self._positions.get(yk, 0.0) + size
+        self._positions[nk] = self._positions.get(nk, 0.0) - size
+
+    def _churn_skip(self, opp) -> str | None:
+        """Block re-trading a pair in the OPPOSITE direction to the hedge we already hold.
+        Buying the reverse legs opens no new arb: on Kalshi it nets against (cancels) the
+        existing contracts and forfeits their premium (~$0.90/ct) — the dominant settled
+        loss (e.g. OMETSA -$25 over a 27-contract flip). Reads the in-memory position cache
+        (30s poll + per-fill updates) -> no hot-path venue read, latency-neutral. Flat opens
+        and same-direction adds are allowed; only a clear reverse hedge (BOTH legs already
+        opposite) is blocked, so a legitimate open is never falsely gated."""
+        tol = 0.5
+        yes_net = self._positions.get((opp.buy_yes_venue, opp.buy_yes_market), 0.0)
+        no_net = self._positions.get((opp.buy_no_venue, opp.buy_no_market), 0.0)
+        # This opp buys YES on the yes-leg (net +) and NO on the no-leg (net -). We already
+        # hold the opposite hedge iff we're net-long NO on the yes-leg AND net-long YES on
+        # the no-leg — firing would unwind it at a premium-forfeiting churn loss.
+        if yes_net < -tol and no_net > tol:
+            return (f"churn guard: pair already hedged the other way "
+                    f"(yes-leg {opp.buy_yes_market} net {yes_net:+.0f}, "
+                    f"no-leg {opp.buy_no_market} net {no_net:+.0f}) — reverse trade forfeits premium")
+        return None
 
     def _balance(self, venue: str) -> float | None:
         return self._balances.get(venue)
@@ -510,7 +551,7 @@ class Executor:
     async def execute(self, opp: ArbOpportunity) -> ExecutionReport:
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
-        scarce = self._scarce_skip(opp) or self._rebalance_skip(opp)
+        scarce = self._scarce_skip(opp) or self._rebalance_skip(opp) or self._churn_skip(opp)
         if scarce is not None:
             return ExecutionReport(ExecStatus.SKIPPED, scarce)
 
@@ -864,7 +905,7 @@ class Executor:
         """
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
-        scarce = self._scarce_skip(opp) or self._rebalance_skip(opp)
+        scarce = self._scarce_skip(opp) or self._rebalance_skip(opp) or self._churn_skip(opp)
         if scarce is not None:
             return ExecutionReport(ExecStatus.SKIPPED, scarce)
         if self.fill_confirmer is None:
@@ -1121,6 +1162,11 @@ class Executor:
         # Decrement tracked cash so the next arb sizes against what's actually left.
         self._spend(yes_leg.venue, ya * size)
         self._spend(no_leg.venue, na * size)
+        # Update the cached net position so the churn guard sees this hedge immediately
+        # (before the next 30s poll) and won't fire the reverse direction on it. Keyed off
+        # the opportunity's legs — exactly what the guard reads — not the venue's echoed ids.
+        self._track_fill(opp.buy_yes_venue, opp.buy_yes_market,
+                         opp.buy_no_venue, opp.buy_no_market, size)
         if self.store is not None:
             self.store.record_fill(yes_leg.venue, yes_leg.market_id, "YES", ya, size)
             self.store.record_fill(no_leg.venue, no_leg.market_id, "NO", na, size)

@@ -186,6 +186,63 @@ def test_rebalance_gate_skips_expensive_leg_on_drained_venue():
     assert rep.status is ExecStatus.SUCCESS
 
 
+def test_churn_guard_blocks_reverse_direction():
+    # Already holding a hedge (net-long NO on kalshi K1, net-long YES on poly P1). An opp to
+    # buy YES@kalshi + NO@poly is the REVERSE direction -> churn (forfeits Kalshi premium)
+    # -> SKIP, nothing fired.
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
+    ex, _ = make_exec([yes, no])
+    ex._positions = {("kalshi", "K1"): -3.0, ("poly", "P1"): 3.0}
+    rep = asyncio.run(ex.execute(opp()))
+    assert rep.status is ExecStatus.SKIPPED and "churn" in rep.reason
+    assert yes.calls == [] and no.calls == []
+
+
+def test_churn_guard_allows_same_direction_add():
+    # Same hedge direction already held (net-long YES@kalshi, NO@poly) -> adding deepens the
+    # hedge (not churn) -> fires, and the cache reflects the larger position afterward.
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
+    ex, _ = make_exec([yes, no])
+    ex._positions = {("kalshi", "K1"): 3.0, ("poly", "P1"): -3.0}
+    rep = asyncio.run(ex.execute(opp()))
+    assert rep.status is ExecStatus.SUCCESS
+    assert ex._positions[("kalshi", "K1")] == 5.0 and ex._positions[("poly", "P1")] == -5.0
+
+
+def test_churn_guard_allows_flat_open_and_tracks_fill():
+    # Flat on the pair -> opens normally; the settled fill is then tracked so the REVERSE
+    # opp would be blocked next time.
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
+    ex, _ = make_exec([yes, no])                       # _positions empty -> flat
+    rep = asyncio.run(ex.execute(opp()))
+    assert rep.status is ExecStatus.SUCCESS
+    assert ex._positions[("kalshi", "K1")] == 2.0 and ex._positions[("poly", "P1")] == -2.0
+    # the true reverse buys YES where we're long NO (poly P1) and NO where we're long YES
+    # (kalshi K1) -> now blocked as churn
+    from dataclasses import replace
+    rev = replace(opp(), buy_yes_venue="poly", buy_yes_market="P1",
+                  buy_no_venue="kalshi", buy_no_market="K1")
+    assert ex._churn_skip(rev) is not None
+
+
+def test_set_balances_caches_and_refreshes_positions():
+    from bot.execution.account import AccountSnapshot, VenuePosition
+    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])])
+    ex.set_balances([
+        AccountSnapshot("kalshi", 100.0, [VenuePosition("K1", -3, 0)]),
+        AccountSnapshot("poly", 100.0, [VenuePosition("P1", 3, 0)]),
+    ])
+    assert ex._positions[("kalshi", "K1")] == -3 and ex._positions[("poly", "P1")] == 3
+    assert ex._churn_skip(opp()) is not None                # reverse hedge -> blocked
+    # a later snapshot with the kalshi market settled (flat) drops it from the cache
+    ex.set_balances([AccountSnapshot("kalshi", 100.0, [])])
+    assert ("kalshi", "K1") not in ex._positions
+    assert ex._churn_skip(opp()) is None                    # no longer a reverse hedge
+
+
 def test_reservation_drains_cache_before_legs_fire():
     # The fire-time reservation must reduce the cached balance for BOTH legs BEFORE any
     # order is placed — so a concurrent fast-loop execution sees the drain and won't
