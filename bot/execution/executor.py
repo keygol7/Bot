@@ -539,13 +539,22 @@ class Executor:
         allocated to keep both venues fundable (vs one-way draining to 'can't-fund' idle)."""
         if self.rebalance_floor <= 0:
             return None
-        for venue, leg_price in ((opp.buy_yes_venue, opp.yes_price),
-                                 (opp.buy_no_venue, opp.no_price)):
+        legs = ((opp.buy_yes_venue, opp.yes_price), (opp.buy_no_venue, opp.no_price))
+        for i, (venue, leg_price) in enumerate(legs):
             bal = self._balance(venue)
-            if bal is not None and bal < self.rebalance_floor and leg_price > 0.5:
-                return (f"rebalance: {venue} low (${bal:.0f} < ${self.rebalance_floor:.0f}) and "
-                        f"its leg is the expensive side (${leg_price:.2f}) — reserving for "
-                        f"cheap-on-{venue} arbs to self-level")
+            if bal is None or bal >= self.rebalance_floor or leg_price <= 0.5:
+                continue
+            # This venue holds the expensive leg and is below the floor. Only RESERVE if the
+            # COUNTERPART venue is funded (>= floor) — i.e. there's actually a funded side to
+            # steer spend toward. If BOTH venues are below the floor there's no rebalance
+            # target, so reserving would just deadlock the bot into idle; let the trade through
+            # (the scarcity gate + min_venue_balance still guard truly-insufficient cash).
+            other_bal = self._balance(legs[1 - i][0])
+            if other_bal is not None and other_bal < self.rebalance_floor:
+                continue
+            return (f"rebalance: {venue} low (${bal:.0f} < ${self.rebalance_floor:.0f}) and "
+                    f"its leg is the expensive side (${leg_price:.2f}) — reserving for "
+                    f"cheap-on-{venue} arbs to self-level")
         return None
 
     async def execute(self, opp: ArbOpportunity) -> ExecutionReport:

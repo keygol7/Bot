@@ -185,6 +185,16 @@ def test_rebalance_gate_skips_expensive_leg_on_drained_venue():
     rep = asyncio.run(ex.execute(opp(yv="kalshi", nv="poly", yes_price=0.80, no_price=0.17)))
     assert rep.status is ExecStatus.SUCCESS
 
+    # BOTH venues below the floor -> NO funded venue to steer toward, so the gate must NOT
+    # reserve (that would deadlock the bot into idle). It fires instead. Regression for the
+    # both-drained deadlock.
+    y, n = fresh()
+    ex, _ = make_exec([y, n])
+    ex.rebalance_floor = 40.0
+    ex._balances = {"kalshi": 30.0, "poly": 39.0}        # both < $40 floor
+    rep = asyncio.run(ex.execute(opp(yv="kalshi", nv="poly", yes_price=0.80, no_price=0.17)))
+    assert rep.status is ExecStatus.SUCCESS and y.calls and n.calls
+
 
 def test_churn_guard_blocks_reverse_direction():
     # Already holding a hedge (net-long NO on kalshi K1, net-long YES on poly P1). An opp to
