@@ -881,7 +881,10 @@ class Executor:
                 ask = await self._taker_ask(taker, taker_venue)
                 if ask is None:
                     continue
-                fee = self._fee(maker[0]).fee(maker_px, size) + self._fee(taker[0]).fee(ask, size)
+                # Rested leg pays the MAKER fee; the taker (hedge) leg pays taker — mirror the
+                # arm gate so we don't cancel a maker that armed on its true (maker-fee) edge.
+                maker_fee_fn = getattr(maker_venue, "maker_fee_model", None) or self._fee(maker[0])
+                fee = maker_fee_fn.fee(maker_px, size) + self._fee(taker[0]).fee(ask, size)
                 edge_now = (size * (1.0 - maker_px - ask) - fee) / size
                 if edge_now < floor - 1e-9:
                     log.info(
@@ -951,22 +954,30 @@ class Executor:
             return ExecutionReport(
                 ExecStatus.SKIPPED, f"size < 1 (binding: {binding}={caps[binding]:.3f})")
 
-        floor = self.min_lock_edge if self.min_lock_edge is not None else self.risk.limits.min_edge
-        # Arm only when the edge clears the lock floor PLUS a drift cushion: the maker
-        # rests exposed to the taker moving against it, and the post-fill hedge is forced
-        # (we hold the maker fill), so a sub-cushion edge that drifts locks a guaranteed
-        # loss. The cushion is the maker analog of the taker path's hedge buffer.
-        arm = floor + self.maker_arm_cushion
-        if opp.edge_per_contract < arm - 1e-9:
-            return ExecutionReport(
-                ExecStatus.SKIPPED,
-                f"edge {opp.edge_per_contract:.3f} < lock {floor:.3f} + maker cushion "
-                f"{self.maker_arm_cushion:.3f} — would risk an adverse-fill loss")
-
         maker_venue = self.venues.get(maker[0])
         taker_venue = self.venues.get(taker[0])
         if maker_venue is None or taker_venue is None:
             return ExecutionReport(ExecStatus.SKIPPED, "venue not available")
+
+        floor = self.min_lock_edge if self.min_lock_edge is not None else self.risk.limits.min_edge
+        # Re-price the edge with the RESTED leg at its MAKER fee (not the taker fee the matcher
+        # charged it) and at the real order size: the Kalshi maker fee (0.0175) is ~4x below the
+        # taker rate (0.07), so charging taker here would skip thin maker arbs that are genuinely
+        # profitable. The taker (hedge) leg keeps its taker fee. _rest_with_drift_guard mirrors
+        # this, so a maker armed on its real edge isn't immediately cancelled on the same basis.
+        maker_fee_fn = getattr(maker_venue, "maker_fee_model", None) or self._fee(maker[0])
+        fee = maker_fee_fn.fee(maker[3], size) + self._fee(taker[0]).fee(taker[3], size)
+        maker_edge = (size * (1.0 - maker[3] - taker[3]) - fee) / size
+        # Arm only when the edge clears the lock floor PLUS a drift cushion: the maker rests
+        # exposed to the taker moving against it, and the post-fill hedge is forced (we hold the
+        # maker fill), so a sub-cushion edge that drifts locks a guaranteed loss. The cushion is
+        # the maker analog of the taker path's hedge buffer.
+        arm = floor + self.maker_arm_cushion
+        if maker_edge < arm - 1e-9:
+            return ExecutionReport(
+                ExecStatus.SKIPPED,
+                f"maker edge {maker_edge:.3f} < lock {floor:.3f} + maker cushion "
+                f"{self.maker_arm_cushion:.3f} — would risk an adverse-fill loss")
 
         # Don't arm a maker we can't hedge. Re-read the taker (hedge) leg's LIVE book and
         # SIZE DOWN to its real top-of-book depth; skip entirely if it can't fill at all

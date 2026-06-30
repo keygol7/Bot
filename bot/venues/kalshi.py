@@ -304,9 +304,14 @@ class KalshiVenue:
 
     name = VENUE
 
-    def __init__(self, cfg: Any, fee_rate: float = 0.07, rate_per_min: float = 55.0) -> None:
+    def __init__(self, cfg: Any, fee_rate: float = 0.07, maker_fee_rate: float = 0.0175,
+                 rate_per_min: float = 55.0) -> None:
         self.cfg = cfg
         self.fee_model = KalshiFeeModel(rate=fee_rate)
+        # Maker fee (resting orders): 0.0175 vs 0.07 taker (Kalshi schedule, eff. 2026-06-29).
+        # The executor RESTS the Kalshi leg as a maker, so its real fee is this, not the taker
+        # rate — used to credit the maker arm gate so profitable thin arbs aren't skipped.
+        self.maker_fee_model = KalshiFeeModel(rate=maker_fee_rate)
         self._client = None  # lazy httpx.AsyncClient
         self._private_key = None
         self._base_path = urlsplit(cfg.api_base).path.rstrip("/")  # e.g. /trade-api/v2

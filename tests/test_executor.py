@@ -596,6 +596,32 @@ def test_execute_maker_fills_then_hedges_locks_arb():
     assert poly.calls[0][2] == "buy"               # poly taken as the hedge
 
 
+def test_maker_fee_credit_arms_thin_arb_that_taker_fee_would_skip():
+    # A 2c raw spread on a mid-priced pair: at the Kalshi TAKER fee (0.07) the maker leg's
+    # edge is ~0.25c < the 0.5c floor (skip), but at the real MAKER fee (0.0175) it's ~1.5c,
+    # so it should arm and lock. Proves the rested leg is priced at the maker fee.
+    from bot.fees import KalshiFeeModel
+
+    def build(maker_model):
+        kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+        if maker_model is not None:
+            kalshi.maker_fee_model = maker_model
+        poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 40, 0.49)])
+        risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
+        ex = Executor({"kalshi": kalshi, "poly": poly}, risk,
+                      fee_models={"kalshi": KalshiFeeModel(0.07), "poly": ZeroFeeModel()},
+                      max_order_contracts=0, min_lock_edge=0.005,
+                      fill_confirmer=FakeConfirmer({"kalshi": (OrderStatus.FILLED, 40, 0.49)}),
+                      maker_timeout=0.01)
+        return ex
+    o = opp(yv="poly", nv="kalshi", max_contracts=40, yes_price=0.49, no_price=0.49)
+    # maker fee modeled -> arms and locks
+    assert asyncio.run(build(KalshiFeeModel(0.0175)).execute_maker(o)).status is ExecStatus.SUCCESS
+    # taker fee on the rested leg (no maker model) -> the same thin arb is skipped
+    rep = asyncio.run(build(None).execute_maker(o))
+    assert rep.status is ExecStatus.SKIPPED and "maker edge" in rep.reason
+
+
 def test_execute_maker_hedge_reprices_off_live_book():
     # Poly moved while the maker rested: the hedge must cross the LIVE ask (0.50), not
     # the stale opp price (0.40) — otherwise it kills and forces an unwind.
