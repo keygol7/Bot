@@ -412,13 +412,77 @@ def test_leg1_error_reconciles_flat_and_skips():
     assert not risk.is_killed and poly.calls == []     # not killed -> keeps trading
 
 
-def test_leg1_error_with_real_position_halts():
+def test_leg1_error_completes_hedge_and_locks():
+    # Leg-1 ERROR but the order ACTUALLY FILLED (a real position exists) — the executed-but-
+    # unacked case. Instead of halting naked, the executor completes the hedge for the unhedged
+    # imbalance and LOCKS the arb (the recovery a human did by hand for the Valorant DKGENA halt).
     from bot.execution.account import VenuePosition
     kalshi = SnapshotVenue(
         "kalshi", [res("kalshi", Side.YES, OrderStatus.ERROR, 0, None)],
-        [VenuePosition("K1", 5, 0)],                    # a real naked position exists
+        [VenuePosition("K1", 2, 0)],                    # leg1 errored-but-filled: 2 naked
     )
-    poly = FakeVenue("poly", [])
+    poly = SnapshotVenue(
+        "poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)],  # hedge completes
+        [],                                              # poly flat -> unhedged = 2 - 0
+    )
+    ex, risk = make_exec([kalshi, poly])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.SUCCESS
+    assert not risk.is_killed                            # locked, not halted
+    assert poly.calls and poly.calls[0][4] == 2          # hedge fired for the 2 naked contracts
+
+
+def test_leg1_error_hedge_completion_fails_halts():
+    # Leg-1 ERROR left a position, but the recovery hedge can't fill -> we now KNOW it's naked
+    # -> halt for manual reconcile (no silent drift).
+    from bot.execution.account import VenuePosition
+    kalshi = SnapshotVenue(
+        "kalshi", [res("kalshi", Side.YES, OrderStatus.ERROR, 0, None)],
+        [VenuePosition("K1", 2, 0)],
+    )
+    poly = SnapshotVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)], [])
+    ex, risk = make_exec([kalshi, poly])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.HALTED and risk.is_killed
+
+
+def test_leg1_error_excess_imbalance_halts():
+    # The naked position EXCEEDS this trade's size (e.g. prior accumulation) -> don't auto-fire
+    # a large unexplained order; halt for manual reconcile and DON'T touch the book.
+    from bot.execution.account import VenuePosition
+    kalshi = SnapshotVenue(
+        "kalshi", [res("kalshi", Side.YES, OrderStatus.ERROR, 0, None)],
+        [VenuePosition("K1", 50, 0)],                    # 50 naked vs trade size 2
+    )
+    poly = SnapshotVenue("poly", [], [])                 # readable, flat
+    ex, risk = make_exec([kalshi, poly])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.HALTED and risk.is_killed
+    assert poly.calls == []                              # excess guard fired before any hedge
+
+
+def test_leg1_error_already_balanced_skips():
+    # Leg-1 ERROR but BOTH legs already hold the position (covered by prior hedged fills) — no
+    # naked remainder -> skip and keep trading, don't halt and don't double-hedge.
+    from bot.execution.account import VenuePosition
+    kalshi = SnapshotVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.ERROR, 0, None)],
+                           [VenuePosition("K1", 3, 0)])
+    poly = SnapshotVenue("poly", [], [VenuePosition("P1", 3, 0)])
+    ex, risk = make_exec([kalshi, poly])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.SKIPPED and not risk.is_killed
+    assert poly.calls == []
+
+
+def test_leg1_error_unreadable_hedge_side_halts():
+    # Leg-1 ERROR with a position, but the hedge venue can't be read (no snapshot) -> can't
+    # compute the imbalance -> fail closed (halt) rather than guess.
+    from bot.execution.account import VenuePosition
+    kalshi = SnapshotVenue(
+        "kalshi", [res("kalshi", Side.YES, OrderStatus.ERROR, 0, None)],
+        [VenuePosition("K1", 2, 0)],
+    )
+    poly = FakeVenue("poly", [])                         # no account_snapshot -> unreadable
     ex, risk = make_exec([kalshi, poly])
     report = asyncio.run(ex.execute(opp()))
     assert report.status is ExecStatus.HALTED and risk.is_killed

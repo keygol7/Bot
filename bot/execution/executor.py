@@ -634,9 +634,16 @@ class Executor:
                 return ExecutionReport(
                     ExecStatus.SKIPPED,
                     f"leg1 ERROR, account flat — no position ({_reject_reason(leg1)})", [leg1])
+            if left is True:
+                # The order EXECUTED (a real position exists) but its HTTP response failed —
+                # so the Kalshi hedge never fired and this leg is naked. Rather than halt the
+                # whole bot, COMPLETE THE HEDGE for the unhedged imbalance to lock the arb
+                # (the same recovery a human does by hand). Only halt if it can't be done safely.
+                return await self._complete_hedge_after_leg1_error(
+                    opp, size, first, second, first_venue, second_venue, leg1)
+            # left is None -> couldn't read the account -> genuinely unknown -> fail closed.
             return self._halt(
-                f"leg1 ERROR — {'position exists' if left else 'fill state unknown'} "
-                f"({_reject_reason(leg1)})", [leg1])
+                f"leg1 ERROR — fill state unknown ({_reject_reason(leg1)})", [leg1])
         if not leg1.left_a_position:
             # Clean: the first leg didn't fill, so NO position was taken — just skip.
             return ExecutionReport(
@@ -709,6 +716,60 @@ class Executor:
             f"leg2 ambiguous ({leg2.status.value}: {_reject_reason(leg2)}) — manual reconcile",
             [leg1, leg2],
         )
+
+    async def _complete_hedge_after_leg1_error(
+        self, opp, size, first, second, first_venue, second_venue, leg1,
+    ) -> ExecutionReport:
+        """Leg 1 errored ambiguously but LEFT A POSITION (the order executed; only its HTTP
+        response failed), so the hedge never fired and the leg is naked. COMPLETE THE HEDGE:
+        read both legs' real positions, fire the hedge leg for the unhedged imbalance, and
+        settle the locked arb. Returns SUCCESS on recovery, SKIPPED if already balanced, or
+        HALT if it can't safely complete.
+
+        We hedge ``first_pos - second_pos`` (the imbalance) rather than leg 1's reported size:
+        a leg-1 FOK can partial-fill (observed on Polymarket), and the market may already carry
+        HEDGED prior fills, so only the imbalance is the true unhedged amount — robust to both.
+        Bounded to this trade's ``size`` so a bookkeeping surprise can't auto-fire a huge order."""
+        fpos = await self._hedge_qty_after_error(first_venue, first[1])
+        spos = await self._hedge_qty_after_error(second_venue, second[1])
+        if fpos is None or spos is None:
+            return self._halt(
+                f"leg1 ERROR — position exists but couldn't read both legs to complete the "
+                f"hedge ({_reject_reason(leg1)})", [leg1])
+        unhedged = round(fpos - spos, 6)
+        if unhedged < 1.0:
+            # Legs already balanced (the position is covered by prior hedged fills) — no naked
+            # remainder from this error. Safe to skip and keep trading.
+            log.warning("leg1 ERROR on %s but legs already balanced (%g vs %g) — no naked, skipping",
+                        first[1], fpos, spos)
+            return ExecutionReport(
+                ExecStatus.SKIPPED,
+                f"leg1 ERROR, legs balanced ({fpos:g}/{spos:g}) — no naked ({_reject_reason(leg1)})",
+                [leg1])
+        if unhedged > size + 1e-9:
+            # More naked than this trade asked for — an unexplained excess we shouldn't chase
+            # automatically. Halt for manual reconciliation.
+            return self._halt(
+                f"leg1 ERROR — naked imbalance {unhedged:g} exceeds trade size {size:g} on "
+                f"{first[1]} ({_reject_reason(leg1)})", [leg1])
+        # Fire the hedge (reliable, second) leg for exactly the unhedged amount.
+        hedge = await self._place(
+            second_venue, second[1], second[2], "buy", second[3], unhedged, "fill_or_kill")
+        log.info("leg1-ERROR recovery hedge %s", hedge)
+        if hedge.status is OrderStatus.FILLED and hedge.filled_fully:
+            # Reconstruct leg 1 at the recovered (now-balanced) size for settle accounting; its
+            # fill price is unknown after the error, so use its limit (the FOK ceiling).
+            leg1_recovered = replace(
+                leg1, status=OrderStatus.FILLED, filled=unhedged,
+                avg_price=leg1.avg_price if leg1.avg_price is not None else first[3])
+            log.warning("leg1 ERROR RECOVERED on %s|%s: completed hedge of %g — LOCKED instead "
+                        "of halting naked", first[1], second[1], unhedged)
+            return self._settle_success(opp, unhedged, [leg1_recovered, hedge])
+        # Hedge didn't complete -> still naked, and now we KNOW it (not ambiguous). Halt so the
+        # remainder is reconciled by hand rather than left to drift.
+        return self._halt(
+            f"leg1 ERROR — hedge-completion failed ({hedge.status.value}: "
+            f"{_reject_reason(hedge)}); {unhedged:g} still naked on {first[1]}", [leg1, hedge])
 
     async def _cancel_maker(self, venue, order_id) -> None:
         """Best-effort cancel of a resting maker. A GOOD_TILL_CANCEL maker does not
