@@ -125,6 +125,32 @@ def test_reconcile_halts_when_both_legs_open_real_naked():
     assert fe.risk.is_killed
 
 
+def test_reconcile_treats_empty_venue_read_as_down_not_naked():
+    # Poly's API returns ZERO positions (an outage) while Kalshi holds hedges on 2+ pairs, so
+    # every pair looks naked at once. That's a venue-DOWN/stale read, not simultaneous hedge
+    # failures — it must NOT halt even when it persists across checks (the outage spans them).
+    fe = _ExecR()
+    async def depth(v, m): return _open_quote("MARKET_STATE_OPEN")   # markets OPEN (not settled)
+    async def opencheck(v, m): return True
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 5000.0, reconcile_halt=True,
+        depth_fetch=depth, open_check=opencheck)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1"),
+                   ConfirmedPair("E2", "kalshi", "K2", "poly", "P2")])
+    down = [_snap("kalshi", [("K1", 40), ("K2", 30)]), _snap("poly", [])]   # poly empty (down)
+    asyncio.run(eng.reconcile_positions(down))
+    asyncio.run(eng.reconcile_positions(down))          # persists across checks, but it's a down-read
+    assert not fe.risk.is_killed                         # NOT halted (venue down, not naked)
+
+    # a SINGLE pair naked on an empty venue is below the threshold -> still treated as real
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    one = [_snap("kalshi", [("K1", 40)]), _snap("poly", [])]
+    asyncio.run(eng.reconcile_positions(one))
+    asyncio.run(eng.reconcile_positions(one))
+    assert fe.risk.is_killed                             # isolated naked still halts
+
+
 def test_reconcile_skips_settled_and_removed_leg_404():
     # Poly settled AND was pruned -> /book 404 -> is_open None AND quote state None. The
     # 0-position leg whose market is now unreadable is a settled leftover (not a stranded

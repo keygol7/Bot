@@ -149,6 +149,12 @@ class StreamingEngine:
         # balance poll) caught a burst mid-flight and FALSE-halted on a pair that was fully
         # hedged seconds later. A real stranded leg persists after trading quiesces.
         self._reconcile_grace = 25.0
+        # Venue-DOWN guard: if a venue's snapshot comes back empty (its API is down/erroring,
+        # as Polymarket did), EVERY hedge on it reads 0 and looks naked at once. Real hedge
+        # failures are isolated (the executor halts on a single one), so this many pairs going
+        # naked simultaneously with the SAME venue reading ZERO total positions is a stale read,
+        # not simultaneous failures — skip the halt for those (the next healthy cycle re-checks).
+        self._venue_down_min = 2
         self._imbalanced_prev: set = set()      # pairs imbalanced last check (persistence)
         # How many of the best edges the periodic snapshot logs each interval.
         self.edge_snapshot_top = edge_snapshot_top
@@ -642,11 +648,14 @@ class StreamingEngine:
         excluded from the halt (genuine stranded legs are caught at execution time).
         """
         pos: dict[tuple[str, str], float] = {}
+        venue_open: dict[str, int] = {}          # per-venue count of open positions (for down-detect)
         for snap in snapshots or []:
             venue = getattr(snap, "venue", None)
+            venue_open.setdefault(venue, 0)
             for vp in getattr(snap, "positions", None) or []:
                 if getattr(vp, "is_open", False) and abs(getattr(vp, "quantity", 0.0)) > 1e-9:
                     pos[(venue, vp.market_id)] = abs(vp.quantity)
+                    venue_open[venue] += 1
 
         imbalanced, paired_markets = [], set()
         for p in self._pairs.values():
@@ -667,6 +676,30 @@ class StreamingEngine:
         if untracked:
             log.info("RECONCILE: %d held position(s) on unpaired markets (verify hedged): %s",
                      len(untracked), ", ".join(f"{v}:{m}={q:g}" for v, m, q in untracked[:8]))
+
+        # Drop imbalances caused by a venue-DOWN read: if a venue returned ZERO open positions
+        # (its API is down/erroring) yet >= _venue_down_min pairs hold their hedge on it, every
+        # one of those looks naked at once — a stale read, not simultaneous hedge failures. Skip
+        # them (don't halt); the next healthy cycle re-checks. A single-pair naked, or nakeds
+        # split across both venues, still flows through to the real halt logic.
+        if imbalanced:
+            zero_side = {}                        # venue -> # pairs whose leg on it reads ~0
+            for p, qa, qb in imbalanced:
+                if qa <= self._reconcile_tol:
+                    zero_side[p.venue_a] = zero_side.get(p.venue_a, 0) + 1
+                if qb <= self._reconcile_tol:
+                    zero_side[p.venue_b] = zero_side.get(p.venue_b, 0) + 1
+            down = {v for v, n in zero_side.items()
+                    if n >= self._venue_down_min and venue_open.get(v, 0) == 0}
+            if down:
+                before = len(imbalanced)
+                imbalanced = [
+                    (p, qa, qb) for p, qa, qb in imbalanced
+                    if not ((qa <= self._reconcile_tol and p.venue_a in down)
+                            or (qb <= self._reconcile_tol and p.venue_b in down))]
+                log.warning("RECONCILE: %s returned 0 positions while %d pair(s) hold a hedge "
+                            "on it — treating as venue DOWN/stale read, NOT naked; skipping halt "
+                            "for those this cycle", ",".join(sorted(down)), before - len(imbalanced))
 
         # Drop imbalances where a leg's market has SETTLED — a realized arb leftover, not a
         # stranded hedge (those halt at execution time). Checked only on imbalance (rare).
