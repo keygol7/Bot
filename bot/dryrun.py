@@ -224,7 +224,7 @@ async def run_cycle(
                 # what the watchlist will actually trade.
                 if use_fingerprint:
                     from bot.matching.fingerprint import (
-                        are_complementary, from_kalshi, from_polymarket,
+                        complement_reason, from_kalshi, from_polymarket,
                     )
 
                     def _fpq(q):
@@ -232,7 +232,15 @@ async def run_cycle(
                                 else from_polymarket(q.market_id, q.title))
 
                     fa, fb = _fpq(c.a), _fpq(c.b)
-                    if not are_complementary(fa, fb):
+                    reason = complement_reason(fa, fb)
+                    # "subject-sub-org" is AMBIGUOUS, not a mismatch: 'X' vs 'X Academy'
+                    # is either one venue shortening the SAME academy team's name (a real
+                    # pair) or the org vs its academy squad (the BESTIA false match). The
+                    # deterministic sweep never trades these, but discovery FORWARDS them
+                    # to the LLM (full titles, warned about academy squads); any verdict-
+                    # admitted pair still faces the empirical sum gate + rules
+                    # verification (material divergence demotes) before real size fires.
+                    if reason not in ("ok", "subject-sub-org"):
                         continue
                     if fingerprint_metrics and fa.metric not in fingerprint_metrics:
                         continue

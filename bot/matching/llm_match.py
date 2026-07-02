@@ -42,6 +42,11 @@ Answer "same_event": true ONLY if BOTH YES parties are the SAME individual/team 
 is the same contest. Different party, different match, or any doubt -> false. Allow for
 spelling/transliteration variants of the SAME person (e.g. "Ghoddos"/"Ghoddoos",
 "van Dijk"/"Van Dijk") — judge the real-world identity, not the exact string.
+CAUTION: an esports org and its ACADEMY/junior/youth squad are DIFFERENT teams playing
+DIFFERENT matches ("BESTIA" vs "BESTIA Academy"). When one title carries an
+Academy/Jr/youth marker and the other does not, answer true ONLY if you are confident
+both refer to the SAME squad in the SAME contest (e.g. identical opponent and the
+shorter name is clearly an abbreviation of the academy squad); any doubt -> false.
 
 EXAMPLES (these are FALSE):
   - A: "Allan Nascimento win the fight" / B: "Mitch Raposo win ... in Nascimento vs

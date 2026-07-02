@@ -399,6 +399,21 @@ def _subjects_align(a: frozenset, b: frozenset) -> bool:
     return not (large - small) & _SUB_ORG
 
 
+def _subject_sub_org_ambiguous(a: frozenset, b: frozenset) -> bool:
+    """True when the subjects WOULD align except a sub-org residue marker — the
+    ambiguous class ('BESTIA' vs 'BESTIA Academy'): either one venue shortened the SAME
+    academy team's name, or they're the org and its academy (different teams). Not
+    deterministically matchable — but escalatable to the title-LLM + rules verification
+    instead of a hard kill (a one-sided shortening of a real academy pair would
+    otherwise never trade)."""
+    if not a or not b:
+        return False
+    small, large = (a, b) if len(a) <= len(b) else (b, a)
+    if not all(_token_matches(x, large) for x in small):
+        return False
+    return bool((large - small) & _SUB_ORG)
+
+
 def complement_reason(a: ContractFingerprint, b: ContractFingerprint,
                       max_gap_days: float = 3.0) -> str:
     """``"ok"`` if complementary, else the first failing check (for shadow diagnostics)."""
@@ -430,6 +445,10 @@ def complement_reason(a: ContractFingerprint, b: ContractFingerprint,
     if a.metric in _QUESTION_SUBJECT_METRICS and _event_overlap(a.event, b.event) is False:
         return f"event {sorted(a.event)}!={sorted(b.event)}"
     if not _subjects_align(a.subject, b.subject):
+        if _subject_sub_org_ambiguous(a.subject, b.subject):
+            # Distinct reason: the deterministic sweep must NOT match these, but the
+            # discovery gate may forward them to the LLM/rules stack for arbitration.
+            return "subject-sub-org"
         return f"subject {sorted(a.subject)}!={sorted(b.subject)}"
     return "ok"
 
