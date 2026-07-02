@@ -213,6 +213,10 @@ class Executor:
         # long fill history lends its NEW markets a real starting size; per-market streak
         # exclusion still bounds any individual phantom book.
         self._family_rel: dict[tuple, list] = {}    # (venue, family) -> [fills, fails, max_fill]
+        # Size-aware reliability state (in-memory; a restart re-probes, which is safe):
+        self._size_ceiling: dict[tuple, tuple] = {}   # key -> (max size, expires_at)
+        self._excluded_until: dict[tuple, float] = {} # key -> phantom-cooldown expiry
+        self.size_ceiling_ttl = 120.0                 # seconds a big-size reject caps size
         for (venue, market_id), (fills, fails, _streak, max_fill) in self._market_rel.items():
             fam = self._family_rel.setdefault(_family(venue, market_id), [0, 0, 0.0])
             fam[0] += fills
@@ -362,32 +366,68 @@ class Executor:
             ok = result.status is OrderStatus.FILLED
             self._record_market_reliability(
                 getattr(venue, "name", "?"), market_id, ok,
-                result.filled if ok else 0.0)
+                result.filled if ok else 0.0, attempted=contracts)
         return result
 
     def _record_market_reliability(self, venue: str, market_id: str, ok: bool,
-                                   fill_size: float = 0.0) -> None:
+                                   fill_size: float = 0.0, attempted: float = 0.0) -> None:
+        """Size-aware, self-healing reliability.
+
+        A reject is only PHANTOM evidence when it happened at PROBE size — a reject at 20
+        contracts says "no 20 of depth right now", not "this book is fake" (live data:
+        markets with 2-4 REAL fills were permanently excluded after two momentarily-thin
+        rejects mid-game). So:
+          - reject at size > probe  -> a TEMPORARY size ceiling (half the attempt, short
+            TTL): retry smaller, no streak, no persisted fail;
+          - reject at probe size    -> the phantom streak; crossing max_fails EXCLUDES for
+            a cooldown (5 min, doubling per extra strike, capped 30 min) after which the
+            market re-probes at 1 contract — never a permanent ratchet (the old cap=0
+            forever meant the streak could never reset: 41 markets were dead-listed, some
+            with real fill history, spamming futile reliability=0 skips);
+          - any FILL              -> clears the ceiling and resets the streak.
+        """
         key = (venue, market_id)
         fills, fails, streak, max_fill = self._market_rel.get(key, (0, 0, 0, 0.0))
-        self._market_rel[key] = (fills + (1 if ok else 0), fails + (0 if ok else 1),
-                                 0 if ok else streak + 1,
-                                 max(max_fill, fill_size) if ok else max_fill)
-        fam = self._family_rel.setdefault(_family(venue, market_id), [0, 0, 0.0])
-        fam[0] += 1 if ok else 0
-        fam[1] += 0 if ok else 1
         if ok:
+            self._market_rel[key] = (fills + 1, fails, 0, max(max_fill, fill_size))
+            self._size_ceiling.pop(key, None)
+            self._excluded_until.pop(key, None)
+            fam = self._family_rel.setdefault(_family(venue, market_id), [0, 0, 0.0])
+            fam[0] += 1
             fam[2] = max(fam[2], fill_size)
+            if self.store is not None:
+                try:
+                    self.store.record_market_outcome(venue, market_id, True, fill_size)
+                except Exception as exc:
+                    log.warning("market reliability write failed for %s: %s", market_id, exc)
+            return
+        if attempted > self.probe_contracts + 1e-9:
+            # Not phantom evidence — the book just can't fill THIS size right now.
+            ceiling = max(float(self.probe_contracts), attempted / 2.0)
+            self._size_ceiling[key] = (ceiling, time.time() + self.size_ceiling_ttl)
+            log.info("reliability: %s:%s FOK reject at %g — size-capped to %g for %.0fs "
+                     "(not phantom evidence)", venue, market_id, attempted, ceiling,
+                     self.size_ceiling_ttl)
+            return
+        # Probe-size reject: real phantom evidence.
+        streak += 1
+        self._market_rel[key] = (fills, fails + 1, streak, max_fill)
+        fam = self._family_rel.setdefault(_family(venue, market_id), [0, 0, 0.0])
+        fam[1] += 1
         if self.store is not None:
             try:
-                self.store.record_market_outcome(venue, market_id, ok, fill_size)
+                self.store.record_market_outcome(venue, market_id, False, 0.0)
             except Exception as exc:
                 log.warning("market reliability write failed for %s: %s", market_id, exc)
-        if not ok:
-            f, x, s, _mf = self._market_rel[key]
-            log.info("reliability: %s:%s FOK failed (%d fills/%d fails/%d streak) — "
-                     "%s", venue, market_id, f, x, s,
-                     "EXCLUDED (depth vanished)" if s >= self.market_max_fails
-                     else "probe-gated until proven")
+        if streak >= self.market_max_fails:
+            cooldown = min(300.0 * (2 ** (streak - self.market_max_fails)), 1800.0)
+            self._excluded_until[key] = time.time() + cooldown
+            log.info("reliability: %s:%s probe FOK failed (%d fills/%d fails/%d streak) — "
+                     "excluded for %.0fs, then re-probes", venue, market_id,
+                     fills, fails + 1, streak, cooldown)
+        else:
+            log.info("reliability: %s:%s probe FOK failed (%d fills/%d fails/%d streak) — "
+                     "probe-gated until proven", venue, market_id, fills, fails + 1, streak)
 
     async def _position_after_error(self, venue, market_id):
         """After an ambiguous leg ERROR, ask the venue whether a position actually
@@ -529,33 +569,41 @@ class Executor:
         (or repeated fails before proving) excludes."""
         fills, fails, streak, max_fill = self._market_rel.get(
             (venue, market_id), (0, 0, 0, 0.0))
-        # CONSECUTIVE fails exclude EVEN a once-proven market: a Valorant/tennis market that
-        # filled early then had its depth drain as the game wound down kept firing into
-        # vanished volume -> repeated hedge-reject unwinds. A live fill resets the streak.
+        key = (venue, market_id)
+        now = time.time()
+        # Phantom exclusion is a COOLDOWN, never a ratchet: while it lasts the market is
+        # out; when it expires the market re-probes at probe size (a fill then resets the
+        # streak; another probe-reject doubles the next cooldown). The old permanent cap=0
+        # could never recover — the streak could only reset on a fill that could never fire.
         if streak >= self.market_max_fails:
-            return 0.0
-        if fills < self.market_proven_fills:
-            if fails >= self.market_max_fails:
+            if now < self._excluded_until.get(key, 0.0):
                 return 0.0
+            return float(self.probe_contracts)
+        if fills < self.market_proven_fills:
             # FAMILY INHERITANCE: markets are ephemeral (hours), so per-market learning
             # never transfers and 67% of fires were stuck at the probe. A family with a
             # long, healthy fill history (>= 10 fills, <= 30% failure rate) lends its new
             # markets a real starting size — half its largest demonstrated fill. A failed
-            # FOK is a $0 clean reject (leg ordering puts the reject-prone leg first), and
-            # this market's OWN streak still excludes it after market_max_fails misses.
+            # FOK at that size is a $0 clean reject that only sets a TEMPORARY size
+            # ceiling (below); only probe-size rejects count phantom strikes.
             ffills, ffails, fmax = self._family_rel.get(
                 _family(venue, market_id), (0, 0, 0.0))
             attempts = ffills + ffails
             if ffills >= 10 and attempts > 0 and ffails / attempts <= 0.30:
-                return max(float(self.probe_contracts), fmax * 0.5)
-            return float(self.probe_contracts)
-        # Proven real -> scale on DEMONSTRATED depth: allow up to ramp_factor x the largest
-        # size a FOK has actually filled here. A real deep market reaches full size in a few
-        # fills (each success roughly multiplies the ceiling), so we don't lose edge to a slow
-        # per-fill count; a market that only ever fills small can't jump past ramp_factor x
-        # what it proved, so a phantom-at-size book can't strand a large naked leg. The live
-        # deep-cushion (_hedge_fillable) and order cap still bind each actual fire.
-        return max(float(self.probe_contracts), max_fill * self.market_ramp_factor)
+                base = max(float(self.probe_contracts), fmax * 0.5)
+            else:
+                base = float(self.probe_contracts)
+        else:
+            # Proven real -> scale on DEMONSTRATED depth: up to ramp_factor x the largest
+            # size a FOK has actually filled here. The live deep-cushion and order cap
+            # still bind each actual fire.
+            base = max(float(self.probe_contracts), max_fill * self.market_ramp_factor)
+        # Temporary size ceiling from a recent bigger-size reject: retry smaller until it
+        # expires or a fill clears it.
+        ceiling, until = self._size_ceiling.get(key, (0.0, 0.0))
+        if now < until:
+            base = min(base, ceiling)
+        return base
 
     def _leg_limits(self, opp: ArbOpportunity, first_side, second_side) -> tuple[float, float]:
         """Limit prices for the (first, second) legs that may pay worse than the quoted

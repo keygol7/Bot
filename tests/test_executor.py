@@ -375,13 +375,21 @@ def test_reliability_scales_proven_market_on_demonstrated_fill_size():
 
 
 def test_reliability_excludes_repeatedly_failing_market():
-    # A market that has KILL/REJECTed max_fails times without ever proving is excluded (cap 0).
+    # A market that KILL/REJECTed at probe size max_fails times is excluded for a COOLDOWN
+    # (cap 0 while it lasts), then re-probes at probe size — never a permanent ratchet
+    # (the old cap-0-forever meant the streak could never reset: 41 markets dead-listed).
+    import time as _time
     yes = FakeVenue("kalshi", [])
     no = FakeVenue("poly", [])
     ex = _rel_exec([yes, no])
     ex._market_rel[("poly", "P1")] = (0, 2, 2, 0.0)    # poly leg proven phantom
+    ex._excluded_until[("poly", "P1")] = _time.time() + 300   # cooling down
     size, caps = ex._max_size(opp(max_contracts=100))
     assert caps["reliability"] == 0 and size == 0
+    # cooldown expired -> re-probes at probe size, NOT dead forever
+    ex._excluded_until[("poly", "P1")] = _time.time() - 1
+    _, caps2 = ex._max_size(opp(max_contracts=100))
+    assert caps2["reliability"] == ex.probe_contracts
 
 
 def test_reliability_excludes_proven_market_on_consecutive_fail_streak():
@@ -391,8 +399,10 @@ def test_reliability_excludes_proven_market_on_consecutive_fail_streak():
     yes = FakeVenue("kalshi", [])
     no = FakeVenue("poly", [])
     ex = _rel_exec([yes, no])
+    import time as _time
     ex._market_rel[("kalshi", "K1")] = (5, 3, 2, 6.0)  # proven, but 2 consecutive fails now
     ex._market_rel[("poly", "P1")] = (8, 0, 0, 6.0)
+    ex._excluded_until[("kalshi", "K1")] = _time.time() + 300
     size, caps = ex._max_size(opp(max_contracts=100))
     assert caps["reliability"] == 0 and size == 0
     # ...and a single fresh fill resets the streak -> trades again (scaled on max_fill, not 0).
@@ -1632,9 +1642,11 @@ def test_family_reliability_lends_starting_size_to_new_markets():
     # UNHEALTHY family (40% failure rate) -> back to probe
     ex._family_rel[("kalshi", "KXVALORANTGAME")] = [12, 8, 30.0]
     assert ex._reliability_cap("kalshi", "KXVALORANTGAME-NEW1-X") == 1.0
-    # a market's OWN fail streak still excludes it regardless of family
+    # a market's OWN fail streak still excludes it (during the cooldown) regardless of family
+    import time as _time
     ex._family_rel[("kalshi", "KXVALORANTGAME")] = [20, 2, 30.0]
     ex._market_rel[("kalshi", "KXVALORANTGAME-NEW1-X")] = (0, 2, 2, 0.0)
+    ex._excluded_until[("kalshi", "KXVALORANTGAME-NEW1-X")] = _time.time() + 300
     assert ex._reliability_cap("kalshi", "KXVALORANTGAME-NEW1-X") == 0.0
 
 
@@ -1694,3 +1706,38 @@ def test_fresh_hedge_fast_path_skips_rest_reread():
     ex, no, o = build(fresh=True, hedge_size=3.0)        # fresh but thin -> re-read
     asyncio.run(ex.execute(o))
     assert no.book_reads == 1
+
+
+def test_size_aware_reliability_big_reject_caps_not_kills():
+    # A FOK reject at 20 contracts is NOT phantom evidence — it means "no 20 of depth
+    # right now". It must set a TEMPORARY ceiling (half the attempt), leave the phantom
+    # streak untouched, and expire.
+    import time as _time
+    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])])
+    ex.probe_contracts = 1
+    ex._market_rel[("poly", "P1")] = (5, 0, 0, 10.0)          # proven, ramp -> 30
+    assert ex._reliability_cap("poly", "P1") == 30.0
+    ex._record_market_reliability("poly", "P1", False, attempted=20.0)
+    fills, fails, streak, _ = ex._market_rel[("poly", "P1")]
+    assert (fails, streak) == (0, 0)                           # no phantom strike
+    assert ex._reliability_cap("poly", "P1") == 10.0           # capped to attempt/2
+    ex._size_ceiling[("poly", "P1")] = (10.0, _time.time() - 1)  # TTL expired
+    assert ex._reliability_cap("poly", "P1") == 30.0           # back to ramped
+
+
+def test_probe_reject_excludes_with_cooldown_then_reprobes():
+    # Probe-size rejects ARE phantom evidence: max_fails of them exclude the market for a
+    # cooldown; after it expires the market re-probes (never permanently dead), and a fill
+    # clears everything.
+    import time as _time
+    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])])
+    ex.probe_contracts, ex.market_max_fails = 1, 2
+    ex._record_market_reliability("poly", "P1", False, attempted=1.0)
+    assert ex._reliability_cap("poly", "P1") == 1.0            # 1 strike -> still probes
+    ex._record_market_reliability("poly", "P1", False, attempted=1.0)
+    assert ex._reliability_cap("poly", "P1") == 0.0            # 2 strikes -> cooling down
+    ex._excluded_until[("poly", "P1")] = _time.time() - 1      # cooldown over
+    assert ex._reliability_cap("poly", "P1") == 1.0            # re-probes, not dead
+    ex._record_market_reliability("poly", "P1", True, fill_size=1.0)
+    fills, fails, streak, _ = ex._market_rel[("poly", "P1")]
+    assert streak == 0 and ("poly", "P1") not in ex._excluded_until
