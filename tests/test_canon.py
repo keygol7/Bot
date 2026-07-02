@@ -36,10 +36,17 @@ def test_extract_canon_parses_and_fails_closed():
 
 
 def test_join_matches_true_pair_with_name_variants():
-    a = mk(venue="kalshi", subject="gen.g global academy")
-    b = mk(venue="polymarket_us", mid="p1", entities=("dplus kia", "gen.g"),
-           subject="gen.g")                                    # shorter variant
+    a = mk(venue="kalshi", entities=("dplus kia", "gen.g global academy"),
+           subject="dplus kia")
+    b = mk(venue="polymarket_us", mid="p1", entities=("dplus", "gen.g global academy"),
+           subject="dplus")                                    # shorter variant, no sub-org marker
     assert complementary(a, b)                                 # token-subset subject aligns
+    # BUT dropping a SUB-ORG marker is NOT a variant — "gen.g" could be the main org
+    # (the BESTIA-class risk), so it must not align with "gen.g global academy".
+    c = mk(venue="polymarket_us", mid="p2", entities=("dplus kia", "gen.g"),
+           subject="gen.g")
+    a2 = mk(venue="kalshi", subject="gen.g global academy")
+    assert not complementary(a2, c)
 
 
 def test_join_rejects_every_settlement_divergence():
@@ -78,10 +85,9 @@ def test_join_is_domain_agnostic():
 def test_store_canon_roundtrip_and_join():
     s = Store(":memory:")
     s.record_canon(mk(venue="kalshi", mid="K1"))
-    s.record_canon(mk(venue="polymarket_us", mid="p1", entities=("dplus", "gen.g"),
-                      subject="gen.g"))
-    s.record_canon(mk(venue="polymarket_us", mid="p-spread", entities=("dplus", "gen.g"),
-                      subject="gen.g", comparator=">=", value=1.5))    # a line market
+    s.record_canon(mk(venue="polymarket_us", mid="p1"))
+    s.record_canon(mk(venue="polymarket_us", mid="p-spread",
+                      comparator=">=", value=1.5))    # a line market
     assert s.canon_checked("kalshi", "K1")
     pairs = s.canon_pairs()
     assert len(pairs) == 1                                     # spread did NOT join
@@ -98,3 +104,17 @@ def test_confirmed_pairs_union_includes_canon():
     s.blacklist_pair("kalshi", "K1", "polymarket_us", "p1", reason="test")
     got = s.confirmed_pairs(use_fingerprint=True, combine_verdicts=True, use_canon=True)
     assert ("kalshi", "K1", "polymarket_us", "p1") not in {p[:4] for p in got}
+
+
+def test_sub_org_teams_never_align():
+    # An org and its academy/junior squad are DIFFERENT teams (the BESTIA incident:
+    # 95 contracts "hedged" across the main org's and the Academy's games).
+    a = mk(venue="kalshi", entities=("patins da ferrari", "bestia academy"),
+           subject="bestia academy")
+    b = mk(venue="polymarket_us", mid="p1", entities=("patins da ferrari", "bestia"),
+           subject="bestia")
+    assert not complementary(a, b)
+    # but a genuine name variant WITHOUT a sub-org marker still aligns
+    c = mk(venue="polymarket_us", mid="p2", entities=("patins da ferrari", "bestia academy"),
+           subject="bestia academy esports")
+    assert complementary(a, c)

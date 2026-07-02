@@ -62,6 +62,11 @@ Respond with ONLY a JSON object:
 
 _WORD = re.compile(r"[a-z0-9]+")
 _GENERIC = frozenset({"gaming", "esports", "team", "club", "fc", "sc", "cf", "the"})
+# An org and its academy/junior/reserve squad are DIFFERENT teams (see fingerprint._SUB_ORG;
+# live incident: BESTIA vs BESTIA Academy matched as one event). Residue containing one of
+# these breaks name-variant alignment.
+_SUB_ORG = frozenset({"academy", "jr", "junior", "youth", "reserve", "reserves",
+                      "u17", "u18", "u19", "u20", "u21", "u23", "ii", "prospects"})
 
 
 @dataclass
@@ -123,13 +128,17 @@ def extract_canon(complete: CompleteFn, *, venue: str, market_id: str,
 def _subjects_align(a: str | None, b: str | None) -> bool:
     """Token-overlap subject alignment tolerant of cross-venue name variants
     ("Gen.G Global Academy" vs "geng academy"): one side's tokens must be a subset of
-    the other's (residue tolerated only in the LONGER name). Both-None never aligns."""
+    the other's (residue tolerated only in the LONGER name — EXCEPT sub-org markers:
+    "BESTIA" vs "BESTIA Academy" are different teams). Both-None never aligns."""
     if not a or not b:
         return False
     ta, tb = _tokens(a), _tokens(b)
     if not ta or not tb:
         return False
-    return ta <= tb or tb <= ta
+    if not (ta <= tb or tb <= ta):
+        return False
+    small, large = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    return not (large - small) & _SUB_ORG
 
 
 def _events_align(a: Canon, b: Canon) -> bool:

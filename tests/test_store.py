@@ -331,3 +331,26 @@ def test_indices_exist():
     for idx in ("idx_pnl_ts", "idx_fills_ts", "idx_fills_market",
                 "idx_opportunities_ts", "idx_opps_acted", "idx_embed_ts"):
         assert idx in names
+
+
+def test_rules_divergent_pairs_dropped_from_watchlist():
+    # A pair whose rules the LLM confidently judged NON-identical is not a hedge and
+    # must drop from confirmed_pairs, exactly like a blacklisted pair.
+    s = Store(":memory:")
+    s.conn.execute("INSERT INTO markets (venue, market_id, title) VALUES ('kalshi','K1','A vs B - A')")
+    s.conn.execute("INSERT INTO markets (venue, market_id, title) VALUES ('polymarket_us','p1','A vs B - A')")
+    s.cache_verdict("kalshi", "K1", "polymarket_us", "p1", same_event=True,
+                    confidence=0.95, rationale="", event_key="E1")
+    kw = dict(use_fingerprint=True, combine_verdicts=True, safe_types_only=False)
+    got = {p[4] for p in s.confirmed_pairs(**kw)}
+    assert "E1" in got
+    s.record_rules_verdict("kalshi", "K1", "polymarket_us", "p1",
+                           identical=False, confidence=1.0,
+                           rationale="different events")
+    got = {p[4] for p in s.confirmed_pairs(**kw)}
+    assert "E1" not in got                              # demoted by divergent rules
+    # low-confidence divergence does NOT demote (the LLM can be pedantic)
+    s.record_rules_verdict("kalshi", "K1", "polymarket_us", "p1",
+                           identical=False, confidence=0.5, rationale="unsure")
+    got = {p[4] for p in s.confirmed_pairs(**kw)}
+    assert "E1" in got

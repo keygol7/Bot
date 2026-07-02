@@ -374,16 +374,29 @@ def _matchup_conflict(a: frozenset, b: frozenset) -> bool:
     return bool(a_only) and bool(b_only)
 
 
+# Sub-organization markers: an org and its academy/junior/reserve squad are DIFFERENT
+# teams playing DIFFERENT matches, but token-subset alignment sees "BESTIA" ⊆ "BESTIA
+# Academy" and matches them (live incident: a 95-contract "hedge" across the BESTIA org's
+# main and Academy CS2 games — the legs settled independently, one naked). If the residue
+# tokens (the part of the LARGER name the smaller doesn't cover) contain one of these,
+# the subjects are related-but-distinct entities, never the same one.
+_SUB_ORG = frozenset({"academy", "jr", "junior", "youth", "reserve", "reserves",
+                      "u17", "u18", "u19", "u20", "u21", "u23", "ii", "prospects"})
+
+
 def _subjects_align(a: frozenset, b: frozenset) -> bool:
     """The YES outcomes refer to the same entity. The SMALLER (cleaner) subject must be
     fully covered by the larger — every one of its tokens matches. A single shared token
     is NOT enough, so two different multi-token entities that share one word (different
     players 'Ronald Araujo' vs 'Maximiliano Araujo', or teams sharing a dropped suffix)
-    no longer falsely align."""
+    no longer falsely align. Residue containing a sub-org marker (Academy/Jr/U21/...)
+    means a RELATED but DIFFERENT team — never aligned."""
     if not a or not b:
         return False
     small, large = (a, b) if len(a) <= len(b) else (b, a)
-    return all(_token_matches(x, large) for x in small)
+    if not all(_token_matches(x, large) for x in small):
+        return False
+    return not (large - small) & _SUB_ORG
 
 
 def complement_reason(a: ContractFingerprint, b: ContractFingerprint,

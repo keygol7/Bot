@@ -381,11 +381,14 @@ class Store:
         }
 
     def _drop_blacklisted(self, pairs: list[tuple]) -> list[tuple]:
-        """Remove any confirmed false-match pairs from a watchlist result."""
-        bl = self.blacklisted_keys()
-        if not bl:
+        """Remove confirmed false matches AND confidently rules-divergent pairs from a
+        watchlist result. Divergent rules = the contracts settle differently in some
+        outcome = not a hedge (learned the hard way: a divergent-at-1.0 pair was left
+        tradeable and produced a naked leg when its legs settled independently)."""
+        drop = self.blacklisted_keys() | self.rules_divergent_keys()
+        if not drop:
             return pairs
-        return [p for p in pairs if self._pair_key(p[0], p[1], p[2], p[3]) not in bl]
+        return [p for p in pairs if self._pair_key(p[0], p[1], p[2], p[3]) not in drop]
 
     # ---- empirical per-market fill reliability (probe-then-scale) ----
     def record_market_outcome(self, venue: str, market_id: str, ok: bool,
@@ -526,6 +529,20 @@ class Store:
         return self.conn.execute(
             "SELECT 1 FROM rules_verdicts WHERE venue_a=? AND market_a=? "
             "AND venue_b=? AND market_b=?", (va, ma, vb, mb)).fetchone() is not None
+
+    def rules_divergent_keys(self, min_confidence: float = 0.9) -> set:
+        """Pairs whose RESOLUTION RULES the LLM confidently judged NON-identical.
+
+        These are not hedges — the contracts settle differently in some outcome (live
+        proof: the BESTIA-Academy-vs-BESTIA pair was flagged divergent at 1.0 and later
+        cost a naked leg when the legs settled independently). Dropped from the
+        watchlist like blacklisted pairs."""
+        return {
+            self._pair_key(r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
+            for r in self.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts "
+                "WHERE identical = 0 AND confidence >= ?", (min_confidence,))
+        }
 
     def verified_pair_keys(self) -> set:
         """Pair keys (ConfirmedPair.key format: sorted 2-tuples) with the STRONGEST

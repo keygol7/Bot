@@ -237,3 +237,14 @@ def test_first_goal_metric_matches_and_is_distinct():
     # Must differ from a 2+ goals count prop for the same team:
     k2 = from_kalshi("KXWCGOAL-26JUN18KORMEX-KOR2", "Korea Republic: 2+ goals - Korea Republic: 2+")
     assert not are_complementary(p, k2)
+
+
+def test_fingerprint_sub_org_academy_never_aligns():
+    # BESTIA (main org) vs BESTIA Academy: token-subset tolerance must NOT match them —
+    # the residue token "academy" marks a related-but-different team.
+    from bot.matching.fingerprint import from_kalshi, from_polymarket, are_complementary
+    fk = from_kalshi("KXCS2GAME-26JUL021800BSTAPDAF-BSTA",
+                     "Will BESTIA Academy win the BESTIA Academy vs. Patins da Ferrari CS2 match? - Yes")
+    fp = from_polymarket("aec-cs2-pdaf-bsta-2026-07-02",
+                         "Who will win in the upcoming esports event Patins da Ferrari vs BESTIA - BESTIA")
+    assert not are_complementary(fk, fp)
