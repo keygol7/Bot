@@ -19,6 +19,23 @@ def test_polymarket_us_fee_matches_published_schedule():
     assert f.fee(0.50, 100) / 100 > 0.01
 
 
+def test_per_contract_rate_is_unrounded_for_edge_gating():
+    # fee(p, 1) cent-quantizes (Kalshi ceils 0.0175->0.02, Poly rounds 0.0125->0.01,
+    # 0.0024->0.00) — an error the size of a half-cent edge floor. per_contract_fee
+    # must return the smooth rate so detectors gate honestly.
+    from bot.fees import per_contract_fee
+    k, p = KalshiFeeModel(0.07), PolymarketUSFeeModel(0.05)
+    assert per_contract_fee(k, 0.50) == 0.07 * 0.25            # 0.0175, not 0.02
+    assert per_contract_fee(p, 0.50) == 0.05 * 0.25            # 0.0125, not 0.01
+    assert per_contract_fee(p, 0.05) == 0.05 * 0.05 * 0.95     # 0.0024, not 0.00
+    assert per_contract_fee(ZeroFeeModel(), 0.5) == 0.0
+
+    class LegacyModel:                                          # no per_contract attr
+        def fee(self, price, contracts):
+            return 0.42
+    assert per_contract_fee(LegacyModel(), 0.5) == 0.42         # falls back to fee(p, 1)
+
+
 def test_zero_fee_is_always_zero():
     f = ZeroFeeModel()
     assert f.fee(0.5, 100) == 0.0

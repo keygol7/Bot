@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from bot.fees import FeeModel, ZeroFeeModel
+from bot.fees import FeeModel, ZeroFeeModel, per_contract_fee
 from bot.models import MarketQuote
 
 
@@ -83,7 +83,10 @@ def _build(
         return None
 
     gross_cost = yes_price + no_price
-    fee_per_pair = yes_fee.fee(yes_price, 1) + no_fee.fee(no_price, 1)
+    # Gate on the UNROUNDED per-contract rate: fee(price, 1) quantizes to a whole cent
+    # (an error the size of the edge floor itself); settlement still books the venue's
+    # rounded fee at real size via total_fees below.
+    fee_per_pair = per_contract_fee(yes_fee, yes_price) + per_contract_fee(no_fee, no_price)
     edge_per_contract = 1.0 - gross_cost - fee_per_pair
 
     total_fees = (
@@ -164,7 +167,7 @@ def _pair_price_edge(
     """Per-contract edge of buying YES on ``yes_q`` and NO on ``no_q``, prices only."""
     if yes_q.yes_ask is None or no_q.no_ask is None:
         return None
-    fees = yes_fee.fee(yes_q.yes_ask, 1) + no_fee.fee(no_q.no_ask, 1)
+    fees = per_contract_fee(yes_fee, yes_q.yes_ask) + per_contract_fee(no_fee, no_q.no_ask)
     return 1.0 - (yes_q.yes_ask + no_q.no_ask) - fees
 
 

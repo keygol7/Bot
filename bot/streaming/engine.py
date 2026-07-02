@@ -9,7 +9,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 
 from bot.execution.executor import Executor
-from bot.fees import FeeModel, ZeroFeeModel
+from bot.fees import FeeModel, ZeroFeeModel, per_contract_fee
 from bot.models import MarketQuote
 from bot.strategies.arbitrage import ArbOpportunity
 
@@ -221,7 +221,9 @@ class StreamingEngine:
         for yq, nq in ((a, b), (b, a)):  # buy YES@yq + NO@nq
             if yq.yes_ask is None or nq.no_ask is None:
                 continue
-            fee = self._fee(yq.venue).fee(yq.yes_ask, 1) + self._fee(nq.venue).fee(nq.no_ask, 1)
+            # Unrounded per-contract rate: fee(p, 1) cent-quantizes (error ~ the edge floor).
+            fee = (per_contract_fee(self._fee(yq.venue), yq.yes_ask)
+                   + per_contract_fee(self._fee(nq.venue), nq.no_ask))
             edge = 1.0 - (yq.yes_ask + nq.no_ask) - fee
             size = min(yq.yes_ask_size, nq.no_ask_size)
             if best is None or edge > best[0]:
