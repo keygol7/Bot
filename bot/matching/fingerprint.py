@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from bot.matching.scope import (
     _METRIC_RULES,
     _threshold_tag,
+    id_scope_tags,
     kalshi_series,
     scope_tags,
 )
@@ -323,7 +324,12 @@ def from_polymarket(slug: str, title: str, end_date: str | None = None,
         # their team/player suffix above (preserving YES polarity).
         subject = _subject_tokens(title.rsplit(" - ", 1)[0])
     return ContractFingerprint(
-        venue="polymarket_us", metric=metric, scope=_scope_only(title),
+        # Slug-encoded scope (handicap -neg-2pt5 / -fh- -sh- half markers) folds into
+        # the title scope: Poly spread/half markets carry a plain-matchup TITLE, so
+        # without the slug tags they fingerprint as moneyline winners and falsely
+        # complement a real moneyline on the other venue.
+        venue="polymarket_us", metric=metric,
+        scope=_scope_only(title) | id_scope_tags(slug),
         threshold=_threshold_int(title), subject=subject, date=date,
         league=_league_of(slug),
         matchup=_matchup_tokens(title) if metric == "winner" else frozenset(),

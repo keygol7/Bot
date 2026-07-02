@@ -31,7 +31,7 @@ from bot.execution.risk import RiskManager
 from bot.fees import FeeModel, ZeroFeeModel
 from bot.matching.embed import candidate_pairs, semantic_candidate_pairs
 from bot.matching.llm_match import MatchVerdict, confirm_match
-from bot.matching.scope import scope_mismatch
+from bot.matching.scope import id_scope_mismatch, scope_mismatch
 from bot.models import MarketQuote
 from bot.modes import RunMode
 from bot.strategies.arbitrage import (
@@ -212,6 +212,11 @@ async def run_cycle(
                 # Scope/period guard: same teams/date but different resolution scope
                 # (e.g. "win 2nd half" vs "win the match") is not the same market.
                 if scope_mismatch(c.a.title, c.b.title):
+                    continue
+                # Identifier-level scope: Poly encodes handicap/half lines ONLY in the
+                # slug (-neg-2pt5 / -fh-), with a plain-matchup title — the source of
+                # the spread-vs-moneyline false matches the LLM rubber-stamps.
+                if id_scope_mismatch(c.a.market_id, c.b.market_id):
                     continue
                 # Structured complement gate (when enabled): skip non-complementary
                 # pairs BEFORE the LLM — stops wasting confirmations on junk (e.g.

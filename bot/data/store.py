@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from bot.matching.scope import (
+    id_scope_mismatch,
     is_allowed_kalshi_series,
     is_tradeable_market_type,
     scope_mismatch,
@@ -520,6 +521,11 @@ class Store:
         for r in rows:
             ta, tb = r["title_a"] or "", r["title_b"] or ""
             if drop_scope_mismatch and scope_mismatch(ta, tb):
+                continue
+            # Identifier-level scope: filters CACHED verdicts too, so handicap/half
+            # slugs the LLM already rubber-stamped (plain-matchup titles) drop out of
+            # the watchlist instead of persisting as spread-vs-moneyline false matches.
+            if drop_scope_mismatch and id_scope_mismatch(r["market_a"], r["market_b"]):
                 continue
             if safe_types_only:
                 if not (is_tradeable_market_type(ta) and is_tradeable_market_type(tb)):

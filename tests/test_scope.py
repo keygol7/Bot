@@ -209,3 +209,43 @@ def test_kalshi_series_allowlist():
     assert not ok("KXATPEXACTMATCH-26JUN17NAKBUS-NAK21")
     assert not ok("KXWTASETWINNER-26JUN15ZHESAK-1-ZHE")
     assert not ok("KXATPGSPREAD-26JUN14FONHAN-FON6")
+
+
+def test_id_scope_tags_parse_poly_slug_markers():
+    # The observed false-match class: handicap/half lines encoded ONLY in the slug.
+    from bot.matching.scope import id_scope_mismatch, id_scope_tags
+    assert id_scope_tags("asc-fwc-col-gha-2026-07-03-neg-2pt5") == {"handicap"}
+    assert id_scope_tags("asc-fwc-col-gha-2026-07-03-pos-1pt5") == {"handicap"}
+    assert id_scope_tags("asc-fwc-col-gha-2026-07-03-fh-neg-2pt5") == {"first_half", "handicap"}
+    assert id_scope_tags("asc-fwc-bel-sen-2026-07-01-sh-pos-2pt5") == {"second_half", "handicap"}
+    assert id_scope_tags("asc-fwc-sui-alg-2026-07-02-et-neg-0pt5") == {"extra_time", "handicap"}
+    # plain moneylines / stat props carry NO id-scope tags (must keep matching)
+    assert id_scope_tags("atc-fwc-bel-sen-2026-07-01-sen") == frozenset()
+    assert id_scope_tags("aec-valorant-gena-dk-2026-07-02") == frozenset()
+    assert id_scope_tags("astatc-fwc-bel-sen-2026-07-01-g-fwcismsar-gte1") == frozenset()
+    assert id_scope_tags("KXWCGAME-26JUL03COLGHA-COL") == frozenset()
+
+    # the exact pairing from the live log: Kalshi moneyline vs Poly -2.5 spread
+    assert id_scope_mismatch("KXWCGAME-26JUL03COLGHA-COL",
+                             "asc-fwc-col-gha-2026-07-03-neg-2pt5")
+    # while a true moneyline pairing is NOT a mismatch
+    assert not id_scope_mismatch("KXWCGAME-26JUL01BELSEN-SEN",
+                                 "atc-fwc-bel-sen-2026-07-01-sen")
+
+
+def test_verdict_pairs_drop_id_scope_mismatches():
+    # A CACHED LLM verdict pairing a moneyline with a slug-encoded spread must be
+    # filtered out of the watchlist (the LLM saw only plain-matchup titles).
+    from bot.data.store import Store
+    s = Store(":memory:")
+    s.conn.execute("INSERT INTO markets (venue, market_id, title) VALUES ('kalshi', 'KXWCGAME-26JUL03COLGHA-COL', 'Colombia vs Ghana - COL')")
+    s.conn.execute("INSERT INTO markets (venue, market_id, title) VALUES ('polymarket_us', 'asc-fwc-col-gha-2026-07-03-neg-2pt5', 'Colombia vs Ghana - Colombia')")
+    s.conn.execute("INSERT INTO markets (venue, market_id, title) VALUES ('polymarket_us', 'atc-fwc-col-gha-2026-07-03-col', 'Colombia vs Ghana - Colombia')")
+    s.cache_verdict("kalshi", "KXWCGAME-26JUL03COLGHA-COL",
+                    "polymarket_us", "asc-fwc-col-gha-2026-07-03-neg-2pt5",
+                    same_event=True, confidence=0.95, rationale="", event_key="E-spread")
+    s.cache_verdict("kalshi", "KXWCGAME-26JUL03COLGHA-COL",
+                    "polymarket_us", "atc-fwc-col-gha-2026-07-03-col",
+                    same_event=True, confidence=0.95, rationale="", event_key="E-money")
+    got = {p[4] for p in s._verdict_pairs(0.8, True, False)}
+    assert "E-money" in got and "E-spread" not in got
