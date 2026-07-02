@@ -710,12 +710,51 @@ class StreamingEngine:
                     continue
                 imbalanced.append((p, qa, qb))
 
-        # Held positions on markets the watchlist no longer pairs — can't auto-verify the
-        # hedge, so surface them for a manual check rather than alarm.
+        # Held positions on markets the watchlist no longer pairs. The live watchlist
+        # forgets a pair once it's pruned (settled/thin), but a held position still has a
+        # knowable counterpart in the store's ACTED-opportunity history — verify against
+        # that instead of just logging (the TPZRL naked leg sat exactly in this blind
+        # spot: its pair left the watchlist, so the naked Kalshi leg was only ever an
+        # INFO line). A counterpart holding a matching size = hedged; a FLAT counterpart
+        # joins the imbalance flow below, where the venue-down and settled-leg filters
+        # still apply before any warn/persist/halt. Blacklisted (quarantined) pairs are
+        # deliberately excluded — quarantine records the loss precisely so the bot does
+        # NOT freeze on that market.
         untracked = [(v, m, q) for (v, m), q in pos.items() if (v, m) not in paired_markets]
         if untracked:
-            log.info("RECONCILE: %d held position(s) on unpaired markets (verify hedged): %s",
-                     len(untracked), ", ".join(f"{v}:{m}={q:g}" for v, m, q in untracked[:8]))
+            hist = {}
+            blacklisted = set()
+            if self.store is not None:
+                try:
+                    hist = self.store.acted_pair_map()
+                    blacklisted = self.store.blacklisted_keys()
+                except Exception as exc:
+                    log.warning("reconcile: pair-history read failed: %s", exc)
+            unverified = []
+            seen_keys = {p.key for p, _, _ in imbalanced}
+            for v, m, q in untracked:
+                counter = hist.get((v, m))
+                if counter is None:
+                    unverified.append((v, m, q))
+                    continue
+                qc = pos.get(counter, 0.0)
+                if abs(q - qc) <= self._reconcile_tol:
+                    continue                                   # hedged on the counterpart
+                p = ConfirmedPair(f"{v}:{m}|{counter[0]}:{counter[1]} (historical)",
+                                  v, m, counter[0], counter[1])
+                # Blacklist keys are the store's FLAT sorted 4-tuple, not ConfirmedPair.key.
+                flat = (self.store._pair_key(v, m, counter[0], counter[1])
+                        if self.store is not None else None)
+                if flat in blacklisted or p.key in seen_keys:
+                    continue
+                if self.clock() - self._last_acted.get(p.key, -1e9) < self._reconcile_grace:
+                    continue                                   # mid-burst, not stranded
+                seen_keys.add(p.key)
+                imbalanced.append((p, q, qc))
+            if unverified:
+                log.info("RECONCILE: %d held position(s) with no known counterpart "
+                         "(verify manually): %s", len(unverified),
+                         ", ".join(f"{v}:{m}={q:g}" for v, m, q in unverified[:8]))
 
         # Drop imbalances caused by a venue-DOWN read: if a venue returned ZERO open positions
         # (its API is down/erroring) yet >= _venue_down_min pairs hold their hedge on it, every

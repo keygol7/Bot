@@ -366,6 +366,23 @@ class Store:
                 "SELECT venue, market_id, fills, fails, streak, max_fill FROM market_reliability")
         }
 
+    def acted_pair_map(self) -> dict:
+        """(venue, market) -> its historical counterpart, from every ACTED opportunity.
+
+        The live watchlist forgets a pair once it's pruned (settled/thin), but a held
+        position on a forgotten market still has a knowable counterpart here — used by
+        the reconcile to verify 'unpaired' positions instead of just logging them
+        (the TPZRL naked leg sat exactly in that blind spot)."""
+        out: dict = {}
+        for r in self.conn.execute(
+            "SELECT DISTINCT buy_yes_venue, buy_yes_market, buy_no_venue, buy_no_market "
+            "FROM opportunities WHERE acted = 1"):
+            a = (r["buy_yes_venue"], r["buy_yes_market"])
+            b = (r["buy_no_venue"], r["buy_no_market"])
+            out[a] = b
+            out[b] = a
+        return out
+
     # ---- embedding cache (see schema comment) ----
 
     def embeddings_get(self, model: str, hashes: list[str]) -> dict[str, bytes]:

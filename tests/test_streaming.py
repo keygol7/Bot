@@ -1243,3 +1243,73 @@ def test_fill_tracker_is_bounded():
         assert filled == 1.0
 
     asyncio.run(main())
+
+
+def _acted_store(pairs):
+    """Store with acted opportunities for (kalshi_mkt, poly_mkt) pairs."""
+    from types import SimpleNamespace
+
+    from bot.data.store import Store
+    store = Store(":memory:")
+    for km, pm in pairs:
+        store.record_opportunity(SimpleNamespace(
+            event_key=f"{km}|{pm}", buy_yes_venue="kalshi", buy_yes_market=km,
+            buy_no_venue="poly", buy_no_market=pm, yes_price=0.4, no_price=0.55,
+            edge_per_contract=0.05, max_contracts=10, total_profit=0.5), acted=True)
+    return store
+
+
+def _hist_engine(store):
+    fe = _ExecR()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 5000.0, reconcile_halt=True,
+        store=store)
+    eng.set_pairs([ConfirmedPair("LIVE", "kalshi", "KL", "poly", "PL")])  # unrelated live pair
+    return eng, fe
+
+
+def test_reconcile_halts_unpaired_naked_via_history():
+    # THE TPZRL regression: a pair leaves the watchlist but its Kalshi leg is still held
+    # and its counterpart is FLAT — a genuinely naked leg that used to be only an INFO
+    # line. The store's acted history identifies the counterpart; persistent -> halt.
+    store = _acted_store([("K_old", "p-old")])
+    eng, fe = _hist_engine(store)
+    snaps = [_snap("kalshi", [("K_old", 3)]), _snap("poly", [("P_other", 1)])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed                       # first sighting: warn only
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert fe.risk.is_killed                           # persisted -> halt
+
+
+def test_reconcile_unpaired_but_hedged_on_counterpart_is_quiet():
+    # Both legs of the forgotten pair still hold matching size -> hedged, no alarm.
+    store = _acted_store([("K_old", "p-old")])
+    eng, fe = _hist_engine(store)
+    snaps = [_snap("kalshi", [("K_old", 3)]), _snap("poly", [("p-old", 3)])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
+
+
+def test_reconcile_unpaired_blacklisted_pair_stays_quarantined():
+    # A quarantined (blacklisted) pair's stranded leg was deliberately recorded and left —
+    # the whole point of quarantine is NOT freezing the bot on it. Must not halt.
+    store = _acted_store([("K_q", "p-q")])
+    store.blacklist_pair("kalshi", "K_q", "poly", "p-q", reason="quarantine test")
+    eng, fe = _hist_engine(store)
+    snaps = [_snap("kalshi", [("K_q", 5)]), _snap("poly", [])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
+
+
+def test_reconcile_unpaired_without_history_stays_info():
+    # No acted history for the market at all -> can't verify -> surface for a human,
+    # never halt on a guess.
+    store = _acted_store([])
+    eng, fe = _hist_engine(store)
+    snaps = [_snap("kalshi", [("K_manual", 4)]), _snap("poly", [])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
