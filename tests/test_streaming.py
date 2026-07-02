@@ -1410,3 +1410,25 @@ def test_verified_pair_fires_fat_edge_with_zero_history():
     eng, fe = make(verified=False)
     asyncio.run(driver(eng))
     assert fe.calls == []                            # unverified -> observes first
+
+
+def test_fat_edge_rejects_wide_book_high_sum_history():
+    # A mean ASK-sum far ABOVE $1 = chronically wide/illiquid books (live incident: a
+    # pair averaging 1.281 "fat-fired" when one book collapsed — a quote pull, not a
+    # dislocation). The proven-complement band must reject it, floor AND ceiling.
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, max_plausible_edge=0.06, empirical_min_obs=4,
+        empirical_sum_floor=0.93, cooldown=0.0, clock=lambda: 0.0)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    async def driver():
+        await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.78, na=100))
+        for _ in range(35):                        # wide books: sum history ~1.28
+            await eng.on_quote(q("kalshi", "K1", yes_ask=0.50, ya=100, no_ask=0.50, na=100))
+        # one book collapses -> apparent 26% "edge" on a 1.28-mean pair -> must NOT fire
+        await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.24, na=100))
+
+    asyncio.run(driver())
+    assert fe.calls == []

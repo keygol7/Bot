@@ -449,12 +449,18 @@ class StreamingEngine:
                 n = len(obs) if obs else 0
                 need_n = max(3 * self.empirical_min_obs, 30)
                 need_mean = max(self.empirical_sum_floor, 0.97)
+                # BAND, not floor: a true complement's ASK sum sits ~$1.00-1.05. A mean
+                # far ABOVE $1 means chronically wide/illiquid books (observed live: a
+                # LoL pair averaging 1.281 "fat-fired" when one book collapsed — a quote
+                # pull, not a dislocation; the FOK then rejects/strands). Fat edges only
+                # fire on TIGHT proven complements.
+                max_mean = 1.06
                 mean_sum = (sum(obs) / n) if n else 0.0
-                if n < need_n or mean_sum < need_mean:
+                if n < need_n or mean_sum < need_mean or mean_sum > max_mean:
                     if n in (1, need_n // 2):        # occasional heartbeat, not tick spam
                         log.info("STREAM %s: fat edge %+.3f needs stronger proof — %d/%d "
-                                 "samples, mean sum %.3f (need >= %.3f); observing",
-                                 p.event_key, edge, n, need_n, mean_sum, need_mean)
+                                 "samples, mean sum %.3f (need %.3f-%.2f); observing",
+                                 p.event_key, edge, n, need_n, mean_sum, need_mean, max_mean)
                     self._observe(p, edge, yq, nq, size, "fat_edge_unproven")
                     # Evidence-based blacklisting still applies: a pair whose sum history
                     # sits far from $1 over enough samples is a false match, parked.
