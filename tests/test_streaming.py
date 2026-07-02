@@ -247,6 +247,132 @@ def test_run_consumes_streams_and_stops(monkeypatch):
     assert len(fe.calls) >= 1
 
 
+def test_run_streams_during_a_slow_refresh(monkeypatch):
+    # THE duty-cycle fix: the discovery pass used to CANCEL the consumers for its whole
+    # duration (~minutes), leaving the fast path dark. Consumers must now keep consuming
+    # (and trading) WHILE a slow refresh is in progress.
+    fe = FakeExec()
+    eng = make_engine(fe)
+
+    class SlowStreamVenue:
+        def __init__(self, name, quotes):
+            self.name = name
+            self._quotes = quotes
+
+        async def stream_order_book(self, mids):
+            await asyncio.sleep(0.05)          # quotes arrive DURING the slow refresh below
+            for x in self._quotes:
+                yield x
+            await asyncio.sleep(10)            # stay open
+
+    venues = [
+        SlowStreamVenue("kalshi", [q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)]),
+        SlowStreamVenue("poly", [q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)]),
+    ]
+    refreshes = [0]
+
+    async def refresh():
+        refreshes[0] += 1
+        if refreshes[0] == 1:
+            return [ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")]   # boot: fast
+        await asyncio.sleep(10)                # second refresh is SLOW (a discovery pass)
+        return [ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")]
+
+    async def driver():
+        task = asyncio.create_task(eng.run(venues, refresh, refresh_interval=0.01))
+        await asyncio.sleep(0.3)               # well into the slow second refresh
+        assert len(fe.calls) >= 1              # traded WHILE the refresh was running
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(driver())
+
+
+def test_run_resubscribes_only_when_market_set_changes():
+    # Unchanged watchlist -> consumers keep their WS sessions (no churn); a changed
+    # market set -> resubscribe.
+    fe = FakeExec()
+    eng = make_engine(fe)
+    subscribes = []
+
+    class CountingVenue:
+        def __init__(self, name):
+            self.name = name
+
+        async def stream_order_book(self, mids):
+            subscribes.append((self.name, tuple(sorted(mids))))
+            await asyncio.sleep(10)            # stay open, never yields
+            yield None                          # pragma: no cover (makes it a generator)
+
+    venues = [CountingVenue("kalshi"), CountingVenue("poly")]
+    sets = [
+        [ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")],
+        [ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")],   # unchanged -> no resubscribe
+        [ConfirmedPair("E2", "kalshi", "K2", "poly", "P2")],   # changed -> resubscribe
+    ]
+    idx = [0]
+
+    async def refresh():
+        i = min(idx[0], len(sets) - 1)
+        idx[0] += 1
+        return sets[i]
+
+    async def driver():
+        task = asyncio.create_task(eng.run(venues, refresh, refresh_interval=0.02))
+        await asyncio.sleep(0.15)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(driver())
+    per_venue = [s for s in subscribes if s[0] == "kalshi"]
+    assert len(per_venue) == 2                                  # boot + the ONE change
+    assert per_venue[0][1] == ("K1",) and per_venue[1][1] == ("K2",)
+
+
+def test_hybrid_take_does_not_block_the_quote_loop():
+    # A slow execution must not stall on_quote: the take is spawned, on_quote returns
+    # immediately, and a second pair's edge on the same venue stream is still evaluated
+    # while the first take is mid-flight.
+    class SlowExec(FakeExec):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def execute(self, opp):
+            self.calls.append(opp)
+            self.started.set()
+            await self.release.wait()          # simulate a slow two-leg execution
+            return f"executed {opp.event_key}"
+
+    fe = SlowExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, maker_mode=True,
+        hybrid_take_depth=10)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1"),
+                   ConfirmedPair("E2", "kalshi", "K2", "poly", "P2")])
+
+    async def driver():
+        await eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
+        await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60))
+        await fe.started.wait()                # first take is now mid-flight (blocked)
+        # the quote loop must still process OTHER pairs while it runs:
+        await eng.on_quote(q("kalshi", "K2", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
+        await eng.on_quote(q("poly", "P2", yes_ask=0.62, ya=100, no_ask=0.55, na=60))
+        fe.release.set()
+        await eng.drain()
+
+    asyncio.run(driver())
+    assert len(fe.calls) == 2                  # both pairs fired despite the slow first take
+
+
 def test_edge_snapshot_only_includes_two_sided_pairs(caplog):
     import logging
     # The snapshot proves WS prices are matched to events: a pair appears only when
@@ -941,9 +1067,11 @@ def test_hybrid_takes_deep_edge_that_clears_taker_bar():
 
     async def driver():
         await eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
-        r = await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60))
-        assert r is not None                        # taker runs inline and returns its report
-        await asyncio.gather(*list(eng._inflight))
+        # The take is SPAWNED off the quote loop (a blocking inline take stalled the
+        # venue's whole WS stream during execution), so on_quote returns None and the
+        # execution is settled via drain().
+        await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60))
+        await eng.drain()
 
     asyncio.run(driver())
     assert len(fe.taker) == 1 and fe.maker == []    # took it, did not rest a maker

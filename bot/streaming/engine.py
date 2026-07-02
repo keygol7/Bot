@@ -53,6 +53,11 @@ class LiveBook:
     def get(self, venue: str, market_id: str) -> MarketQuote | None:
         return self._q.get((venue, market_id))
 
+    def prune(self, keep: set[tuple[str, str]]) -> None:
+        """Drop quotes for markets no longer watched (settled pairs would pile up forever)."""
+        for k in [k for k in self._q if k not in keep]:
+            del self._q[k]
+
 
 class StreamingEngine:
     # Only a market in this state is tradeable; anything else (suspended, halted,
@@ -169,6 +174,7 @@ class StreamingEngine:
         # the per-venue rate limiters). Higher = faster watchlist refresh.
         self.prime_concurrency = prime_concurrency
         self._maker_inflight: set = set()
+        self._take_inflight: set = set()        # pairs with a spawned hybrid TAKE running
         # Async callable depth_fetch(venue, market_id) -> sized MarketQuote | None.
         # WS ticker feeds carry no size (Kalshi), so before firing on a price edge we
         # re-fetch real order-book depth (which also re-validates the price).
@@ -204,6 +210,17 @@ class StreamingEngine:
         for p in pairs:
             for m in p.markets():
                 self._index.setdefault(m, set()).add(p.key)
+        # Prune per-pair / per-market state for pairs that left the watchlist — these maps
+        # otherwise grow forever across refreshes (a steady memory leak on long uptimes).
+        live_keys = set(self._pairs)
+        for d in (self._sum_obs, self._edge_since, self._fail_counts,
+                  self._backoff_until, self._last_acted):
+            for k in [k for k in d if k not in live_keys]:
+                del d[k]
+        live_markets = set(self._index)
+        for k in [k for k in self._market_state if k not in live_markets]:
+            del self._market_state[k]
+        self.livebook.prune(live_markets)
 
     @property
     def market_ids(self) -> dict[str, list[str]]:
@@ -382,8 +399,8 @@ class StreamingEngine:
         risk = getattr(self.executor, "risk", None)
         if risk is not None and getattr(risk, "is_killed", False):
             return None
-        if self.maker_mode and key in self._maker_inflight:
-            return None                           # already resting a maker for this pair
+        if self.maker_mode and (key in self._maker_inflight or key in self._take_inflight):
+            return None                # already resting a maker / running a take for this pair
         ev = self._best_direction(p)
         if ev is None:
             return None
@@ -516,13 +533,15 @@ class StreamingEngine:
                 log.info("STREAM edge %.4f sz %g on %s -> hybrid TAKE "
                          "(depth >= %g, clears taker bar %.4f)",
                          edge, size, p.event_key, self.hybrid_take_depth, take_bar)
-                report = await self._execute_guarded(opp)
-                log.info("STREAM exec %s | %s", p.event_key, report)
-                status = getattr(report, "status", None)
-                self._observe(p, edge, yq, nq, size,
-                              status.value if status is not None else "executed")
-                self._note_outcome(key, p, report)
-                return report
+                # Spawn the take OFF the quote loop (like makers): awaiting the two-leg
+                # execution inline (~hundreds of ms) stalls THIS VENUE'S ENTIRE WS stream —
+                # other pairs' edges go unevaluated exactly when game events move many
+                # markets at once. Tracked + never cancelled; run() drains before resubscribe.
+                self._take_inflight.add(key)
+                task = asyncio.ensure_future(self._run_take(key, p, opp, edge, yq, nq, size))
+                self._inflight.add(task)
+                task.add_done_callback(self._inflight.discard)
+                return None
             # Maker-volume gate: only REST a maker when the Polymarket HEDGE market is liquid
             # enough that its hedge will reliably fill. On a thin market the hedge 500s and
             # leaves the maker fill naked (the incident). Such markets stay TAKE-able above —
@@ -549,6 +568,25 @@ class StreamingEngine:
         self._observe(p, edge, yq, nq, size, status.value if status is not None else "executed")
         self._note_outcome(key, p, report)
         return report
+
+    async def _run_take(self, key, p, opp, edge, yq, nq, size) -> None:
+        """Run a hybrid TAKE to completion off the quote loop, then log + book it."""
+        try:
+            report = await self.executor.execute(opp)
+            log.info("STREAM exec %s | %s", p.event_key, report)
+            status = getattr(report, "status", None)
+            self._observe(p, edge, yq, nq, size,
+                          status.value if status is not None else "executed")
+            self._note_outcome(key, p, report)
+        except Exception as exc:
+            log.warning("take run failed for %s: %s", p.event_key, exc)
+        finally:
+            self._take_inflight.discard(key)
+
+    async def drain(self) -> None:
+        """Await all in-flight executions (makers + takes) to a definitive outcome."""
+        while self._inflight:
+            await asyncio.gather(*list(self._inflight), return_exceptions=True)
 
     async def _run_maker(self, key, p, opp, edge, yq, nq, size) -> None:
         """Run a maker execution to completion off the quote loop, then log + book it."""
@@ -812,54 +850,77 @@ class StreamingEngine:
             await self.on_quote(q)
 
     async def run(self, venues: list, refresh_specs, *, refresh_interval: float = 300.0) -> None:
-        """Slow/fast loop: refresh confirmed pairs each interval, (re)subscribe the
-        fast consumers to the current market set, and stream until the next refresh.
+        """Slow/fast loop: refresh confirmed pairs each interval WHILE the fast
+        consumers keep streaming, hot-swap the watchlist on completion, and only
+        (re)subscribe the WebSockets when the market set actually changed.
+
+        The consumers used to be CANCELLED for the whole discovery pass, so the fast
+        path was dark for its entire duration (measured ~8 min/cycle before the
+        embedding cache) — every edge appearing during a refresh was invisible. Now
+        the only dark windows are the first pass at boot (no watchlist yet) and the
+        brief resubscribe when subscriptions change.
 
         ``refresh_specs`` is an async callable returning ``list[ConfirmedPair]``.
         """
-        while True:
-            try:
-                pairs = await refresh_specs()
-            except Exception as exc:
-                log.warning("spec refresh failed (%s); keeping %d existing pairs",
-                            exc, len(self._pairs))
-                pairs = None
-            if pairs:
-                self.set_pairs(pairs)
-            elif pairs is not None and self._pairs:
-                # Successful refresh but empty (e.g. transient: no edge/markets this
-                # cycle) — keep the last-good watchlist rather than going dark.
-                log.info("refresh returned 0 pairs; keeping %d existing", len(self._pairs))
-            log.info("streaming %d confirmed pairs across %d venues",
-                     len(self._pairs), len(self.market_ids))
-            self._ws_counts = {}
+        consumers: list = []
+        subscribed: dict[str, tuple] = {}
+
+        async def _resubscribe() -> None:
+            for c in consumers:
+                c.cancel()
+            await asyncio.gather(*consumers, return_exceptions=True)
+            consumers.clear()
+            # A consumer we just cancelled may have spawned an execution; the shielded
+            # task survives. Settle every order before resubscribing — never stream a
+            # new market set with an order ambiguously in flight.
+            if self._inflight:
+                log.warning("waiting for %d in-flight execution(s) to settle "
+                            "before resubscribe", len(self._inflight))
+                await self.drain()
             # Seed the book with REST snapshots so a quiet (non-ticking) leg doesn't
             # leave pairs blind, and catch any edge already present at refresh time.
             await self.prime_and_sweep()
-            consumers = [asyncio.create_task(self._consume(v)) for v in venues]
-            try:
+            consumers.extend(asyncio.create_task(self._consume(v)) for v in venues)
+
+        try:
+            while True:
+                # Discovery/scan/match runs CONCURRENTLY with the consumers (which
+                # keep trading the last-good watchlist while this completes).
+                try:
+                    pairs = await refresh_specs()
+                except Exception as exc:
+                    log.warning("spec refresh failed (%s); keeping %d existing pairs",
+                                exc, len(self._pairs))
+                    pairs = None
+                if pairs:
+                    self.set_pairs(pairs)
+                elif pairs is not None and self._pairs:
+                    # Successful refresh but empty (e.g. transient: no edge/markets this
+                    # cycle) — keep the last-good watchlist rather than going dark.
+                    log.info("refresh returned 0 pairs; keeping %d existing", len(self._pairs))
+                log.info("streaming %d confirmed pairs across %d venues",
+                         len(self._pairs), len(self.market_ids))
+                new_subs = {v: tuple(sorted(m)) for v, m in self.market_ids.items()}
+                if new_subs != subscribed or not consumers or any(c.done() for c in consumers):
+                    subscribed = new_subs
+                    await _resubscribe()
+                self._ws_counts = {}
                 await asyncio.sleep(refresh_interval)
-            finally:
-                for c in consumers:
-                    c.cancel()
-                await asyncio.gather(*consumers, return_exceptions=True)
-                # A trade may have fired in the last instant before the interval
-                # ended; the consumer that launched it is now cancelled, but the
-                # shielded execution survives. Wait it out so we never start a new
-                # cycle (or exit) with an order still in flight.
-                if self._inflight:
-                    log.warning("waiting for %d in-flight execution(s) to settle "
-                                "before refresh", len(self._inflight))
-                    await asyncio.gather(*list(self._inflight), return_exceptions=True)
-            # WS health: how many live ticks each venue delivered this interval. A
-            # venue at 0 means its market WebSocket isn't feeding the fast path.
-            counts = {v.name: self._ws_counts.get(v.name, 0) for v in venues}
-            dead = [name for name, n in counts.items() if n == 0]
-            if dead:
-                log.warning("WS health: %s — NO quotes this interval from %s", counts, dead)
-            else:
-                log.info("WS health: %s quotes this interval", counts)
-            await self.log_edge_snapshot()
+                # WS health: how many live ticks each venue delivered this interval. A
+                # venue at 0 means its market WebSocket isn't feeding the fast path.
+                counts = {v.name: self._ws_counts.get(v.name, 0) for v in venues}
+                dead = [name for name, n in counts.items() if n == 0]
+                if dead:
+                    log.warning("WS health: %s — NO quotes this interval from %s", counts, dead)
+                else:
+                    log.info("WS health: %s quotes this interval", counts)
+                await self.log_edge_snapshot()
+        finally:
+            for c in consumers:
+                c.cancel()
+            await asyncio.gather(*consumers, return_exceptions=True)
+            if self._inflight:
+                await self.drain()
 
     def edge_snapshot(self, top: int | None = None) -> list[tuple]:
         """Current best edge per pair, computed from the live WS book.
