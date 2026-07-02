@@ -1030,6 +1030,24 @@ class PolymarketUSVenue:
     async def get_positions(self) -> dict:
         raise NotImplementedError("positions endpoint lands with the live phase")
 
+    async def settled_positions(self) -> dict:
+        """Raw slug -> position dict INCLUDING recently-settled positions.
+
+        ``?includeSettled=true`` keeps settled positions readable for a window after
+        resolution (they then drop off entirely) — the only place Polymarket exposes a
+        post-settlement ``realized``, which the settlement-truth auditor uses to infer
+        which side actually paid. Read-only. The query string is excluded from the
+        signed path (verified live: signing the bare path returns 200)."""
+        if not getattr(self.cfg, "is_trading_configured", False):
+            raise OrderNotPermitted("Polymarket US trading credentials not configured")
+        path = "/v1/portfolio/positions"
+        await self._limiter.wait()
+        resp = await self._api().get(
+            path + "?includeSettled=true", headers=self._auth_headers("GET", path))
+        resp.raise_for_status()
+        body = resp.json()
+        return (body.get("positions") if isinstance(body, dict) else None) or {}
+
     async def account_snapshot(self):
         """Balance + non-flat positions/resting orders, for the startup guard.
 

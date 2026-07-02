@@ -164,6 +164,21 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
     PRIMARY KEY (model, text_hash)
 );
 
+-- Settlement ground truth: every settled pair is a completed experiment. If a matched
+-- pair's two legs ever SETTLE DIFFERENTLY, that's PROOF of a false match (no statistics
+-- needed) -> blacklist. Consistent settlements accumulate as positive evidence per pair.
+CREATE TABLE IF NOT EXISTS settlement_checks (
+    venue_a    TEXT NOT NULL,
+    market_a   TEXT NOT NULL,
+    venue_b    TEXT NOT NULL,
+    market_b   TEXT NOT NULL,
+    result_a   TEXT,               -- yes/no as settled on venue A
+    result_b   TEXT,               -- yes/no as settled on venue B (inferred from realized)
+    consistent INTEGER NOT NULL,   -- 1 = same outcome (true match), 0 = DIVERGED (false)
+    ts         REAL NOT NULL,
+    PRIMARY KEY (venue_a, market_a, venue_b, market_b)
+);
+
 -- Time/market indices: the settled-PnL reconciliation, reconcile pairing, and every
 -- "last N hours" query scan these tables, which grow without bound.
 CREATE INDEX IF NOT EXISTS idx_pnl_ts            ON pnl (ts);
@@ -383,6 +398,29 @@ class Store:
             out[a] = b
             out[b] = a
         return out
+
+    # ---- settlement ground truth ----
+
+    def record_settlement_check(self, va: str, ma: str, vb: str, mb: str, *,
+                                result_a: str, result_b: str, consistent: bool) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settlement_checks "
+            "(venue_a, market_a, venue_b, market_b, result_a, result_b, consistent, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (va, ma, vb, mb, result_a, result_b, 1 if consistent else 0, time.time()))
+        self.conn.commit()
+
+    def settlement_checked(self, va: str, ma: str, vb: str, mb: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM settlement_checks WHERE venue_a=? AND market_a=? "
+            "AND venue_b=? AND market_b=?", (va, ma, vb, mb)).fetchone() is not None
+
+    def settlement_consistency(self) -> tuple[int, int]:
+        """(consistent, divergent) totals — the ground-truth track record."""
+        row = self.conn.execute(
+            "SELECT SUM(consistent) c, SUM(1 - consistent) d FROM settlement_checks"
+        ).fetchone()
+        return (row["c"] or 0, row["d"] or 0)
 
     # ---- embedding cache (see schema comment) ----
 

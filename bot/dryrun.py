@@ -908,9 +908,36 @@ async def stream(
     if settings.risk_caps_from_balance:
         apply_balance_caps(risk, guard.snapshots, settings.risk.max_position_fraction)
 
+    async def settlement_truth_loop():
+        # Ground-truth match verification (bot/matching/settlement_truth.py): every
+        # ~10 min, compare how settled pairs ACTUALLY resolved on both venues. A
+        # divergent settlement is PROOF of a false match -> blacklist; consistent
+        # settlements accumulate positive evidence. Off the trade path; a failed pass
+        # just skips to the next.
+        from bot.matching.settlement_truth import audit_settlements
+        kalshi_v = next((v for v in venues if v.name == "kalshi"), None)
+        poly_v = next((v for v in venues if v.name == "polymarket_us"), None)
+        if kalshi_v is None or poly_v is None or store is None:
+            return
+        while True:
+            await asyncio.sleep(600)
+            try:
+                setts = await kalshi_v.settlements(limit=200)
+                ppos = await poly_v.settled_positions()
+                n = audit_settlements(setts, ppos, store.acted_pair_map(), store)
+                if n:
+                    ok, bad = store.settlement_consistency()
+                    log.info("settlement truth: %d new check(s); track record "
+                             "%d consistent / %d divergent", n, ok, bad)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("settlement truth pass failed: %s", exc)
+
     private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
     private_tasks += [asyncio.create_task(feed_lifecycle(v)) for v in venues]
     private_tasks.append(asyncio.create_task(poll_balances()))
+    private_tasks.append(asyncio.create_task(settlement_truth_loop()))
     log.warning("matching mode: %s metrics=%s (MATCH_USE_FINGERPRINT/MATCH_COMBINE_VERDICTS)",
                 ("fingerprint+LLM verdicts UNION"
                  if settings.match_use_fingerprint and settings.match_combine_verdicts
