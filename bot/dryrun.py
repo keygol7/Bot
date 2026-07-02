@@ -959,7 +959,7 @@ async def stream(
         while True:
             await asyncio.sleep(300)
             try:
-                budget = 4
+                budget = 10
                 for p in list(engine._pairs.values()):
                     if budget <= 0:
                         break
@@ -982,10 +982,11 @@ async def stream(
                     store.record_rules_verdict(
                         "kalshi", ka, "polymarket_us", pm,
                         identical=v.identical, confidence=v.confidence,
-                        rationale=v.rationale)
+                        rationale=v.rationale, material=v.material)
                     budget -= 1
                     log.info("rules verify: %s|%s -> %s (%.2f) %s", ka, pm,
-                             "IDENTICAL" if v.identical else "divergent",
+                             "IDENTICAL" if v.identical
+                             else "DIFFERENT-EVENT" if v.material else "tail-divergent",
                              v.confidence, v.rationale[:120])
                 engine.verified_pairs = store.verified_pair_keys()
             except asyncio.CancelledError:

@@ -9,8 +9,9 @@ from bot.matching.rules_match import confirm_rules
 def test_identical_rules_verdict():
     def llm(prompt):
         assert "RESOLUTION RULES" in prompt and "Gen.G" in prompt
-        return json.dumps({"divergent_scenario": "none found", "identical": True,
-                           "confidence": 0.95, "rationale": "same match, same winner"})
+        return json.dumps({"divergent_scenario": "none found", "divergence": "none",
+                           "identical": True, "confidence": 0.95,
+                           "rationale": "same match, same winner"})
     v = confirm_rules(llm, venue_a="kalshi", title_a="DK vs GENG - GENG",
                       rules_a="If Gen.G wins the Jul 2 match, resolves Yes.",
                       venue_b="polymarket_us", title_b="GENG vs DK - Gen.G",
@@ -20,10 +21,17 @@ def test_identical_rules_verdict():
 
 def test_divergent_and_malformed_fail_closed():
     v = confirm_rules(lambda p: json.dumps({"identical": False, "confidence": 0.9,
+                                            "divergence": "different_event",
                                             "rationale": "handicap vs moneyline"}),
                       venue_a="k", title_a="", rules_a="win", venue_b="p", title_b="",
                       rules_b="win by 2.5")
-    assert not v.identical
+    assert not v.identical and v.material
+    v = confirm_rules(lambda p: json.dumps({"identical": False, "confidence": 0.9,
+                                            "divergence": "tail_scenarios",
+                                            "rationale": "tie wording differs"}),
+                      venue_a="k", title_a="", rules_a="r", venue_b="p", title_b="",
+                      rules_b="r2")
+    assert not v.identical and not v.material
     for bad in ("not json at all", '{"identical": "maybe"}', ""):
         v = confirm_rules(lambda p, b=bad: b, venue_a="k", title_a="", rules_a="r",
                           venue_b="p", title_b="", rules_b="r")

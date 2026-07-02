@@ -344,13 +344,25 @@ def test_rules_divergent_pairs_dropped_from_watchlist():
     kw = dict(use_fingerprint=True, combine_verdicts=True, safe_types_only=False)
     got = {p[4] for p in s.confirmed_pairs(**kw)}
     assert "E1" in got
+    # TAIL-scenario divergence (same event, differing void/tie wording) does NOT demote
     s.record_rules_verdict("kalshi", "K1", "polymarket_us", "p1",
                            identical=False, confidence=1.0,
-                           rationale="different events")
-    got = {p[4] for p in s.confirmed_pairs(**kw)}
-    assert "E1" not in got                              # demoted by divergent rules
-    # low-confidence divergence does NOT demote (the LLM can be pedantic)
-    s.record_rules_verdict("kalshi", "K1", "polymarket_us", "p1",
-                           identical=False, confidence=0.5, rationale="unsure")
+                           rationale="cancellation wording differs", material=False)
     got = {p[4] for p in s.confirmed_pairs(**kw)}
     assert "E1" in got
+    # MATERIAL divergence (different event/party — the BESTIA class) demotes
+    s.record_rules_verdict("kalshi", "K1", "polymarket_us", "p1",
+                           identical=False, confidence=1.0,
+                           rationale="different events", material=True)
+    got = {p[4] for p in s.confirmed_pairs(**kw)}
+    assert "E1" not in got
+    # low-confidence material divergence does NOT demote (the LLM can be unsure)
+    s.record_rules_verdict("kalshi", "K1", "polymarket_us", "p1",
+                           identical=False, confidence=0.5, rationale="unsure",
+                           material=True)
+    got = {p[4] for p in s.confirmed_pairs(**kw)}
+    assert "E1" in got
+    # legacy (pre-classification) rows count as UNchecked -> re-verified organically
+    s.conn.execute("UPDATE rules_verdicts SET material=NULL")
+    s.conn.commit()
+    assert not s.rules_checked("kalshi", "K1", "polymarket_us", "p1")

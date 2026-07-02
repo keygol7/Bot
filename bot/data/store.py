@@ -210,6 +210,7 @@ CREATE TABLE IF NOT EXISTS rules_verdicts (
     identical  INTEGER NOT NULL,
     confidence REAL,
     rationale  TEXT,
+    material   INTEGER,           -- 1 = different-event divergence (demote); NULL = legacy
     ts         REAL NOT NULL,
     PRIMARY KEY (venue_a, market_a, venue_b, market_b)
 );
@@ -250,6 +251,12 @@ class Store:
         if "max_fill" not in _rel_cols:
             self.conn.execute(
                 "ALTER TABLE market_reliability ADD COLUMN max_fill REAL NOT NULL DEFAULT 0")
+        # rules_verdicts.material: 1 = different-event divergence (never a hedge -> demote),
+        # 0 = tail-scenario/identical, NULL = legacy row from the pre-classification prompt —
+        # rules_checked() treats NULL as unchecked so old verdicts re-verify organically.
+        _rv_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(rules_verdicts)")}
+        if "material" not in _rv_cols:
+            self.conn.execute("ALTER TABLE rules_verdicts ADD COLUMN material INTEGER")
         self.conn.commit()
 
     def close(self) -> None:
@@ -517,18 +524,23 @@ class Store:
     # ---- rules-text verification ----
 
     def record_rules_verdict(self, va: str, ma: str, vb: str, mb: str, *,
-                             identical: bool, confidence: float, rationale: str) -> None:
+                             identical: bool, confidence: float, rationale: str,
+                             material: bool = False) -> None:
         self.conn.execute(
             "INSERT OR REPLACE INTO rules_verdicts "
-            "(venue_a, market_a, venue_b, market_b, identical, confidence, rationale, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (va, ma, vb, mb, 1 if identical else 0, confidence, rationale, time.time()))
+            "(venue_a, market_a, venue_b, market_b, identical, confidence, rationale,"
+            " material, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (va, ma, vb, mb, 1 if identical else 0, confidence, rationale,
+             1 if material else 0, time.time()))
         self.conn.commit()
 
     def rules_checked(self, va: str, ma: str, vb: str, mb: str) -> bool:
+        # Legacy rows (material IS NULL, from the pre-classification prompt) count as
+        # UNchecked so they re-verify organically with the material/tail distinction.
         return self.conn.execute(
             "SELECT 1 FROM rules_verdicts WHERE venue_a=? AND market_a=? "
-            "AND venue_b=? AND market_b=?", (va, ma, vb, mb)).fetchone() is not None
+            "AND venue_b=? AND market_b=? AND material IS NOT NULL",
+            (va, ma, vb, mb)).fetchone() is not None
 
     def rules_divergent_keys(self, min_confidence: float = 0.9) -> set:
         """Pairs whose RESOLUTION RULES the LLM confidently judged NON-identical.
@@ -541,7 +553,8 @@ class Store:
             self._pair_key(r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
             for r in self.conn.execute(
                 "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts "
-                "WHERE identical = 0 AND confidence >= ?", (min_confidence,))
+                "WHERE identical = 0 AND material = 1 AND confidence >= ?",
+                (min_confidence,))
         }
 
     def verified_pair_keys(self) -> set:
