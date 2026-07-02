@@ -437,9 +437,11 @@ async def run(
 
     embed_fn = None
     if use_embed:
+        from bot.matching.embed_cache import CachingEmbedFn
         from bot.matching.embed_client import make_embed_fn
 
-        embed_fn = make_embed_fn(settings.llm)
+        embed_fn = CachingEmbedFn(make_embed_fn(settings.llm), store,
+                                  model=settings.llm.embedding_model)
 
     last: CycleResult | None = None
     try:
@@ -767,7 +769,14 @@ async def stream(
     # fingerprint sweep ignores — so skip the clients entirely when it's off.
     discover = settings.stream_discovery
     complete_fn = make_complete_fn(settings.llm) if (use_llm and discover) else None
-    embed_fn = make_embed_fn(settings.llm) if (use_embed and discover) else None
+    embed_fn = None
+    if use_embed and discover:
+        from bot.matching.embed_cache import CachingEmbedFn
+
+        # Cache title->vector (memory LRU + SQLite): each discovery pass embeds only
+        # NEW titles instead of the whole board — the ~8-minute cycle becomes seconds.
+        embed_fn = CachingEmbedFn(make_embed_fn(settings.llm), store,
+                                  model=settings.llm.embedding_model)
 
     async def refresh_balances():
         # Re-read available cash per venue so each arb is sized against what's actually

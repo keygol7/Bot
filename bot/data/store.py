@@ -150,6 +150,18 @@ CREATE TABLE IF NOT EXISTS market_reliability (
     ts         REAL,
     PRIMARY KEY (venue, market_id)
 );
+
+-- Title-embedding cache. Market titles are stable strings, but the discovery cycle was
+-- re-embedding the ENTIRE scanned board every pass (~3.4k calls/cycle -> ~8-minute
+-- cycles). Persisting text-hash -> vector means each pass embeds only NEW titles, and a
+-- restart doesn't re-pay the whole board. vec is packed float32 (array('f').tobytes()).
+CREATE TABLE IF NOT EXISTS embedding_cache (
+    model      TEXT NOT NULL,
+    text_hash  TEXT NOT NULL,
+    vec        BLOB NOT NULL,
+    ts         REAL NOT NULL,
+    PRIMARY KEY (model, text_hash)
+);
 """
 
 
@@ -344,6 +356,37 @@ class Store:
             for r in self.conn.execute(
                 "SELECT venue, market_id, fills, fails, streak, max_fill FROM market_reliability")
         }
+
+    # ---- embedding cache (see schema comment) ----
+
+    def embeddings_get(self, model: str, hashes: list[str]) -> dict[str, bytes]:
+        """Cached packed-float32 vectors for ``hashes`` (missing ones absent)."""
+        out: dict[str, bytes] = {}
+        CHUNK = 500                                   # stay under SQLite's param limit
+        for i in range(0, len(hashes), CHUNK):
+            chunk = hashes[i:i + CHUNK]
+            marks = ",".join("?" * len(chunk))
+            for r in self.conn.execute(
+                f"SELECT text_hash, vec FROM embedding_cache "
+                f"WHERE model = ? AND text_hash IN ({marks})", [model, *chunk]):
+                out[r["text_hash"]] = r["vec"]
+        return out
+
+    def embeddings_put(self, model: str, rows: list[tuple[str, bytes]]) -> None:
+        """Persist ``(text_hash, packed_vec)`` rows (INSERT OR REPLACE)."""
+        now = time.time()
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO embedding_cache (model, text_hash, vec, ts) "
+            "VALUES (?, ?, ?, ?)",
+            [(model, h, v, now) for h, v in rows])
+        self.conn.commit()
+
+    def embeddings_prune(self, *, max_age_days: float = 30.0) -> int:
+        """Drop cache entries older than ``max_age_days`` (titles that left the board)."""
+        cutoff = time.time() - max_age_days * 86400
+        cur = self.conn.execute("DELETE FROM embedding_cache WHERE ts < ?", (cutoff,))
+        self.conn.commit()
+        return cur.rowcount
 
     def cache_verdict(
         self, va: str, ma: str, vb: str, mb: str, *,
