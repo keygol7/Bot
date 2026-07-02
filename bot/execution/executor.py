@@ -596,29 +596,34 @@ class Executor:
 
     def _rebalance_skip(self, opp: ArbOpportunity) -> str | None:
         """Keep a draining venue alive: when one venue's cash is below the rebalance floor,
-        skip arbs whose leg on THAT venue is the EXPENSIVE (> $0.50) side. Each arb's two
-        legs sum to ~$0.97, so exactly one venue holds the expensive half — firing only the
-        arbs where the scarce venue holds the CHEAP half shifts new spend to the funded venue
-        and stretches the scarce side's cash until settlements replenish it. Same edge, just
-        allocated to keep both venues fundable (vs one-way draining to 'can't-fund' idle)."""
+        skip arbs where THAT venue would hold the LONGSHOT leg (the cheaper side).
+
+        Settlement cash flows to the venue holding the WINNER — and price ~= win
+        probability. The original gate did the OPPOSITE (kept only cheap legs on the
+        drained venue to conserve cash-at-purchase), which measurably created a death
+        spiral: over 48h live, Kalshi's book became 109 cheap legs vs 17 expensive, its
+        held sides won only 16/52 settlements, and the venue's settlement cash flow ran
+        spent $281 / received $83 (net -$198) while Poly collected the $1 payouts. Holding
+        the FAVORITE costs more per contract now (the cash caps bound that) but the median
+        settlement REPLENISHES the drained venue within hours instead of bleeding it."""
         if self.rebalance_floor <= 0:
             return None
         legs = ((opp.buy_yes_venue, opp.yes_price), (opp.buy_no_venue, opp.no_price))
         for i, (venue, leg_price) in enumerate(legs):
+            other_venue, other_price = legs[1 - i]
             bal = self._balance(venue)
-            if bal is None or bal >= self.rebalance_floor or leg_price <= 0.5:
-                continue
-            # This venue holds the expensive leg and is below the floor. Only RESERVE if the
-            # COUNTERPART venue is funded (>= floor) — i.e. there's actually a funded side to
-            # steer spend toward. If BOTH venues are below the floor there's no rebalance
-            # target, so reserving would just deadlock the bot into idle; let the trade through
-            # (the scarcity gate + min_venue_balance still guard truly-insufficient cash).
-            other_bal = self._balance(legs[1 - i][0])
+            if bal is None or bal >= self.rebalance_floor or leg_price >= other_price:
+                continue                    # funded, or already holding the favorite
+            # Only RESERVE if the COUNTERPART venue is funded (>= floor) — i.e. there's a
+            # funded side to steer the longshot toward. If BOTH venues are below the floor
+            # there's no rebalance target, so reserving would just deadlock the bot into
+            # idle (the scarcity gate + min_venue_balance still guard genuine shortfalls).
+            other_bal = self._balance(other_venue)
             if other_bal is not None and other_bal < self.rebalance_floor:
                 continue
             return (f"rebalance: {venue} low (${bal:.0f} < ${self.rebalance_floor:.0f}) and "
-                    f"its leg is the expensive side (${leg_price:.2f}) — reserving for "
-                    f"cheap-on-{venue} arbs to self-level")
+                    f"its leg is the LONGSHOT (${leg_price:.2f} vs ${other_price:.2f}) — "
+                    f"settlements must replenish it, so it only holds favorites now")
         return None
 
     async def execute(self, opp: ArbOpportunity) -> ExecutionReport:

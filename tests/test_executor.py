@@ -152,29 +152,30 @@ def test_scarcity_gate_reserves_capital_for_fat_edges():
     assert rep.status is ExecStatus.SUCCESS
 
 
-def test_rebalance_gate_skips_expensive_leg_on_drained_venue():
-    # When a venue is below the rebalance floor, an arb whose leg on it is the EXPENSIVE side
-    # is skipped (reserve its cash for cheap-on-it arbs); a cheap-on-it arb fires.
+def test_rebalance_gate_keeps_favorites_on_drained_venue():
+    # Settlement cash flows to the venue holding the WINNER (price ~= win probability), so
+    # a drained venue must hold the FAVORITE leg — settlements then replenish it. The old
+    # cheap-legs-only gate measurably death-spiraled Kalshi (-$198 settlement flow / 48h).
     def fresh():
         return (FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)]),
                 FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.57)]))
 
-    # kalshi drained ($15 < $30 floor). This arb's kalshi (YES) leg is the EXPENSIVE side
-    # (0.80) -> skip so kalshi's cash goes to arbs where kalshi is the cheap half.
-    y, n = fresh()
-    ex, _ = make_exec([y, n])
-    ex.rebalance_floor = 30.0
-    ex._balances = {"kalshi": 15.0, "poly": 100.0}
-    rep = asyncio.run(ex.execute(opp(yv="kalshi", nv="poly", yes_price=0.80, no_price=0.17)))
-    assert rep.status is ExecStatus.SKIPPED and "rebalance" in rep.reason and y.calls == []
-
-    # same drained kalshi, but here the kalshi (YES) leg is the CHEAP side (0.17) -> fires
-    # (spends little on the scarce venue, shifts cost to the funded poly side)
+    # kalshi drained ($15 < $30 floor) and this arb's kalshi (YES) leg is the LONGSHOT
+    # (0.17 vs 0.80) -> skip: a longshot mostly loses at settlement and bleeds kalshi.
     y, n = fresh()
     ex, _ = make_exec([y, n])
     ex.rebalance_floor = 30.0
     ex._balances = {"kalshi": 15.0, "poly": 100.0}
     rep = asyncio.run(ex.execute(opp(yv="kalshi", nv="poly", yes_price=0.17, no_price=0.80)))
+    assert rep.status is ExecStatus.SKIPPED and "LONGSHOT" in rep.reason and y.calls == []
+
+    # same drained kalshi, but kalshi holds the FAVORITE (0.80) -> fires (the settlement
+    # pays kalshi $1/contract with ~80% probability -> median replenishment)
+    y, n = fresh()
+    ex, _ = make_exec([y, n])
+    ex.rebalance_floor = 30.0
+    ex._balances = {"kalshi": 15.0, "poly": 100.0}
+    rep = asyncio.run(ex.execute(opp(yv="kalshi", nv="poly", yes_price=0.80, no_price=0.17)))
     assert rep.status is ExecStatus.SUCCESS
 
     # both venues funded -> no rebalance gating even on a lopsided arb
