@@ -162,6 +162,15 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
     ts         REAL NOT NULL,
     PRIMARY KEY (model, text_hash)
 );
+
+-- Time/market indices: the settled-PnL reconciliation, reconcile pairing, and every
+-- "last N hours" query scan these tables, which grow without bound.
+CREATE INDEX IF NOT EXISTS idx_pnl_ts            ON pnl (ts);
+CREATE INDEX IF NOT EXISTS idx_fills_ts          ON fills (ts);
+CREATE INDEX IF NOT EXISTS idx_fills_market      ON fills (venue, market_id);
+CREATE INDEX IF NOT EXISTS idx_opportunities_ts  ON opportunities (ts);
+CREATE INDEX IF NOT EXISTS idx_opps_acted        ON opportunities (acted);
+CREATE INDEX IF NOT EXISTS idx_embed_ts          ON embedding_cache (ts);
 """
 
 

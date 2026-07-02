@@ -321,3 +321,13 @@ def test_audit_log():
     assert row["kind"] == "startup"
     assert "DRY_RUN" in row["payload"]
     s.close()
+
+
+def test_indices_exist():
+    # Time/market indices keep the settled-PnL and reconcile queries off full scans.
+    s = Store(":memory:")
+    names = {r["name"] for r in s.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'")}
+    for idx in ("idx_pnl_ts", "idx_fills_ts", "idx_fills_market",
+                "idx_opportunities_ts", "idx_opps_acted", "idx_embed_ts"):
+        assert idx in names

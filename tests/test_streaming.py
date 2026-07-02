@@ -1226,3 +1226,20 @@ def test_consume_counts_ws_quotes_for_health():
 
     asyncio.run(eng._consume(V()))
     assert eng._ws_counts["kalshi"] == 2
+
+
+def test_fill_tracker_is_bounded():
+    # One _OrderState per order forever = a slow leak; the map must stay bounded.
+    from bot.streaming.fills import FillEvent, FillTracker
+
+    async def main():
+        t = FillTracker()
+        t._max = 50
+        for i in range(200):
+            await t.apply(FillEvent("kalshi", f"o{i}", "FILL", 1.0, 0.5))
+        assert len(t._orders) <= 50
+        # the most recent order's state survived
+        status, filled, _ = await t.confirm("kalshi", "o199", 1.0, timeout=0.01)
+        assert filled == 1.0
+
+    asyncio.run(main())
