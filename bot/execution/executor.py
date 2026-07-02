@@ -1240,11 +1240,23 @@ class Executor:
         # the venue and trust the larger value, so we never walk away from a real fill.
         fn = getattr(maker_venue, "order_filled_qty", None)
         if fn is not None and m.order_id:
-            try:
-                true_qty = await fn(m.order_id, size, maker[2])
-            except Exception as exc:
-                log.warning("maker true-fill read failed for %s: %s", m.order_id, exc)
-                true_qty = None
+            async def _read():
+                try:
+                    return await fn(m.order_id, size, maker[2])
+                except Exception as exc:
+                    log.warning("maker true-fill read failed for %s: %s", m.order_id, exc)
+                    return None
+
+            true_qty = await _read()
+            if true_qty is None or true_qty <= filled + 1e-9:
+                # CONFIRMATION RETRY: the order record is eventually consistent — a live
+                # incident had fills land at T+0s, the record still read the OLD count in
+                # this window, and 8 contracts leaked naked until the reconcile halted.
+                # The maker is already cancelled here, so ~2.5s later the record is final.
+                await asyncio.sleep(2.5)
+                second = await _read()
+                if second is not None:
+                    true_qty = second if true_qty is None else max(true_qty, second)
             if true_qty is not None:
                 if true_qty > filled + 1e-9:
                     log.warning("maker fill UNDER-REPORTED by confirmer (%g) — venue shows %g; "

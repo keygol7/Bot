@@ -288,8 +288,12 @@ def _parse_create_order_response(data: Any, requested: float, side: Side):
         order_id = terminal_order.get("id")
 
     avg_price = _amount(terminal_order.get("avgPx"))
-    # avgPx is the YES/long-side price; for a NO buy the cost is 1 - that.
-    if avg_price is not None and side is Side.NO:
+    # avgPx is the YES/long-side price; for a NO buy the cost is 1 - that. An UNFILLED
+    # order's avgPx is a meaningless 0 — leaving it set turns a KILLED order into a
+    # phantom @0.0 (YES) / @1.0 (NO) price in logs and accounting.
+    if filled <= 1e-9:
+        avg_price = None
+    elif avg_price is not None and side is Side.NO:
         avg_price = round(1.0 - avg_price, 6)
 
     if state == _STATE_FILLED or (requested > 0 and filled >= requested - 1e-9):
