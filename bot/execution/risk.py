@@ -50,6 +50,7 @@ class RiskManager:
         self._daily_pnl: float = 0.0
         self._killed: bool = False
         self._kill_reason: str = ""
+        self._pnl_day: str = ""                 # UTC date the daily counter belongs to
 
     # ---- state inspection ----
     @property
@@ -104,8 +105,35 @@ class RiskManager:
         if self._positions[market_label] <= 1e-9:
             self._positions.pop(market_label, None)
 
+    def retain_markets(self, open_labels) -> float:
+        """Release exposure for markets no longer OPEN on the venue.
+
+        ``record_fill`` only ever ADDS notional, so settled/expired markets would pin
+        their exposure forever — tightening the per-market/total caps monotonically
+        until a restart. The balance poll calls this with the labels the venues still
+        report as open positions; anything else has settled and its capital is back
+        (or lost — either way no longer *at risk*). Returns the $ released.
+        """
+        keep = set(open_labels)
+        stale = [label for label in self._positions if label not in keep]
+        released = 0.0
+        for label in stale:
+            released += self._positions.pop(label)
+        return released
+
     def record_pnl(self, amount: float) -> None:
-        """Record realized PnL. A breach of the daily loss limit trips the kill switch."""
+        """Record realized PnL. A breach of the daily loss limit trips the kill switch.
+
+        The counter self-rolls at UTC midnight so "daily" is a real day, not
+        process-lifetime (nothing else in the live loop calls reset_daily). The kill
+        switch stays sticky — a new day resets the COUNTER, never a tripped switch.
+        """
+        from datetime import datetime, timezone
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._pnl_day and self._pnl_day != today:
+            self._daily_pnl = 0.0
+        self._pnl_day = today
         self._daily_pnl += amount
         if self._daily_pnl <= -self.limits.max_daily_loss:
             self.trip_kill_switch(

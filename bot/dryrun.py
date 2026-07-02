@@ -785,6 +785,17 @@ async def stream(
             executor.set_balances(snaps)
             if settings.risk_caps_from_balance:
                 apply_balance_caps(risk, snaps, settings.risk.max_position_fraction)
+            # Release risk exposure held on markets the venues no longer report open
+            # (settled/expired) — record_fill only adds, so without this the caps
+            # tighten monotonically until a restart.
+            open_labels = {
+                f"{snap.venue}:{pos.market_id}"
+                for snap in snaps for pos in (getattr(snap, "positions", None) or [])
+                if getattr(pos, "is_open", False)
+            }
+            released = risk.retain_markets(open_labels)
+            if released > 1e-9:
+                log.info("risk: released $%.2f of exposure on settled markets", released)
             # Cross-venue naked-exposure backstop: catch a position whose hedge never
             # landed (the failure mode behind the Ruzic loss), not just at startup.
             await engine.reconcile_positions(snaps)

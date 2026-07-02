@@ -67,3 +67,30 @@ def test_invalid_limits():
         RiskLimits(max_total_exposure=0)
     with pytest.raises(ValueError):
         RiskLimits(min_edge=-1)
+
+
+def test_retain_markets_releases_settled_exposure():
+    # record_fill only ever ADDS, so settled markets would pin exposure forever and
+    # tighten the caps monotonically. retain_markets releases anything not in the
+    # venue's still-open set (fed by the balance poll).
+    r = make(max_position_per_market=200, max_total_exposure=5000, max_daily_loss=500)
+    r.record_fill("kalshi:A", 100)
+    r.record_fill("kalshi:B", 50)
+    r.record_fill("poly:C", 25)
+    released = r.retain_markets({"kalshi:B"})          # A and C settled
+    assert released == 125
+    assert r.total_exposure == 50
+    assert r.position("kalshi:A") == 0 and r.position("poly:C") == 0
+    assert r.position("kalshi:B") == 50                # still-open exposure kept
+
+
+def test_daily_pnl_rolls_at_utc_midnight():
+    # "daily" must mean a real UTC day, not process lifetime: losses from yesterday
+    # roll off the counter (the kill switch itself stays sticky and is NOT reset).
+    r = make(max_position_per_market=200, max_total_exposure=5000, max_daily_loss=500)
+    r.record_pnl(-100)
+    assert r.daily_pnl == -100
+    r._pnl_day = "2000-01-01"                          # simulate a prior-day counter
+    r.record_pnl(-10)
+    assert r.daily_pnl == -10                          # yesterday's -100 rolled off
+    assert not r.is_killed

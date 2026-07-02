@@ -1177,7 +1177,10 @@ class Executor:
         fees = self._fee(yes_leg.venue).fee(ya, size) + self._fee(no_leg.venue).fee(na, size)
         pnl = size * (1.0 - ya - na) - fees
 
-        self.risk.record_fill(f"{yes_leg.venue}:{yes_leg.market_id}", ya * size)
+        # Record the PAIR's full committed notional (both legs) under the same label
+        # risk.check()/_max_size gate on — recording only the YES leg's half made
+        # recorded exposure ~half of what the gates were sized against.
+        self.risk.record_fill(f"{yes_leg.venue}:{yes_leg.market_id}", (ya + na) * size)
         self.risk.record_pnl(pnl)
         # Decrement tracked cash so the next arb sizes against what's actually left.
         self._spend(yes_leg.venue, ya * size)
