@@ -128,6 +128,7 @@ class Executor:
         edge_full_budget: float = 0.0,
         edge_budget_floor: float = 0.25,
         fresh_hedge_secs: float = 0.0,
+        recross_epsilon: float = 0.02,
         min_lock_edge: float | None = None,
         leg2_slippage_share: float = 0.6,
         min_leg_depth: float = 0.0,
@@ -204,6 +205,9 @@ class Executor:
         # are younger than this AND the hedge leg's WS depth is >= 2x the trade size (the
         # only network round-trip on the fire path, ~40ms). 0 = always re-read.
         self.fresh_hedge_secs = fresh_hedge_secs
+        # Breakeven recross (see _recross_or_unwind): how far past leg1's breakeven the
+        # failed hedge may be re-taken before we accept the unwind's guaranteed loss.
+        self.recross_epsilon = recross_epsilon
         self._market_rel: dict[tuple, tuple] = (
             self.store.market_reliability() if self.store is not None else {})
         # FAMILY-level reliability (aggregated from the per-market table): markets are
@@ -846,10 +850,14 @@ class Executor:
                 f"leg1 not filled ({leg1.status.value}: {_reject_reason(leg1)})", [leg1])
         if not leg1.filled_fully:
             # FoK didn't behave all-or-nothing (observed on Polymarket: a 0.62/6 fill).
-            # The filled amount is KNOWN (not ambiguous), so unwind that portion and skip
-            # rather than halting the whole bot and stranding a naked leg.
-            log.warning("leg1 PARTIAL %g/%g — unwinding the filled portion", leg1.filled, size)
-            return await self._unwind(opp, leg1, None, reason="leg1 partial fill")
+            # We HOLD leg1.filled — a perfectly good position. The old behavior sold it
+            # straight back (guaranteed spread+slippage loss; the single worst unwind
+            # category, -$32 all-time at -$4.6 avg). Just HEDGE the amount we actually
+            # hold instead: shrink the trade to leg1.filled and continue into the normal
+            # leg-2 flow — every failure path below (recross -> unwind) still applies.
+            log.warning("leg1 PARTIAL %g/%g — hedging the filled portion instead of "
+                        "unwinding it", leg1.filled, size)
+            size = leg1.filled
 
         # ----- Leg 2: the hedge, fill-or-kill -----
         leg2 = await self._place(
@@ -861,12 +869,13 @@ class Executor:
             return self._settle_success(opp, size, [leg1, leg2])
 
         if leg2.status in (OrderStatus.KILLED, OrderStatus.REJECTED) and leg2.filled <= 1e-9:
-            # Definitively no leg-2 position -> safe to unwind leg 1. Carry WHY leg2
-            # failed (HTTP status + venue body) into the unwind/log so a rejection is
-            # diagnosable instead of an opaque [REJECTED].
+            # Definitively no leg-2 position. Try a breakeven RECROSS before unwinding —
+            # unwinding is a GUARANTEED loss (cross leg1's spread + slippage), while the
+            # hedge is usually still available a tick worse. See _recross_or_unwind.
             log.warning("leg2 %s — %s", leg2.status.value, _reject_reason(leg2))
-            return await self._unwind(
-                opp, leg1, leg2, reason=f"leg2 {leg2.status.value} ({_reject_reason(leg2)})"
+            return await self._recross_or_unwind(
+                opp, leg1, leg2, second, second_venue, size,
+                reason=f"leg2 {leg2.status.value} ({_reject_reason(leg2)})"
             )
 
         if leg2.status is OrderStatus.ERROR:
@@ -891,13 +900,13 @@ class Executor:
                     avg_price=leg2.avg_price if leg2.avg_price is not None else second[3])
                 return self._settle_success(opp, size, [leg1, leg2])
             if qty <= 1e-9:
-                # Hedge confirmed FLAT. The synchronous FOK didn't fill -> no leg-2 position
-                # -> safe to unwind leg 1 and KEEP TRADING (one bad market doesn't freeze
-                # the whole bot).
-                log.warning("leg2 ERROR but %s flat — no hedge landed, unwinding leg1 (%s)",
+                # Hedge confirmed FLAT. The synchronous FOK didn't fill -> no leg-2
+                # position -> try the breakeven recross, then unwind. One bad market
+                # doesn't freeze the whole bot either way.
+                log.warning("leg2 ERROR but %s flat — no hedge landed, recross/unwind (%s)",
                             second[1], _reject_reason(leg2))
-                return await self._unwind(
-                    opp, leg1, leg2,
+                return await self._recross_or_unwind(
+                    opp, leg1, leg2, second, second_venue, size,
                     reason=f"leg2 ERROR, hedge flat ({_reject_reason(leg2)})")
             # 0 < qty < size: a partial hedge — a known-but-mismatched naked remainder we
             # can't safely auto-resolve. Halt for manual reconciliation.
@@ -965,6 +974,45 @@ class Executor:
         return self._halt(
             f"leg1 ERROR — hedge-completion failed ({hedge.status.value}: "
             f"{_reject_reason(hedge)}); {unhedged:g} still naked on {first[1]}", [leg1, hedge])
+
+    async def _recross_or_unwind(self, opp, leg1, leg2, second, second_venue, size,
+                                 *, reason: str) -> ExecutionReport:
+        """A failed hedge doesn't mean the hedge is GONE — usually the book moved a tick.
+        Unwinding leg 1 is a GUARANTEED loss (cross its spread + slippage, historically
+        ~-$0.16 avg and 89% of gross profit all-time), so first RE-READ the hedge book and
+        take it at up to BREAKEVEN + recross_epsilon: worst case we lock a ~$0 arb (or an
+        epsilon loss strictly smaller than the expected unwind cost), best case the edge
+        survived the tick. Only when the book truly can't hedge near breakeven do we pay
+        for the unwind. One extra book read + at most one order, on the failure path only."""
+        buy_px = leg1.avg_price if leg1.avg_price is not None else (
+            opp.yes_price if leg1.side is Side.YES else opp.no_price)
+        ceiling = min(0.99, round((1.0 - buy_px) + self.recross_epsilon, 4))
+        ask = await self._taker_ask(second, second_venue)
+        if ask is not None and ask <= ceiling + 1e-9:
+            retry = await self._place(
+                second_venue, second[1], second[2], "buy", ceiling, size, "fill_or_kill")
+            log.warning("recross %s", retry)
+            if retry.status is OrderStatus.FILLED and retry.filled_fully:
+                log.warning("RECROSSED %s: hedge landed at %.3f (breakeven %.3f + eps) — "
+                            "locked instead of unwinding", opp.event_key,
+                            retry.avg_price if retry.avg_price is not None else ceiling,
+                            1.0 - buy_px)
+                return self._settle_success(opp, size, [leg1, retry])
+            if retry.status is OrderStatus.ERROR:
+                # Ambiguous retry: reconcile like the main leg-2 ERROR path — settle if it
+                # actually landed, otherwise fall through to the unwind.
+                qty = await self._hedge_qty_after_error(second_venue, second[1])
+                if qty is not None and qty >= size - 1e-9:
+                    landed = replace(retry, status=OrderStatus.FILLED, filled=size,
+                                     avg_price=retry.avg_price if retry.avg_price is not None
+                                     else ceiling)
+                    return self._settle_success(opp, size, [leg1, landed])
+                if qty is None or qty > 1e-9:
+                    return self._halt(
+                        f"recross ambiguous ({_reject_reason(retry)}; hedge state "
+                        f"{'unreadable' if qty is None else f'partial {qty:g}/{size:g}'}) "
+                        f"— manual reconcile", [leg1, retry])
+        return await self._unwind(opp, leg1, leg2, reason=reason)
 
     async def _cancel_maker(self, venue, order_id) -> None:
         """Best-effort cancel of a resting maker. A GOOD_TILL_CANCEL maker does not

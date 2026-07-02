@@ -686,6 +686,7 @@ async def stream(
         edge_full_budget=settings.exec_edge_full_budget,
         edge_budget_floor=settings.exec_edge_budget_floor,
         fresh_hedge_secs=settings.exec_fresh_hedge_secs,
+        recross_epsilon=settings.exec_recross_epsilon,
         rebalance_floor=settings.exec_rebalance_floor,
         probe_contracts=settings.exec_probe_contracts,
         market_proven_fills=settings.exec_market_proven_fills,

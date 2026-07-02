@@ -81,7 +81,8 @@ def test_leg2_killed_unwinds_leg1():
         res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),
         res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.38, action="sell"),
     ])
-    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None),
+                            res("poly", Side.NO, OrderStatus.KILLED, 0, None)])  # + recross
     ex, risk = make_exec([yes, no])
     report = asyncio.run(ex.execute(opp()))
     assert report.status is ExecStatus.UNWOUND
@@ -99,7 +100,8 @@ def test_unwind_failure_quarantines_and_keeps_trading():
         res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),                 # leg1 fills
         res("kalshi", Side.YES, OrderStatus.KILLED, 0, None, action="sell"),  # unwind fails
     ])
-    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)])  # leg2 rejects
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None),
+                            res("poly", Side.NO, OrderStatus.KILLED, 0, None)])  # leg2+recross reject
     ex, risk = make_exec([yes, no], store=store)
     report = asyncio.run(ex.execute(opp()))
     assert report.status is ExecStatus.QUARANTINED
@@ -114,7 +116,8 @@ def test_unwind_failure_without_store_hard_halts():
         res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),
         res("kalshi", Side.YES, OrderStatus.KILLED, 0, None, action="sell"),
     ])
-    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None),
+                            res("poly", Side.NO, OrderStatus.KILLED, 0, None)])
     ex, risk = make_exec([yes, no])                        # store=None
     report = asyncio.run(ex.execute(opp()))
     assert report.status is ExecStatus.HALTED and risk.is_killed
@@ -442,20 +445,39 @@ def test_reliability_loads_history_from_store_on_init():
     assert ex._market_rel[("poly", "P1")] == (0, 2, 2, 0.0)  # excluded from the first tick after restart
 
 
-def test_leg1_partial_unwinds_not_halts():
-    # FoK partial-filled leg1 (observed on Polymarket, e.g. 0.62/6). The known filled
-    # amount is unwound and the bot keeps running — no halt, no naked position.
+def test_leg1_partial_hedges_filled_portion():
+    # FoK partial-filled leg1 (e.g. 0.62/6): we HOLD 0.62 — a good position. The old
+    # behavior sold it straight back (the worst unwind category, -$32 all-time); now the
+    # trade shrinks to the filled amount and hedges it -> a locked (smaller) arb.
+    yes = FakeVenue("kalshi", [
+        res("kalshi", Side.YES, OrderStatus.PARTIAL, 0.62, 0.40, requested=6),
+    ])
+    no = FakeVenue("poly", [
+        res("poly", Side.NO, OrderStatus.FILLED, 0.62, 0.55, requested=0.62),
+    ])
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp(max_contracts=6)))
+    assert report.status is ExecStatus.SUCCESS        # hedged, not unwound
+    assert not risk.is_killed
+    assert no.calls[0][4] == 0.62                     # hedge sized to the PARTIAL amount
+
+
+def test_leg1_partial_unwinds_only_when_hedge_and_recross_fail():
+    # Partial leg1 whose hedge AND breakeven recross both fail -> unwind just the
+    # filled portion (never more), bot keeps running.
     yes = FakeVenue("kalshi", [
         res("kalshi", Side.YES, OrderStatus.PARTIAL, 0.62, 0.40, requested=6),
         res("kalshi", Side.YES, OrderStatus.FILLED, 0.62, 0.38, action="sell", requested=0.62),
     ])
-    no = FakeVenue("poly", [])                       # leg2 never attempted on a partial leg1
+    no = FakeVenue("poly", [
+        res("poly", Side.NO, OrderStatus.KILLED, 0, None),   # hedge FOK fails
+        res("poly", Side.NO, OrderStatus.KILLED, 0, None),   # breakeven recross fails too
+    ])
     ex, risk = make_exec([yes, no])
     report = asyncio.run(ex.execute(opp(max_contracts=6)))
     assert report.status is ExecStatus.UNWOUND
-    assert not risk.is_killed                         # bot keeps trading
-    assert no.calls == []                             # no hedge leg placed
-    assert yes.calls[1][2] == "sell"                  # the partial was sold back
+    assert not risk.is_killed
+    assert yes.calls[1][2] == "sell" and yes.calls[1][4] == 0.62
 
 
 def test_leg1_killed_skips_no_position():
@@ -1236,7 +1258,8 @@ def test_leg2_rejected_unwinds_not_halts():
         res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),
         res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.38, action="sell"),
     ])
-    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.REJECTED, 0, None)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.REJECTED, 0, None),
+                            res("poly", Side.NO, OrderStatus.KILLED, 0, None)])  # + recross
     ex, risk = make_exec([yes, no])
     report = asyncio.run(ex.execute(opp()))
     assert report.status is ExecStatus.UNWOUND and not risk.is_killed
@@ -1253,7 +1276,7 @@ def test_leg2_reject_reason_in_unwind_report():
         res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),
         res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.38, action="sell"),
     ])
-    no = FakeVenue("poly", [rej])
+    no = FakeVenue("poly", [rej, res("poly", Side.NO, OrderStatus.KILLED, 0, None)])
     ex, risk = make_exec([yes, no])
     report = asyncio.run(ex.execute(opp()))
     assert report.status is ExecStatus.UNWOUND
@@ -1341,7 +1364,8 @@ def test_unwind_crosses_real_bid():
         res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),
         res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.05, action="sell"),
     ], thin)
-    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None),
+                            res("poly", Side.NO, OrderStatus.KILLED, 0, None)])  # + recross
     ex, risk = make_exec([yes, no])
     report = asyncio.run(ex.execute(opp()))
     assert report.status is ExecStatus.UNWOUND and not risk.is_killed
@@ -1368,7 +1392,8 @@ def test_unwinds_first_leg_when_kalshi_no_filled_then_poly_fails():
         res("kalshi", Side.NO, OrderStatus.FILLED, 5, 0.55),
         res("kalshi", Side.NO, OrderStatus.FILLED, 5, 0.53, action="sell"),
     ])
-    poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.KILLED, 0, None)])
+    poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.KILLED, 0, None),
+                              res("poly", Side.YES, OrderStatus.KILLED, 0, None)])  # + recross
     ex, risk = make_exec([kalshi, poly])
     report = asyncio.run(ex.execute(opp(yv="poly", nv="kalshi", max_contracts=5)))
     assert report.status is ExecStatus.UNWOUND and not risk.is_killed
@@ -1774,3 +1799,36 @@ def test_size_ladder_remembers_and_converges_to_phantom_strike():
     _, _, streak, _ = ex._market_rel[("polymarket_us", m)]
     assert streak == 2                                              # -> cooldown engaged
     assert ex._reliability_cap("polymarket_us", m) == 0.0
+
+
+def test_recross_locks_at_breakeven_instead_of_unwinding():
+    # leg2 FOK fails but the book still offers the hedge within breakeven+eps ->
+    # re-take it: a ~$0 lock strictly dominates the unwind's guaranteed spread loss.
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = FakeVenue("poly", [
+        res("poly", Side.NO, OrderStatus.KILLED, 0, None),          # hedge FOK fails
+        res("poly", Side.NO, OrderStatus.FILLED, 2, 0.59),          # recross fills at 0.59
+    ])
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.SUCCESS                       # locked, NOT unwound
+    assert round(report.realized_pnl, 4) == round(2 * (1 - 0.40 - 0.59), 4)
+    assert not risk.is_killed
+    # the recross order was priced at the breakeven+eps ceiling (1-0.40+0.02)
+    assert abs(no.calls[1][3] - 0.62) < 1e-9
+
+
+def test_recross_skipped_when_ask_beyond_breakeven():
+    # The hedge book has moved past breakeven+eps -> recross would lock a real loss,
+    # so pay for the unwind instead (old behavior preserved).
+    from bot.models import MarketQuote
+    away = MarketQuote(venue="poly", market_id="P1", title="", no_ask=0.80, no_ask_size=100)
+    yes = FakeVenue("kalshi", [
+        res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40),
+        res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.38, action="sell"),
+    ])
+    no = QuotingVenue("poly", [res("poly", Side.NO, OrderStatus.KILLED, 0, None)], away)
+    ex, risk = make_exec([yes, no])
+    report = asyncio.run(ex.execute(opp()))
+    assert report.status is ExecStatus.UNWOUND
+    assert len(no.calls) == 1                        # no recross order was even attempted
