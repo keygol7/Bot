@@ -1741,3 +1741,36 @@ def test_probe_reject_excludes_with_cooldown_then_reprobes():
     ex._record_market_reliability("poly", "P1", True, fill_size=1.0)
     fills, fails, streak, _ = ex._market_rel[("poly", "P1")]
     assert streak == 0 and ("poly", "P1") not in ex._excluded_until
+
+
+def test_size_ladder_remembers_and_converges_to_phantom_strike():
+    # Without memory, the family base RESETS the ladder after each ceiling TTL and a
+    # persistent phantom loops 20 -> 10 -> (reset) -> 20 forever, never earning strikes
+    # (observed live on gh-alka: book showed 170, killed even 5). The ladder must halve
+    # from the REMEMBERED ceiling and convert to a phantom strike at probe size.
+    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])])
+    ex.probe_contracts, ex.market_max_fails = 1, 2
+    ex._family_rel[("polymarket_us", "aec-cs2")] = [50, 2, 40.0]   # healthy family, start 20
+
+    m = "aec-cs2-gh-alka-2026-07-02"
+    assert ex._reliability_cap("polymarket_us", m) == 20.0         # family start
+    ex._record_market_reliability("polymarket_us", m, False, attempted=20.0)
+    assert ex._reliability_cap("polymarket_us", m) == 10.0
+    ex._record_market_reliability("polymarket_us", m, False, attempted=10.0)
+    assert ex._reliability_cap("polymarket_us", m) == 5.0
+    # simulate the capping TTL expiring — the family base would reset the cap, but the
+    # ladder MEMORY must keep halving from the last ceiling on the next reject
+    c, exp = ex._size_ceiling[("polymarket_us", m)]
+    ex._size_ceiling[("polymarket_us", m)] = (c, exp - 3600 + 1800 + 10)  # expired, remembered
+    ex._record_market_reliability("polymarket_us", m, False, attempted=20.0)
+    assert ex._reliability_cap("polymarket_us", m) == 2.5          # min(20, 5)/2, not 10
+    ex._record_market_reliability("polymarket_us", m, False, attempted=2.5)
+    # 2.5/2 = 1.25 > probe -> one more rung
+    ex._record_market_reliability("polymarket_us", m, False, attempted=1.25)
+    # 1.25/2 <= probe -> converted to a PHANTOM STRIKE
+    _, _, streak, _ = ex._market_rel[("polymarket_us", m)]
+    assert streak == 1
+    ex._record_market_reliability("polymarket_us", m, False, attempted=1.0)
+    _, _, streak, _ = ex._market_rel[("polymarket_us", m)]
+    assert streak == 2                                              # -> cooldown engaged
+    assert ex._reliability_cap("polymarket_us", m) == 0.0

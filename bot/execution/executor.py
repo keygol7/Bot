@@ -402,13 +402,29 @@ class Executor:
                     log.warning("market reliability write failed for %s: %s", market_id, exc)
             return
         if attempted > self.probe_contracts + 1e-9:
-            # Not phantom evidence — the book just can't fill THIS size right now.
-            ceiling = max(float(self.probe_contracts), attempted / 2.0)
-            self._size_ceiling[key] = (ceiling, time.time() + self.size_ceiling_ttl)
-            log.info("reliability: %s:%s FOK reject at %g — size-capped to %g for %.0fs "
-                     "(not phantom evidence)", venue, market_id, attempted, ceiling,
-                     self.size_ceiling_ttl)
-            return
+            # Not phantom evidence by itself — the book couldn't fill THIS size right now.
+            # But the halving ladder must REMEMBER: without memory, the family base resets
+            # the size after each TTL and a persistent phantom loops 20 -> 10 -> (reset) ->
+            # 20 forever, never reaching probe size, never earning strikes. So a new reject
+            # halves from the REMEMBERED ceiling (kept ~30 min beyond its capping TTL), and
+            # once the ladder walks down TO probe size it converts into a phantom strike —
+            # phantoms converge to the cooldown; a FILL clears everything.
+            now = time.time()
+            prev_c, prev_exp = self._size_ceiling.get(key, (None, 0.0))
+            remembered = (prev_c is not None
+                          and now - (prev_exp - self.size_ceiling_ttl) < 1800.0)
+            ref = min(attempted, prev_c) if remembered else attempted
+            ceiling = ref / 2.0
+            if ceiling > self.probe_contracts + 1e-9:
+                self._size_ceiling[key] = (ceiling, now + self.size_ceiling_ttl)
+                log.info("reliability: %s:%s FOK reject at %g — size-capped to %g for %.0fs "
+                         "(not phantom evidence)", venue, market_id, attempted, ceiling,
+                         self.size_ceiling_ttl)
+                return
+            # Ladder exhausted: even near-probe sizes reject -> fall through and count it
+            # as a phantom strike (streak/cooldown below).
+            self._size_ceiling[key] = (float(self.probe_contracts),
+                                       now + self.size_ceiling_ttl)
         # Probe-size reject: real phantom evidence.
         streak += 1
         self._market_rel[key] = (fills, fails + 1, streak, max_fill)

@@ -315,7 +315,11 @@ def _parse_order_snapshot(order: Any, requested: float, side: Side):
     cum = order.get("cumQuantity")
     filled = float(cum) if cum not in (None, "") else 0.0
     avg_price = _amount(order.get("avgPx"))
-    if avg_price is not None and side is Side.NO:      # avgPx is YES-side; NO cost = 1 - it
+    if filled <= 1e-9:
+        # An unfilled order's avgPx is a meaningless 0 — leaving it set turns a KILLED
+        # NO order into a phantom "@1.0" price (1 - 0) in logs/accounting.
+        avg_price = None
+    elif avg_price is not None and side is Side.NO:    # avgPx is YES-side; NO cost = 1 - it
         avg_price = round(1.0 - avg_price, 6)
     if state == _STATE_FILLED or (requested > 0 and filled >= requested - 1e-9):
         status = OrderStatus.FILLED
