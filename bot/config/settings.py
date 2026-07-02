@@ -263,6 +263,15 @@ class Settings:
     # of FIFO. 0 balance = off (no scarcity gate).
     exec_scarcity_balance: float = 0.0
     exec_scarcity_min_edge: float = 0.02
+    # Edge-weighted capital budget: the per-contract edge at which a fire may use the FULL
+    # spendable balance; thinner edges get edge/this (floored below) — so the bankroll isn't
+    # FIFO-locked into small-pnl trades while thin edges still trade smaller. 0 = off.
+    exec_edge_full_budget: float = 0.0
+    exec_edge_budget_floor: float = 0.25
+    # Fresh-hedge fast path: skip the hedge REST re-read (the only network hop on the fire
+    # path, ~40ms) when the opp's WS quotes are younger than this AND the hedge leg's WS
+    # depth is >= 2x the trade size. 0 = always re-read.
+    exec_fresh_hedge_secs: float = 0.0
     # Venue auto-balancing: when a venue's cash dips below exec_rebalance_floor, skip arbs
     # whose leg on THAT venue is the expensive (> $0.50) side, so new spend shifts to the
     # funded venue and the scarce side's cash lasts until settlements replenish it. Same edge
@@ -426,6 +435,9 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_min_venue_balance=_env_float("EXEC_MIN_VENUE_BALANCE", 0.0),
         exec_scarcity_balance=_env_float("EXEC_SCARCITY_BALANCE", 0.0),
         exec_scarcity_min_edge=_env_float("EXEC_SCARCITY_MIN_EDGE", 0.02),
+        exec_edge_full_budget=_env_float("EXEC_EDGE_FULL_BUDGET", 0.0),
+        exec_edge_budget_floor=_env_float("EXEC_EDGE_BUDGET_FLOOR", 0.25),
+        exec_fresh_hedge_secs=_env_float("EXEC_FRESH_HEDGE_SECS", 0.0),
         exec_rebalance_floor=_env_float("EXEC_REBALANCE_FLOOR", 0.0),
         exec_probe_contracts=_env_float("EXEC_PROBE_CONTRACTS", 0.0),
         exec_market_proven_fills=int(_env_float("EXEC_MARKET_PROVEN_FILLS", 3)),

@@ -46,6 +46,8 @@ class ArbOpportunity:
     notional: float            # capital deployed = gross_cost * max_contracts
     yes_size: float = 0.0      # YES leg's own top-of-book depth (0 = unknown)
     no_size: float = 0.0       # NO leg's own top-of-book depth (0 = unknown)
+    fresh_ts: float = 0.0      # wall-clock ts of the OLDEST leg quote backing this opp
+                               # (both legs WS-fresh); 0 = unknown/stale -> re-read books
 
     @property
     def is_single_venue(self) -> bool:

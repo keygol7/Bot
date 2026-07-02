@@ -1611,3 +1611,85 @@ def test_risk_cap_skips():
     # A risk cap that leaves room for <1 contract is now caught at sizing, naming the
     # binding constraint (the per-market cap) rather than a generic risk rejection.
     assert report.status is ExecStatus.SKIPPED and "per_market" in report.reason
+
+
+def test_family_reliability_lends_starting_size_to_new_markets():
+    # Markets are ephemeral: per-market learning never transfers, so 67% of live fires
+    # were stuck at the 1-contract probe. A family with a healthy fill history lends its
+    # NEW markets a real starting size (half its largest demonstrated fill).
+    from bot.execution.executor import _family
+    assert _family("kalshi", "KXVALORANTGAME-26JUL020400DKGENA-GENA") == ("kalshi", "KXVALORANTGAME")
+    assert _family("polymarket_us", "aec-valorant-gena-dk-2026-07-02") == ("polymarket_us", "aec-valorant")
+
+    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])])
+    ex.probe_contracts, ex.market_proven_fills, ex.market_max_fails = 1, 3, 2
+    # no family history -> probe
+    assert ex._reliability_cap("kalshi", "KXVALORANTGAME-NEW1-X") == 1.0
+    # healthy family history (20 fills, 2 fails, max_fill 30) -> new market starts at 15
+    ex._family_rel[("kalshi", "KXVALORANTGAME")] = [20, 2, 30.0]
+    assert ex._reliability_cap("kalshi", "KXVALORANTGAME-NEW1-X") == 15.0
+    # UNHEALTHY family (40% failure rate) -> back to probe
+    ex._family_rel[("kalshi", "KXVALORANTGAME")] = [12, 8, 30.0]
+    assert ex._reliability_cap("kalshi", "KXVALORANTGAME-NEW1-X") == 1.0
+    # a market's OWN fail streak still excludes it regardless of family
+    ex._family_rel[("kalshi", "KXVALORANTGAME")] = [20, 2, 30.0]
+    ex._market_rel[("kalshi", "KXVALORANTGAME-NEW1-X")] = (0, 2, 2, 0.0)
+    assert ex._reliability_cap("kalshi", "KXVALORANTGAME-NEW1-X") == 0.0
+
+
+def test_edge_weighted_capital_budget():
+    # A thin 1c edge may take at most edge/full_budget of spendable cash; a 3c edge
+    # takes it all. Bankroll stops FIFO-locking into small-pnl trades.
+    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])],
+                      max_order_contracts=0)
+    ex.edge_full_budget, ex.edge_budget_floor = 0.03, 0.25
+    ex.balance_buffer = 1.0
+    ex._balances = {"kalshi": 90.0, "poly": 300.0}
+    # 1c edge, gross ~0.99: budget = 90 * (0.01/0.03) / 0.99 ≈ 30 contracts
+    _, caps = ex._max_size(opp(max_contracts=1000, yes_price=0.44, no_price=0.55))
+    assert abs(caps["edge_budget"] - 90 * (1/3) / 0.99) < 1.0
+    # 3c edge: full budget ≈ 90/0.97
+    _, caps = ex._max_size(opp(max_contracts=1000, yes_price=0.44, no_price=0.53))
+    assert abs(caps["edge_budget"] - 90 / 0.97) < 1.0
+    # sub-floor edge still gets the 25% floor, not zero
+    _, caps = ex._max_size(opp(max_contracts=1000, yes_price=0.45, no_price=0.548))
+    assert caps["edge_budget"] >= 90 * 0.25 / 0.998 - 1.0
+
+
+def test_fresh_hedge_fast_path_skips_rest_reread():
+    # With fresh WS quotes and a hedge leg showing >=2x the trade size, the executor must
+    # NOT re-read the hedge book (the only network hop on the fire path); stale or thin
+    # quotes keep the confirm.
+    import time as _time
+    from dataclasses import replace as _replace
+
+    class CountingVenue(FakeVenue):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.book_reads = 0
+
+        async def fetch_quote(self, market):
+            self.book_reads += 1
+            return await super().fetch_quote(market)
+
+    def build(fresh, hedge_size):
+        yes = CountingVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+        no = CountingVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
+        ex, _ = make_exec([yes, no])
+        ex.fresh_hedge_secs = 1.0
+        o = opp()
+        o = _replace(o, fresh_ts=_time.time() if fresh else 0.0,
+                     yes_size=100.0, no_size=hedge_size)
+        return ex, no, o
+
+    ex, no, o = build(fresh=True, hedge_size=100.0)      # fresh + deep -> skip re-read
+    assert asyncio.run(ex.execute(o)).status is ExecStatus.SUCCESS
+    assert no.book_reads == 0
+
+    ex, no, o = build(fresh=False, hedge_size=100.0)     # stale -> re-read
+    assert asyncio.run(ex.execute(o)).status is ExecStatus.SUCCESS
+    assert no.book_reads == 1
+
+    ex, no, o = build(fresh=True, hedge_size=3.0)        # fresh but thin -> re-read
+    asyncio.run(ex.execute(o))
+    assert no.book_reads == 1

@@ -40,6 +40,19 @@ from bot.venues.base import RawMarket
 log = logging.getLogger("bot.executor")
 
 
+def _family(venue: str, market_id: str) -> tuple[str, str]:
+    """Reliability FAMILY of a market — the venue-side grouping whose fill behavior is
+    correlated: Kalshi's series token (``KXVALORANTGAME``), Polymarket's slug family
+    (``aec-valorant``). Individual markets are ephemeral; families persist, so fill
+    evidence aggregated here transfers to each new market in the family."""
+    if not market_id:
+        return (venue, "")
+    if market_id[:2].isupper():                       # Kalshi ticker
+        return (venue, market_id.split("-", 1)[0])
+    parts = market_id.split("-")                      # Poly slug: first two segments
+    return (venue, "-".join(parts[:2]))
+
+
 def _reject_reason(result) -> str:
     """Human-readable why-it-failed from an OrderResult's raw payload (HTTP status +
     venue error body), so a rejection isn't an opaque [REJECTED] in the log."""
@@ -112,6 +125,9 @@ class Executor:
         scarcity_balance: float = 0.0,
         scarcity_min_edge: float = 0.02,
         rebalance_floor: float = 0.0,
+        edge_full_budget: float = 0.0,
+        edge_budget_floor: float = 0.25,
+        fresh_hedge_secs: float = 0.0,
         min_lock_edge: float | None = None,
         leg2_slippage_share: float = 0.6,
         min_leg_depth: float = 0.0,
@@ -179,8 +195,29 @@ class Executor:
         # Venue auto-balancing (see _rebalance_skip): below this floor, stop firing the arbs
         # that drain a venue fastest so it self-levels instead of one-way draining to idle.
         self.rebalance_floor = rebalance_floor
+        # Edge-weighted capital budget (see _max_size): the edge (per contract) at which a
+        # fire may use the FULL spendable balance; thinner edges get a proportional share
+        # (floored at edge_budget_floor) so small-pnl trades can't FIFO-lock the bankroll.
+        self.edge_full_budget = edge_full_budget
+        self.edge_budget_floor = edge_budget_floor
+        # Fresh-hedge fast path: skip the hedge REST re-read when the opp's backing quotes
+        # are younger than this AND the hedge leg's WS depth is >= 2x the trade size (the
+        # only network round-trip on the fire path, ~40ms). 0 = always re-read.
+        self.fresh_hedge_secs = fresh_hedge_secs
         self._market_rel: dict[tuple, tuple] = (
             self.store.market_reliability() if self.store is not None else {})
+        # FAMILY-level reliability (aggregated from the per-market table): markets are
+        # ephemeral (a game market lives hours and sees a handful of edges), so per-market
+        # learning never transfers — 67% of live fires were stuck at the 1-contract probe
+        # while every other cap allowed 40+. A family (KXVALORANTGAME, aec-cs2, ...) with a
+        # long fill history lends its NEW markets a real starting size; per-market streak
+        # exclusion still bounds any individual phantom book.
+        self._family_rel: dict[tuple, list] = {}    # (venue, family) -> [fills, fails, max_fill]
+        for (venue, market_id), (fills, fails, _streak, max_fill) in self._market_rel.items():
+            fam = self._family_rel.setdefault(_family(venue, market_id), [0, 0, 0.0])
+            fam[0] += fills
+            fam[1] += fails
+            fam[2] = max(fam[2], max_fill)
         self._balances: dict[str, float] = {}
         # Net position per (venue, market_id), signed (+ = net long YES). Seeded from the
         # startup snapshot, refreshed by the 30s balance poll, and updated on each settled
@@ -335,6 +372,11 @@ class Executor:
         self._market_rel[key] = (fills + (1 if ok else 0), fails + (0 if ok else 1),
                                  0 if ok else streak + 1,
                                  max(max_fill, fill_size) if ok else max_fill)
+        fam = self._family_rel.setdefault(_family(venue, market_id), [0, 0, 0.0])
+        fam[0] += 1 if ok else 0
+        fam[1] += 0 if ok else 1
+        if ok:
+            fam[2] = max(fam[2], fill_size)
         if self.store is not None:
             try:
                 self.store.record_market_outcome(venue, market_id, ok, fill_size)
@@ -467,6 +509,17 @@ class Executor:
                 self._reliability_cap(opp.buy_no_venue, opp.buy_no_market),
             )
 
+        # EDGE-WEIGHTED CAPITAL BUDGET: weight each fire's cash share by edge quality so
+        # the bankroll isn't FIFO-locked into small-pnl trades — a thin edge may take at
+        # most a fraction of spendable cash (still trades, just smaller); a fat edge takes
+        # it all. Pure arithmetic (no latency). 0 disables.
+        if self.edge_full_budget > 0 and gross > 0:
+            frac = min(1.0, max(self.edge_budget_floor,
+                                opp.edge_per_contract / self.edge_full_budget))
+            spendable = min((b for b in (yb, nb) if b is not None), default=None)
+            if spendable is not None:
+                caps["edge_budget"] = (spendable * self.balance_buffer * frac) / gross
+
         return math.floor(max(0.0, min(caps.values()))), caps
 
     def _reliability_cap(self, venue: str, market_id: str) -> float:
@@ -484,6 +537,17 @@ class Executor:
         if fills < self.market_proven_fills:
             if fails >= self.market_max_fails:
                 return 0.0
+            # FAMILY INHERITANCE: markets are ephemeral (hours), so per-market learning
+            # never transfers and 67% of fires were stuck at the probe. A family with a
+            # long, healthy fill history (>= 10 fills, <= 30% failure rate) lends its new
+            # markets a real starting size — half its largest demonstrated fill. A failed
+            # FOK is a $0 clean reject (leg ordering puts the reject-prone leg first), and
+            # this market's OWN streak still excludes it after market_max_fails misses.
+            ffills, ffails, fmax = self._family_rel.get(
+                _family(venue, market_id), (0, 0, 0.0))
+            attempts = ffills + ffails
+            if ffills >= 10 and attempts > 0 and ffails / attempts <= 0.30:
+                return max(float(self.probe_contracts), fmax * 0.5)
             return float(self.probe_contracts)
         # Proven real -> scale on DEMONSTRATED depth: allow up to ramp_factor x the largest
         # size a FOK has actually filled here. A real deep market reaches full size in a few
@@ -630,7 +694,19 @@ class Executor:
         # remainder) or fire a FOK into vanished liquidity (the 500 trigger). Sizing to the
         # live fillable depth keeps the trade fully hedged at whatever the leg supports —
         # capturing a small real arb instead of skipping it. A fetch failure -> 0 (skip).
-        fillable = await self._hedge_fillable(second_venue, second, size)
+        #
+        # FRESH-HEDGE FAST PATH: this re-read is the ONLY network round-trip on the fire
+        # path (~40ms). When the opp is backed by WS quotes younger than fresh_hedge_secs
+        # AND the hedge leg's own WS depth is >= 2x the trade size (the deep-cushion margin
+        # squared), the live book already told us the hedge fills — skip the re-read and
+        # fire immediately. Thin or stale hedges keep the confirm.
+        hedge_ws_size = opp.no_size if second[2] is Side.NO else opp.yes_size
+        if (self.fresh_hedge_secs > 0 and opp.fresh_ts > 0
+                and time.time() - opp.fresh_ts <= self.fresh_hedge_secs
+                and hedge_ws_size * self.hedge_depth_fraction >= 2 * size):
+            fillable = float(size)
+        else:
+            fillable = await self._hedge_fillable(second_venue, second, size)
         if fillable < size - 1e-9:
             capped = int(fillable + 1e-9)
             if capped < 1:
