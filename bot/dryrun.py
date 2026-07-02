@@ -840,6 +840,7 @@ async def stream(
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
             combine_verdicts=settings.match_combine_verdicts,
+            use_canon=settings.match_use_canon,
         )
         return await build_watchlist(cached, res.scanned, venues, store=store,
                                      min_poly_depth=settings.stream_min_poly_depth)
@@ -988,11 +989,61 @@ async def stream(
             except Exception as exc:
                 log.warning("rules verify pass failed: %s", exc)
 
+    async def canon_extract_loop():
+        # Canonicalize-then-join (bot/matching/canon.py): ONE cached LLM extraction per
+        # market from its resolution rules; matching then happens as a deterministic join
+        # in confirmed_pairs (use_canon). A few extractions per pass, recent markets
+        # first, LLM in a thread — the cache builds over hours and never re-pays.
+        from bot.matching.canon import extract_canon
+        kalshi_v = next((v for v in venues if v.name == "kalshi"), None)
+        poly_v = next((v for v in venues if v.name == "polymarket_us"), None)
+        if store is None or complete_fn is None or not settings.match_use_canon:
+            return
+        while True:
+            await asyncio.sleep(150)
+            try:
+                pool = store.conn.execute(
+                    "SELECT venue, market_id, title FROM markets "
+                    "ORDER BY updated_at DESC LIMIT 600").fetchall()
+                budget = 8
+                done = 0
+                for r in pool:
+                    if budget <= 0:
+                        break
+                    venue, mid, title = r["venue"], r["market_id"], r["title"]
+                    if store.canon_checked(venue, mid):
+                        continue
+                    if venue == "kalshi" and kalshi_v is not None:
+                        rules = await kalshi_v.market_rules(mid)
+                    elif venue == "polymarket_us" and poly_v is not None:
+                        rules = await poly_v.market_rules(mid)
+                    else:
+                        continue
+                    if not rules:
+                        continue                      # poly desc arrives with a scan
+                    c = await asyncio.to_thread(
+                        extract_canon, complete_fn,
+                        venue=venue, market_id=mid, title=title or "", rules=rules)
+                    budget -= 1
+                    if c is not None:
+                        store.record_canon(c)
+                        done += 1
+                if done:
+                    total = store.conn.execute(
+                        "SELECT COUNT(*) c FROM market_canon").fetchone()["c"]
+                    log.info("canon: extracted %d contract(s) this pass (%d total cached)",
+                             done, total)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("canon extraction pass failed: %s", exc)
+
     private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
     private_tasks += [asyncio.create_task(feed_lifecycle(v)) for v in venues]
     private_tasks.append(asyncio.create_task(poll_balances()))
     private_tasks.append(asyncio.create_task(settlement_truth_loop()))
     private_tasks.append(asyncio.create_task(rules_verify_loop()))
+    private_tasks.append(asyncio.create_task(canon_extract_loop()))
     log.warning("matching mode: %s metrics=%s (MATCH_USE_FINGERPRINT/MATCH_COMBINE_VERDICTS)",
                 ("fingerprint+LLM verdicts UNION"
                  if settings.match_use_fingerprint and settings.match_combine_verdicts

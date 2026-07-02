@@ -1,0 +1,100 @@
+"""Canonicalize-then-join: extraction fails closed, the join is exact on settlement."""
+
+import json
+
+from bot.data.store import Store
+from bot.matching.canon import Canon, complementary, extract_canon
+
+
+def mk(venue="kalshi", mid="K1", event_type="match", entities=("dplus", "gen.g global academy"),
+       subject="gen.g global academy", metric="winner", comparator=None, value=None,
+       period="full", date="2026-07-02", confidence=0.9):
+    return Canon(venue=venue, market_id=mid, event_type=event_type,
+                 entities=tuple(entities), subject=subject, metric=metric,
+                 comparator=comparator, value=value, period=period, date=date,
+                 confidence=confidence)
+
+
+def test_extract_canon_parses_and_fails_closed():
+    def llm(prompt):
+        assert "resolution rules" in prompt.lower()
+        return json.dumps({"event_type": "match", "entities": ["Dplus", "Gen.G Global Academy"],
+                           "subject": "Gen.G Global Academy", "metric": "winner",
+                           "comparator": None, "value": None, "period": "full",
+                           "date": "2026-07-02", "confidence": 0.92})
+    c = extract_canon(llm, venue="kalshi", market_id="K1", title="DK vs GENG - GENG",
+                      rules="If Gen.G Global Academy wins the Jul 2 match, resolves Yes.")
+    assert c is not None and c.subject == "gen.g global academy"
+    assert c.entities == ("dplus", "gen.g global academy")     # normalized + sorted
+    # anything unparseable -> None (fail closed)
+    assert extract_canon(lambda p: "garbage", venue="k", market_id="m",
+                         title="", rules="r") is None
+
+    def boom(p):
+        raise RuntimeError("down")
+    assert extract_canon(boom, venue="k", market_id="m", title="", rules="r") is None
+
+
+def test_join_matches_true_pair_with_name_variants():
+    a = mk(venue="kalshi", subject="gen.g global academy")
+    b = mk(venue="polymarket_us", mid="p1", entities=("dplus kia", "gen.g"),
+           subject="gen.g")                                    # shorter variant
+    assert complementary(a, b)                                 # token-subset subject aligns
+
+
+def test_join_rejects_every_settlement_divergence():
+    a = mk()
+    assert not complementary(a, mk(venue="p", value=2.5, comparator=">="))  # handicap line
+    assert not complementary(a, mk(venue="p", period="1h"))                 # half vs full
+    assert not complementary(a, mk(venue="p", metric="goals"))              # different metric
+    assert not complementary(a, mk(venue="p", date="2026-07-03"))           # different date
+    assert not complementary(a, mk(venue="p", subject="dplus"))             # YES pays other side
+    assert not complementary(a, mk(venue="p", entities=("liquid", "faze"),
+                                   subject="gen.g global academy"))         # different event
+    assert not complementary(a, mk(venue="p", confidence=0.4))              # low confidence
+    assert not complementary(a, mk(venue="p", subject=None))                # draw/range YES
+
+
+def test_join_is_domain_agnostic():
+    # An election canonicalizes and joins exactly like a match — no sports vocabulary.
+    a = mk(event_type="election", entities=("smith", "jones"), subject="smith",
+           metric="winner", date="2026-11-03")
+    b = mk(venue="polymarket_us", mid="p-el", event_type="election",
+           entities=("john smith", "mary jones"), subject="john smith",
+           metric="winner", date="2026-11-03")
+    assert complementary(a, b)
+    # a BTC threshold market joins only on the same comparator+value
+    c1 = mk(event_type="price_threshold", entities=("btc",), subject="btc",
+            metric="price_close", comparator=">=", value=100000.0, date="2026-12-31")
+    c2 = mk(venue="polymarket_us", mid="p-btc", event_type="price_threshold",
+            entities=("bitcoin btc",), subject="bitcoin btc", metric="price_close",
+            comparator=">=", value=100000.0, date="2026-12-31")
+    assert complementary(c1, c2)
+    assert not complementary(c1, mk(venue="p", event_type="price_threshold",
+                                    entities=("btc",), subject="btc", metric="price_close",
+                                    comparator=">=", value=120000.0, date="2026-12-31"))
+
+
+def test_store_canon_roundtrip_and_join():
+    s = Store(":memory:")
+    s.record_canon(mk(venue="kalshi", mid="K1"))
+    s.record_canon(mk(venue="polymarket_us", mid="p1", entities=("dplus", "gen.g"),
+                      subject="gen.g"))
+    s.record_canon(mk(venue="polymarket_us", mid="p-spread", entities=("dplus", "gen.g"),
+                      subject="gen.g", comparator=">=", value=1.5))    # a line market
+    assert s.canon_checked("kalshi", "K1")
+    pairs = s.canon_pairs()
+    assert len(pairs) == 1                                     # spread did NOT join
+    assert pairs[0][:4] == ("kalshi", "K1", "polymarket_us", "p1")
+
+
+def test_confirmed_pairs_union_includes_canon():
+    s = Store(":memory:")
+    s.record_canon(mk(venue="kalshi", mid="K1"))
+    s.record_canon(mk(venue="polymarket_us", mid="p1"))
+    got = s.confirmed_pairs(use_fingerprint=True, combine_verdicts=True, use_canon=True)
+    assert ("kalshi", "K1", "polymarket_us", "p1") in {p[:4] for p in got}
+    # and canon respects the blacklist backstop
+    s.blacklist_pair("kalshi", "K1", "polymarket_us", "p1", reason="test")
+    got = s.confirmed_pairs(use_fingerprint=True, combine_verdicts=True, use_canon=True)
+    assert ("kalshi", "K1", "polymarket_us", "p1") not in {p[:4] for p in got}

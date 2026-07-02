@@ -165,6 +165,11 @@ class Settings:
     # markets (FEWER embeds than the 5000 baseline) while covering ~3.4x the per-game lines
     # AND every currently-confirmed pair. Empty = disabled. Applied to KALSHI only.
     kalshi_scan_patterns: tuple[str, ...] = ()
+    # Canonicalize-then-join matching (see bot/matching/canon.py): per-market cached LLM
+    # extraction of the canonical contract from its RESOLUTION RULES, matched by a
+    # deterministic join — the domain-agnostic third member of the watchlist union.
+    # Only takes effect as extractions accumulate (the canon loop budgets a few per pass).
+    match_use_canon: bool = True
     # Max markets to pull per venue per scan (TOTAL across paginated pages). 0 = scan the
     # ENTIRE board (every available market), not just a page. Used by the streaming loop;
     # the matched/tradeable set is still bounded by Polymarket's small universe, so this
@@ -381,6 +386,9 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         ).lower() == "true",
         match_combine_verdicts=(
             env("MATCH_COMBINE_VERDICTS", "false") or "false"
+        ).lower() == "true",
+        match_use_canon=(
+            env("MATCH_USE_CANON", "true") or "true"
         ).lower() == "true",
         # Keep ONLY recognized metric names — so a malformed value (e.g. an inline
         # comment captured as the value, or a stray token) degrades to "all matchable"

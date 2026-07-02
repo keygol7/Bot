@@ -179,6 +179,26 @@ CREATE TABLE IF NOT EXISTS settlement_checks (
     PRIMARY KEY (venue_a, market_a, venue_b, market_b)
 );
 
+-- Canonical contracts (canonicalize-then-join matching): ONE cached LLM extraction per
+-- market (from its resolution rules), matched by deterministic join on the fields that
+-- decide settlement. O(N) LLM work instead of O(N^2) pairwise confirms; domain-agnostic.
+CREATE TABLE IF NOT EXISTS market_canon (
+    venue       TEXT NOT NULL,
+    market_id   TEXT NOT NULL,
+    event_type  TEXT,
+    entities    TEXT,              -- JSON array, lowercase canonical names
+    subject     TEXT,              -- the ONE entity YES pays for (null: draw/range)
+    metric      TEXT,
+    comparator  TEXT,
+    value       REAL,
+    period      TEXT,
+    date        TEXT,              -- YYYY-MM-DD event date
+    confidence  REAL,
+    ts          REAL NOT NULL,
+    PRIMARY KEY (venue, market_id)
+);
+CREATE INDEX IF NOT EXISTS idx_canon_join ON market_canon (event_type, metric, date);
+
 -- Rules-text verification: LLM comparison of the two markets' RESOLUTION RULES (the
 -- contract, not the title). identical=1 pairs are definitionally the same bet -> the
 -- streaming engine may fire fat edges on them with no price history.
@@ -437,6 +457,60 @@ class Store:
         ).fetchone()
         return (row["c"] or 0, row["d"] or 0)
 
+    # ---- canonical contracts (canonicalize-then-join) ----
+
+    def record_canon(self, c) -> None:
+        """Persist one Canon extraction (cached forever — contracts don't change)."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO market_canon (venue, market_id, event_type, entities,"
+            " subject, metric, comparator, value, period, date, confidence, ts)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (c.venue, c.market_id, c.event_type, json.dumps(list(c.entities)),
+             c.subject, c.metric, c.comparator, c.value, c.period, c.date,
+             c.confidence, time.time()))
+        self.conn.commit()
+
+    def canon_checked(self, venue: str, market_id: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM market_canon WHERE venue=? AND market_id=?",
+            (venue, market_id)).fetchone() is not None
+
+    def canon_pairs(self, *, min_confidence: float = 0.7,
+                    max_past_s: Optional[float] = None) -> list[tuple]:
+        """Cross-venue complements from the canonical-contract join. SQL blocks by the
+        exact join fields (event_type, metric, date) so the Python complement check runs
+        on tiny buckets, not N^2. Pre-fan-out (the caller's shared backstop applies)."""
+        from bot.matching.canon import Canon, complementary
+        cutoff_date = None
+        if max_past_s is not None:
+            cutoff_date = time.strftime(
+                "%Y-%m-%d", time.gmtime(time.time() - max_past_s))
+        buckets: dict[tuple, dict[str, list]] = {}
+        for r in self.conn.execute(
+                "SELECT venue, market_id, event_type, entities, subject, metric,"
+                " comparator, value, period, date, confidence FROM market_canon"
+                " WHERE confidence >= ?", (min_confidence,)):
+            if cutoff_date and r["date"] and r["date"] < cutoff_date:
+                continue                             # long-settled event
+            c = Canon(venue=r["venue"], market_id=r["market_id"],
+                      event_type=r["event_type"] or "other",
+                      entities=tuple(json.loads(r["entities"] or "[]")),
+                      subject=r["subject"], metric=r["metric"] or "other",
+                      comparator=r["comparator"], value=r["value"],
+                      period=r["period"] or "full", date=r["date"],
+                      confidence=r["confidence"] or 0.0)
+            b = buckets.setdefault((c.event_type, c.metric, c.date), {})
+            b.setdefault(c.venue, []).append(c)
+        pairs = []
+        for b in buckets.values():
+            for ka in b.get("kalshi", []):
+                for pb in b.get("polymarket_us", []):
+                    if complementary(ka, pb, min_confidence=min_confidence):
+                        pairs.append(("kalshi", ka.market_id,
+                                      "polymarket_us", pb.market_id,
+                                      f"kalshi:{ka.market_id}|polymarket_us:{pb.market_id}"))
+        return pairs
+
     # ---- rules-text verification ----
 
     def record_rules_verdict(self, va: str, ma: str, vb: str, mb: str, *,
@@ -528,6 +602,7 @@ class Store:
         drop_scope_mismatch: bool = True, safe_types_only: bool = True,
         use_fingerprint: bool = False, fingerprint_metrics: Optional[frozenset] = None,
         sweep_max_past_s: Optional[float] = None, combine_verdicts: bool = False,
+        use_canon: bool = False,
     ) -> list[tuple]:
         """Cached tradeable pairs: (venue_a, market_a, venue_b, market_b, event_key).
 
@@ -580,8 +655,14 @@ class Store:
         # runs once over the combined set (a market the two map to different counterparties
         # is ambiguous and both pairs drop). Dedup keeps the first occurrence per pair key.
         fp = self._fingerprint_sweep(fingerprint_metrics, None, sweep_max_past_s)
+        # Canonical-contract join (canonicalize-then-join): a THIRD member of the union.
+        # Domain-agnostic (elections/econ/crypto join the same as matches) and immune to
+        # the shortlist's recall ceiling — any two markets whose cached extractions agree
+        # on every settlement-deciding field become tradeable. Same shared fan-out +
+        # blacklist backstops apply. Canon legs are kalshi-first like the sweep's.
+        cp = self.canon_pairs(max_past_s=sweep_max_past_s) if use_canon else []
         merged: dict = {}
-        for p in (*fp, *verdict):
+        for p in (*fp, *verdict, *cp):
             merged.setdefault(self._pair_key(p[0], p[1], p[2], p[3]), p)
         pairs = list(merged.values())
         if max_fanout is not None:
