@@ -316,6 +316,10 @@ class KalshiVenue:
         self._private_key = None
         self._base_path = urlsplit(cfg.api_base).path.rstrip("/")  # e.g. /trade-api/v2
         self._limiter = AsyncRateLimiter(getattr(cfg, "read_rate_per_min", None) or rate_per_min)
+        # ORDERS must never queue behind scan/depth READ tokens: a hedge leg waiting on
+        # the read bucket right after leg 1 fills is a widened naked window. Writes get
+        # their own generous bucket (venue-side write limits are far above this).
+        self._order_limiter = AsyncRateLimiter(240.0, burst=20)
 
     @property
     def authenticated(self) -> bool:
@@ -636,7 +640,7 @@ class KalshiVenue:
             body["expiration_ts"] = int(expiration_ts)
 
         endpoint = "/portfolio/events/orders"
-        await self._limiter.wait()
+        await self._order_limiter.wait()
         try:
             resp = await self._http().post(
                 endpoint, json=body, headers=self._auth_headers("POST", endpoint),
@@ -677,7 +681,7 @@ class KalshiVenue:
         # cancel-on-timeout/drift. The V2 path mirrors the create endpoint family
         # (POST /portfolio/events/orders); only the self-expiry was still cancelling makers.
         path = f"/portfolio/events/orders/{order_id}"
-        await self._limiter.wait()
+        await self._order_limiter.wait()
         resp = await self._http().request(
             "DELETE", path, headers=self._auth_headers("DELETE", path)
         )
@@ -732,8 +736,9 @@ class KalshiVenue:
     async def order_detail(self, order_id: str) -> dict:
         """Raw order record from GET /portfolio/orders/{id}: created_time, expiration_time,
         status, last_update_time — for tracing whether a maker actually expired or rested
-        until a late (naked) fill. Read-only."""
-        await self._limiter.wait()
+        until a late (naked) fill. Read-only but on the TRADE path (post-order fill
+        reconciliation), so it uses the order limiter — never queued behind scans."""
+        await self._order_limiter.wait()
         path = f"/portfolio/orders/{order_id}"
         resp = await self._http().get(path, headers=self._auth_headers("GET", path))
         resp.raise_for_status()

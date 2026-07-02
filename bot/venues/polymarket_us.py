@@ -486,6 +486,9 @@ class PolymarketUSVenue:
         self._api_client = None      # authenticated trading (later)
         self._key = None
         self._limiter = AsyncRateLimiter(getattr(cfg, "read_rate_per_min", None) or rate_per_min)
+        # ORDERS must never queue behind scan/depth READ tokens (a hedge leg waiting on
+        # read tokens right after leg 1 fills = a widened naked window). Own bucket.
+        self._order_limiter = AsyncRateLimiter(240.0, burst=20)
         # Per-slug order constraints (orderPriceMinTickSize / minimumTradeQty) captured
         # during scan_quotes, so place_order can round price/qty to valid increments
         # without a hot-path fetch. The docs warn NOT to infer these from slug/type.
@@ -922,7 +925,7 @@ class PolymarketUSVenue:
             # bare "5", NOT a duration like "5s". Keep it under the 10s HTTP client timeout.
             body["synchronousExecution"] = True
             body["maxBlockTime"] = "5"
-        await self._limiter.wait()
+        await self._order_limiter.wait()
         try:
             resp = await self._api().post(
                 "/v1/orders", json=body, headers=self._auth_headers("POST", "/v1/orders")
@@ -992,7 +995,7 @@ class PolymarketUSVenue:
         """GET /v1/order/{id} -> OrderResult, or None if it couldn't be read. The
         authoritative terminal state for an order we already have an id for."""
         path = f"/v1/order/{order_id}"
-        await self._limiter.wait()
+        await self._order_limiter.wait()
         try:
             resp = await self._api().get(path, headers=self._auth_headers("GET", path))
             resp.raise_for_status()
@@ -1019,7 +1022,7 @@ class PolymarketUSVenue:
         if not getattr(self.cfg, "is_trading_configured", False):
             raise OrderNotPermitted("Polymarket US trading credentials not configured")
         path = f"/v1/order/{order_id}/cancel"
-        await self._limiter.wait()
+        await self._order_limiter.wait()
         resp = await self._api().post(path, headers=self._auth_headers("POST", path))
         resp.raise_for_status()
         return resp.json()
