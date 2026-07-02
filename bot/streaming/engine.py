@@ -175,6 +175,10 @@ class StreamingEngine:
         self.prime_concurrency = prime_concurrency
         self._maker_inflight: set = set()
         self._take_inflight: set = set()        # pairs with a spawned hybrid TAKE running
+        # Pair keys with the STRONGEST match evidence (rules-verified identical, or
+        # settlement-verified consistent) — allowed to fire FAT edges with no price
+        # history. Fed by the slow loop from Store.verified_pair_keys().
+        self.verified_pairs: set = set()
         # Async callable depth_fetch(venue, market_id) -> sized MarketQuote | None.
         # WS ticker feeds carry no size (Kalshi), so before firing on a price edge we
         # re-fetch real order-book depth (which also re-validates the price).
@@ -427,31 +431,38 @@ class StreamingEngine:
         # blacklists persistent non-complements). With the empirical gate DISABLED there is
         # no evidence to escalate to, so the conservative hard skip is kept.
         if self.max_plausible_edge > 0 and edge > self.max_plausible_edge:
-            if self.empirical_min_obs <= 0:
+            if key in self.verified_pairs:
+                # Definitional truth outranks price statistics: the pair's RESOLUTION
+                # RULES were verified identical (or it has settled consistently before),
+                # so a fat edge is a genuine dislocation — fire with no history needed.
+                log.warning("STREAM %s: FAT edge %+.3f on a RULES/SETTLEMENT-verified "
+                            "pair — firing without price history", p.event_key, edge)
+            elif self.empirical_min_obs <= 0:
                 log.warning("STREAM %s: edge %+.3f > %.3f and no empirical gate to verify "
                             "complementarity — skipping (likely FALSE MATCH)",
                             p.event_key, edge, self.max_plausible_edge)
                 self._observe(p, edge, yq, nq, size, "implausible_edge_false_match")
                 self._backoff_until[key] = self.clock() + self._backoff_cap
                 return None
-            obs = self._sum_obs.get(key)
-            n = len(obs) if obs else 0
-            need_n = max(3 * self.empirical_min_obs, 30)
-            need_mean = max(self.empirical_sum_floor, 0.97)
-            mean_sum = (sum(obs) / n) if n else 0.0
-            if n < need_n or mean_sum < need_mean:
-                if n in (1, need_n // 2):            # occasional heartbeat, not tick spam
-                    log.info("STREAM %s: fat edge %+.3f needs stronger proof — %d/%d samples,"
-                             " mean sum %.3f (need >= %.3f); observing",
-                             p.event_key, edge, n, need_n, mean_sum, need_mean)
-                self._observe(p, edge, yq, nq, size, "fat_edge_unproven")
-                # Evidence-based blacklisting still applies: a pair whose sum history sits
-                # far from $1 over enough samples is a false match, parked permanently.
-                self._maybe_blacklist(p, key, f"implausible edge {edge:+.3f}")
-                return None
-            log.warning("STREAM %s: FAT edge %+.3f on a PROVEN complement (mean sum %.3f "
-                        "over %d samples) — genuine dislocation, firing", p.event_key,
-                        edge, mean_sum, n)
+            else:
+                obs = self._sum_obs.get(key)
+                n = len(obs) if obs else 0
+                need_n = max(3 * self.empirical_min_obs, 30)
+                need_mean = max(self.empirical_sum_floor, 0.97)
+                mean_sum = (sum(obs) / n) if n else 0.0
+                if n < need_n or mean_sum < need_mean:
+                    if n in (1, need_n // 2):        # occasional heartbeat, not tick spam
+                        log.info("STREAM %s: fat edge %+.3f needs stronger proof — %d/%d "
+                                 "samples, mean sum %.3f (need >= %.3f); observing",
+                                 p.event_key, edge, n, need_n, mean_sum, need_mean)
+                    self._observe(p, edge, yq, nq, size, "fat_edge_unproven")
+                    # Evidence-based blacklisting still applies: a pair whose sum history
+                    # sits far from $1 over enough samples is a false match, parked.
+                    self._maybe_blacklist(p, key, f"implausible edge {edge:+.3f}")
+                    return None
+                log.warning("STREAM %s: FAT edge %+.3f on a PROVEN complement (mean sum "
+                            "%.3f over %d samples) — genuine dislocation, firing",
+                            p.event_key, edge, mean_sum, n)
         # EMPIRICAL same-event gate: only TRADE a pair once its observed YES+NO sum confirms
         # the legs are complements. Insufficient history -> OBSERVE, don't trade yet (a new
         # real pair confirms within minutes as ticks accrue). Mean sum below the floor -> a
@@ -460,19 +471,29 @@ class StreamingEngine:
         if self.empirical_min_obs > 0:
             obs = self._sum_obs.get(key)
             n = len(obs) if obs else 0
-            if n < self.empirical_min_obs:
+            if n < self.empirical_min_obs and key not in self.verified_pairs:
+                # A rules/settlement-VERIFIED pair skips the observation wait entirely
+                # (definitional truth needs no price history); everyone else observes.
                 if n == 1 or n == self.empirical_min_obs // 2:   # occasional heartbeat
                     log.info("STREAM %s: observing (%d/%d samples) before trading",
                              p.event_key, n, self.empirical_min_obs)
                 return None
-            mean_sum = sum(obs) / n
-            if mean_sum < self.empirical_sum_floor:
-                log.warning("STREAM %s: empirical reject — mean YES+NO sum %.3f < %.3f over "
-                            "%d samples (legs not complementary -> FALSE MATCH)",
-                            p.event_key, mean_sum, self.empirical_sum_floor, n)
+            mean_sum = (sum(obs) / n) if n else 1.0
+            if n >= self.empirical_min_obs and mean_sum < self.empirical_sum_floor:
+                # Defense in depth: an empirical NON-complement blocks even a verified
+                # pair (two truth signals disagreeing = investigate, never trade).
+                if key in self.verified_pairs:
+                    log.warning("STREAM %s: CONFLICT — pair is rules/settlement-verified "
+                                "but its price history says non-complement (mean %.3f); "
+                                "trusting the prices, not trading", p.event_key, mean_sum)
+                else:
+                    log.warning("STREAM %s: empirical reject — mean YES+NO sum %.3f < %.3f "
+                                "over %d samples (legs not complementary -> FALSE MATCH)",
+                                p.event_key, mean_sum, self.empirical_sum_floor, n)
+                    self._maybe_blacklist(p, key, f"mean sum {mean_sum:.3f} < "
+                                                  f"{self.empirical_sum_floor}")
                 self._observe(p, edge, yq, nq, size, "empirical_reject_false_match")
                 self._backoff_until[key] = self.clock() + self._backoff_cap
-                self._maybe_blacklist(p, key, f"mean sum {mean_sum:.3f} < {self.empirical_sum_floor}")
                 return None
         # SUB-100ms SYNC PATH: when BOTH legs just ticked within the tight sync window the
         # cross-feed is synchronized NOW, so this is a genuine edge — not a one-sided flicker.

@@ -779,6 +779,22 @@ class KalshiVenue:
         resp.raise_for_status()
         return resp.json().get("fills") or []
 
+    async def market_rules(self, ticker: str) -> str | None:
+        """The market's resolution rules text (``rules_primary`` + ``rules_secondary``)
+        from GET /markets/{ticker} — the contract itself, for rules-verification.
+        Read-only; None on any failure (the verifier just skips the pair this pass)."""
+        path = f"/markets/{ticker}"
+        await self._limiter.wait()
+        try:
+            resp = await self._http().get(path, headers=self._auth_headers("GET", path))
+            resp.raise_for_status()
+            m = resp.json().get("market") or {}
+        except Exception as exc:
+            log.warning("market_rules fetch failed for %s: %s", ticker, exc)
+            return None
+        text = " ".join(t for t in (m.get("rules_primary"), m.get("rules_secondary")) if t)
+        return text or None
+
     async def settlements(self, *, limit: int = 200) -> list[dict]:
         """Settled markets from /portfolio/settlements: each carries ticker, market_result,
         yes/no counts, revenue, and settled_time — where a closed position's actual payout

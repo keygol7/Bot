@@ -828,6 +828,12 @@ async def stream(
             kalshi_ticker_patterns=settings.kalshi_scan_patterns,
             match_cross_venue=discover,
         )
+        # Push the strongest-evidence pair set (rules-verified identical + settlement-
+        # verified consistent) to the fast path: these may fire fat edges history-free.
+        try:
+            engine.verified_pairs = store.verified_pair_keys()
+        except Exception as exc:
+            log.warning("verified-pairs refresh failed: %s", exc)
         await refresh_balances()
         cached = store.confirmed_pairs(
             use_fingerprint=settings.match_use_fingerprint,
@@ -934,10 +940,59 @@ async def stream(
             except Exception as exc:
                 log.warning("settlement truth pass failed: %s", exc)
 
+    async def rules_verify_loop():
+        # Rules-text verification (bot/matching/rules_match.py): compare the two markets'
+        # RESOLUTION RULES via the LLM for watchlist pairs that lack a verdict. A few per
+        # pass (LLM ~seconds each, run in a thread so the loop never blocks); verdicts
+        # cached forever. identical=1 pairs join engine.verified_pairs (history-free
+        # fat-edge firing). Off the trade path entirely.
+        from bot.matching.rules_match import confirm_rules
+        kalshi_v = next((v for v in venues if v.name == "kalshi"), None)
+        poly_v = next((v for v in venues if v.name == "polymarket_us"), None)
+        if kalshi_v is None or poly_v is None or store is None or complete_fn is None:
+            return
+        while True:
+            await asyncio.sleep(300)
+            try:
+                budget = 4
+                for p in list(engine._pairs.values()):
+                    if budget <= 0:
+                        break
+                    if store.rules_checked(p.venue_a, p.market_a, p.venue_b, p.market_b):
+                        continue
+                    ka = p.market_a if p.venue_a == "kalshi" else p.market_b
+                    pm = p.market_a if p.venue_a == "polymarket_us" else p.market_b
+                    rules_k = await kalshi_v.market_rules(ka)
+                    rules_p = await poly_v.market_rules(pm)
+                    if not rules_k or not rules_p:
+                        continue                      # poly desc arrives with the next scan
+                    row = store.conn.execute(
+                        "SELECT venue, market_id, title FROM markets WHERE market_id IN (?, ?)",
+                        (ka, pm)).fetchall()
+                    titles = {r["market_id"]: r["title"] for r in row}
+                    v = await asyncio.to_thread(
+                        confirm_rules, complete_fn,
+                        venue_a="kalshi", title_a=titles.get(ka, ka), rules_a=rules_k,
+                        venue_b="polymarket_us", title_b=titles.get(pm, pm), rules_b=rules_p)
+                    store.record_rules_verdict(
+                        "kalshi", ka, "polymarket_us", pm,
+                        identical=v.identical, confidence=v.confidence,
+                        rationale=v.rationale)
+                    budget -= 1
+                    log.info("rules verify: %s|%s -> %s (%.2f) %s", ka, pm,
+                             "IDENTICAL" if v.identical else "divergent",
+                             v.confidence, v.rationale[:120])
+                engine.verified_pairs = store.verified_pair_keys()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("rules verify pass failed: %s", exc)
+
     private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
     private_tasks += [asyncio.create_task(feed_lifecycle(v)) for v in venues]
     private_tasks.append(asyncio.create_task(poll_balances()))
     private_tasks.append(asyncio.create_task(settlement_truth_loop()))
+    private_tasks.append(asyncio.create_task(rules_verify_loop()))
     log.warning("matching mode: %s metrics=%s (MATCH_USE_FINGERPRINT/MATCH_COMBINE_VERDICTS)",
                 ("fingerprint+LLM verdicts UNION"
                  if settings.match_use_fingerprint and settings.match_combine_verdicts

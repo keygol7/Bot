@@ -179,6 +179,21 @@ CREATE TABLE IF NOT EXISTS settlement_checks (
     PRIMARY KEY (venue_a, market_a, venue_b, market_b)
 );
 
+-- Rules-text verification: LLM comparison of the two markets' RESOLUTION RULES (the
+-- contract, not the title). identical=1 pairs are definitionally the same bet -> the
+-- streaming engine may fire fat edges on them with no price history.
+CREATE TABLE IF NOT EXISTS rules_verdicts (
+    venue_a    TEXT NOT NULL,
+    market_a   TEXT NOT NULL,
+    venue_b    TEXT NOT NULL,
+    market_b   TEXT NOT NULL,
+    identical  INTEGER NOT NULL,
+    confidence REAL,
+    rationale  TEXT,
+    ts         REAL NOT NULL,
+    PRIMARY KEY (venue_a, market_a, venue_b, market_b)
+);
+
 -- Time/market indices: the settled-PnL reconciliation, reconcile pairing, and every
 -- "last N hours" query scan these tables, which grow without bound.
 CREATE INDEX IF NOT EXISTS idx_pnl_ts            ON pnl (ts);
@@ -421,6 +436,39 @@ class Store:
             "SELECT SUM(consistent) c, SUM(1 - consistent) d FROM settlement_checks"
         ).fetchone()
         return (row["c"] or 0, row["d"] or 0)
+
+    # ---- rules-text verification ----
+
+    def record_rules_verdict(self, va: str, ma: str, vb: str, mb: str, *,
+                             identical: bool, confidence: float, rationale: str) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO rules_verdicts "
+            "(venue_a, market_a, venue_b, market_b, identical, confidence, rationale, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (va, ma, vb, mb, 1 if identical else 0, confidence, rationale, time.time()))
+        self.conn.commit()
+
+    def rules_checked(self, va: str, ma: str, vb: str, mb: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM rules_verdicts WHERE venue_a=? AND market_a=? "
+            "AND venue_b=? AND market_b=?", (va, ma, vb, mb)).fetchone() is not None
+
+    def verified_pair_keys(self) -> set:
+        """Pair keys (ConfirmedPair.key format: sorted 2-tuples) with the STRONGEST
+        match evidence — rules-verified identical, or settlement-verified consistent.
+        The streaming engine lets these fire fat edges without price history."""
+        keys = set()
+        for r in self.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts "
+                "WHERE identical=1"):
+            keys.add(tuple(sorted([(r["venue_a"], r["market_a"]),
+                                   (r["venue_b"], r["market_b"])])))
+        for r in self.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM settlement_checks "
+                "WHERE consistent=1"):
+            keys.add(tuple(sorted([(r["venue_a"], r["market_a"]),
+                                   (r["venue_b"], r["market_b"])])))
+        return keys
 
     # ---- embedding cache (see schema comment) ----
 

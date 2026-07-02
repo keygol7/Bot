@@ -1381,3 +1381,32 @@ def test_reconcile_unpaired_without_history_stays_info():
     asyncio.run(eng.reconcile_positions(snaps))
     asyncio.run(eng.reconcile_positions(snaps))
     assert not fe.risk.is_killed
+
+
+def test_verified_pair_fires_fat_edge_with_zero_history():
+    # A rules/settlement-verified pair needs NO price history: first-ever tick with a
+    # 41% edge fires (definitional truth outranks price statistics). An unverified pair
+    # in the identical situation observes instead.
+    def make(verified):
+        fe = FakeExec()
+        eng = StreamingEngine(
+            executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+            min_edge=0.01, max_plausible_edge=0.06, empirical_min_obs=4,
+            empirical_sum_floor=0.93, cooldown=0.0, clock=lambda: 0.0)
+        pair = ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")
+        eng.set_pairs([pair])
+        if verified:
+            eng.verified_pairs = {pair.key}
+        return eng, fe
+
+    async def driver(eng):
+        await eng.on_quote(q("kalshi", "K1", yes_ask=0.50, ya=100, no_ask=0.50, na=100))
+        await eng.on_quote(q("poly", "P1", yes_ask=0.50, ya=100, no_ask=0.09, na=100))
+
+    eng, fe = make(verified=True)
+    asyncio.run(driver(eng))
+    assert len(fe.calls) == 1                        # fired on the first sighting
+
+    eng, fe = make(verified=False)
+    asyncio.run(driver(eng))
+    assert fe.calls == []                            # unverified -> observes first

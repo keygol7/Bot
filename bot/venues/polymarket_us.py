@@ -493,6 +493,7 @@ class PolymarketUSVenue:
         # during scan_quotes, so place_order can round price/qty to valid increments
         # without a hot-path fetch. The docs warn NOT to infer these from slug/type.
         self._meta: dict[str, dict[str, float | None]] = {}
+        self._descriptions: dict[str, str] = {}   # slug -> resolution rules text (from scan)
 
     @property
     def is_trading_configured(self) -> bool:
@@ -562,6 +563,11 @@ class PolymarketUSVenue:
             "min_qty": _amount(m.get("minimumTradeQty")),
             "volume24hr": v24,
         }
+        # Resolution rules text, free in the scan payload — the rules-verification
+        # layer reads it via market_rules() (no per-market fetch needed).
+        desc = m.get("description")
+        if desc:
+            self._descriptions[slug] = str(desc)
         # Per-game markets often carry endDate=None, which left the matcher's resolve-date
         # guard with no Polymarket date to compare -> it failed OPEN and matched same-teams
         # games on DIFFERENT dates (a Kalshi June-30 KC@CWS paired with a Poly June-26 one;
@@ -1029,6 +1035,12 @@ class PolymarketUSVenue:
 
     async def get_positions(self) -> dict:
         raise NotImplementedError("positions endpoint lands with the live phase")
+
+    async def market_rules(self, slug: str) -> str | None:
+        """Resolution rules text for a market, captured from the scan payload
+        (Polymarket's ``description`` maps every outcome to its settlement condition).
+        None if the market hasn't been scanned this process."""
+        return self._descriptions.get(slug)
 
     async def settled_positions(self) -> dict:
         """Raw slug -> position dict INCLUDING recently-settled positions.
