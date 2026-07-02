@@ -416,17 +416,42 @@ class StreamingEngine:
         # Implausible-edge guard (empirical sanity): an edge this large can't be a real arb —
         # it means the two legs are NOT complements (a false same-event match). Skip + record
         # it so the empirical observer learns the pair's sum sits far from $1.
+        # FAT-EDGE evidence escalation (was a hard ceiling): a huge "edge" is USUALLY the
+        # signature of a false match (spread-vs-moneyline pairings show 10-44%), but a hard
+        # cap also rejected genuine dislocations — money left on the table. Edge size doesn't
+        # determine truth; PRICE HISTORY does. So above the threshold we don't reject — we
+        # demand STRONGER empirical proof of complementarity: ~3x the samples and a mean
+        # YES+NO sum >= ~0.97 (a true pair's history sits at ~$1 with a momentary dip; a
+        # spread-pair's mean lives at 0.55-0.90 and never qualifies). A proven pair fires at
+        # ANY edge; an unproven one keeps observing (and the empirical gate below still
+        # blacklists persistent non-complements). With the empirical gate DISABLED there is
+        # no evidence to escalate to, so the conservative hard skip is kept.
         if self.max_plausible_edge > 0 and edge > self.max_plausible_edge:
-            log.warning("STREAM %s: edge %+.3f > max plausible %.3f — likely FALSE MATCH "
-                        "(legs not complementary), skipping", p.event_key, edge,
-                        self.max_plausible_edge)
-            self._observe(p, edge, yq, nq, size, "implausible_edge_false_match")
-            self._backoff_until[key] = self.clock() + self._backoff_cap   # park it hard
-            # Persist as a confirmed false match once the anomaly is repeated (not a one-off
-            # data blip): a pair that keeps showing an impossible edge over many samples is
-            # not the same event -> blacklist it so it's never matched again (across restarts).
-            self._maybe_blacklist(p, key, f"implausible edge {edge:+.3f}")
-            return None
+            if self.empirical_min_obs <= 0:
+                log.warning("STREAM %s: edge %+.3f > %.3f and no empirical gate to verify "
+                            "complementarity — skipping (likely FALSE MATCH)",
+                            p.event_key, edge, self.max_plausible_edge)
+                self._observe(p, edge, yq, nq, size, "implausible_edge_false_match")
+                self._backoff_until[key] = self.clock() + self._backoff_cap
+                return None
+            obs = self._sum_obs.get(key)
+            n = len(obs) if obs else 0
+            need_n = max(3 * self.empirical_min_obs, 30)
+            need_mean = max(self.empirical_sum_floor, 0.97)
+            mean_sum = (sum(obs) / n) if n else 0.0
+            if n < need_n or mean_sum < need_mean:
+                if n in (1, need_n // 2):            # occasional heartbeat, not tick spam
+                    log.info("STREAM %s: fat edge %+.3f needs stronger proof — %d/%d samples,"
+                             " mean sum %.3f (need >= %.3f); observing",
+                             p.event_key, edge, n, need_n, mean_sum, need_mean)
+                self._observe(p, edge, yq, nq, size, "fat_edge_unproven")
+                # Evidence-based blacklisting still applies: a pair whose sum history sits
+                # far from $1 over enough samples is a false match, parked permanently.
+                self._maybe_blacklist(p, key, f"implausible edge {edge:+.3f}")
+                return None
+            log.warning("STREAM %s: FAT edge %+.3f on a PROVEN complement (mean sum %.3f "
+                        "over %d samples) — genuine dislocation, firing", p.event_key,
+                        edge, mean_sum, n)
         # EMPIRICAL same-event gate: only TRADE a pair once its observed YES+NO sum confirms
         # the legs are complements. Insufficient history -> OBSERVE, don't trade yet (a new
         # real pair confirms within minutes as ticks accrue). Mean sum below the floor -> a

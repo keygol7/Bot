@@ -231,9 +231,12 @@ class Settings:
     # failure is a clean skip not an unwind). "" = same as the maker-rest venue. Set to
     # "polymarket_us" so its 500s on thin markets become free skips instead of Kalshi unwinds.
     exec_take_first_venue: str = ""
-    # Implausible-edge guard: skip any "arb" whose edge exceeds this — a real cross-venue arb
-    # is bounded by arbitrage to a few %, so a larger edge means the legs aren't complements
-    # (a false same-event match). ~0.06-0.08 is sane; 0 = off.
+    # Fat-edge evidence threshold (NOT a hard ceiling): an edge above this is usually a
+    # false same-event match (legs not complements), so it must be backed by STRONGER
+    # empirical proof — ~3x the sum-observation samples with a mean YES+NO >= ~0.97 —
+    # before it may fire. A proven complement fires at ANY edge (a genuine dislocation);
+    # an unproven pair keeps observing and blacklists on evidence. If the empirical gate
+    # is disabled (MATCH_EMPIRICAL_MIN_OBS=0) this falls back to a hard skip. 0 = off.
     exec_max_plausible_edge: float = 0.0
     # Empirical same-event confirmation: a pair must show >= this many YES+NO-sum samples
     # whose MEAN is >= match_empirical_sum_floor before it can TRADE (price behavior is the

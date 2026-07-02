@@ -608,6 +608,74 @@ def test_implausible_edge_skipped_as_false_match():
     assert fe.calls == []                            # 0.50+0.09=0.59 -> edge ~0.41 > 0.06 -> skip
 
 
+def test_fat_edge_fires_on_proven_complement():
+    # NO hard edge ceiling: a pair whose observed YES+NO history proves complementarity
+    # (>= ~30 samples, mean >= 0.97) fires on ANY edge — a fat edge on a proven pair is
+    # a genuine dislocation, not a false match.
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, max_plausible_edge=0.06, empirical_min_obs=4,
+        empirical_sum_floor=0.93, cooldown=0.0, clock=lambda: 0.0)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    async def driver():
+        await eng.on_quote(q("poly", "P1", yes_ask=0.52, ya=100, no_ask=0.51, na=100))
+        for _ in range(31):                       # build a ~$1.01-sum history (no edge)
+            await eng.on_quote(q("kalshi", "K1", yes_ask=0.50, ya=100, no_ask=0.50, na=100))
+        assert fe.calls == []                     # nothing fired while sum ~1.01
+        # genuine dislocation: poly NO collapses -> sum 0.90 -> edge 0.10 > the 0.06 bar
+        await eng.on_quote(q("poly", "P1", yes_ask=0.52, ya=100, no_ask=0.40, na=100))
+
+    asyncio.run(driver())
+    assert len(fe.calls) == 1                     # proven complement -> fat edge FIRES
+
+
+def test_fat_edge_unproven_observes_then_fires_once_proven():
+    # An unproven pair showing a fat edge must NOT fire yet — but it also must NOT be
+    # permanently parked (the old hard-cap behavior): once its history proves the
+    # complement, the same fat edge fires.
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, max_plausible_edge=0.06, empirical_min_obs=4,
+        empirical_sum_floor=0.93, cooldown=0.0, clock=lambda: 0.0)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    async def driver():
+        await eng.on_quote(q("poly", "P1", yes_ask=0.52, ya=100, no_ask=0.40, na=100))
+        await eng.on_quote(q("kalshi", "K1", yes_ask=0.50, ya=100, no_ask=0.50, na=100))
+        assert fe.calls == []                     # fat edge, 2 samples -> observe only
+        for _ in range(35):                       # now prove the complement (sum ~1.02)
+            await eng.on_quote(q("poly", "P1", yes_ask=0.52, ya=100, no_ask=0.52, na=100))
+        await eng.on_quote(q("poly", "P1", yes_ask=0.52, ya=100, no_ask=0.40, na=100))
+
+    asyncio.run(driver())
+    assert len(fe.calls) == 1                     # not parked: fires once proven
+
+
+def test_fat_edge_persistent_false_match_still_blacklists():
+    # A pair whose sum history sits far from $1 (a spread-vs-moneyline false match) never
+    # fires AND still gets evidence-blacklisted, exactly as before.
+    from bot.data.store import Store
+    store = Store(":memory:")
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, max_plausible_edge=0.06, empirical_min_obs=4,
+        empirical_sum_floor=0.93, cooldown=0.0, clock=lambda: 0.0, store=store)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    async def driver():
+        await eng.on_quote(q("poly", "P1", yes_ask=0.50, ya=100, no_ask=0.09, na=100))
+        for _ in range(10):                       # sum ~0.59 every tick -> false match
+            await eng.on_quote(q("kalshi", "K1", yes_ask=0.50, ya=100, no_ask=0.50, na=100))
+
+    asyncio.run(driver())
+    assert fe.calls == []                         # never traded
+    assert store.blacklisted_keys()               # and evidence-blacklisted
+
+
 def test_empirical_gate_blocks_false_match_and_confirms_real_pair():
     # The empirical same-event gate: a pair only trades once its observed YES+NO sum confirms
     # the legs are complements (mean >= floor over >= min_obs samples).
