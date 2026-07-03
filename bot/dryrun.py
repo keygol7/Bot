@@ -848,9 +848,66 @@ async def stream(
             released = risk.retain_markets(open_labels)
             if released > 1e-9:
                 log.info("risk: released $%.2f of exposure on settled markets", released)
+            # Pending-aware gating (auto-rebalance v2 part B): a venue with settled-leg
+            # payouts hours away is not actually drained — count the KNOWN inflows for
+            # the steering gates so they stop over-steering favorites onto it. Only
+            # computed when a venue is genuinely below the floor (zero cost otherwise);
+            # sizing still uses real cash (a pending payout can't pay today's hedge).
+            try:
+                await _refresh_pending(snaps)
+            except Exception as exc:
+                log.warning("pending-payout refresh failed: %s", exc)
             # Cross-venue naked-exposure backstop: catch a position whose hedge never
             # landed (the failure mode behind the Ruzic loss), not just at startup.
             await engine.reconcile_positions(snaps)
+
+    _pending_cache: dict = {}          # (venue, market) -> (verdict_ts, counts: bool)
+
+    async def _refresh_pending(snaps):
+        floor = settings.exec_rebalance_floor
+        bals = {s.venue: s.balance for s in snaps if getattr(s, "balance", None) is not None}
+        if floor <= 0 or not bals or min(bals.values()) >= floor or store is None:
+            if getattr(executor, "_pending", None):
+                executor.set_pending({})
+            return
+        pair_map = store.acted_pair_map()
+        held = {(s.venue, p.market_id): float(p.quantity)
+                for s in snaps for p in (getattr(s, "positions", None) or [])
+                if getattr(p, "is_open", False)}
+        pending: dict = {}
+        now = time.time()
+        budget = 8                                  # bounded venue reads per pass
+        for (v, m), q in held.items():
+            counter = pair_map.get((v, m))
+            if counter is None or abs(held.get(counter, 0.0)) > 0.5:
+                continue                            # counterpart still open -> not pending
+            cached = _pending_cache.get((v, m))
+            if cached is not None and now - cached[0] < 300.0:
+                counts = cached[1]
+            elif budget <= 0:
+                continue
+            else:
+                budget -= 1
+                counts = False
+                try:
+                    if (await open_check(*counter)) is False:   # authoritative settled
+                        quote = await depth_fetch(v, m)
+                        bid = None
+                        if quote is not None:
+                            bid = (round(1.0 - quote.no_ask, 4)
+                                   if q > 0 and quote.no_ask is not None else
+                                   round(1.0 - quote.yes_ask, 4)
+                                   if q < 0 and quote.yes_ask is not None else None)
+                        counts = bid is not None and bid >= 0.95
+                except Exception:
+                    counts = False
+                _pending_cache[(v, m)] = (now, counts)
+            if counts:
+                pending[v] = pending.get(v, 0.0) + abs(q) * 1.0
+        executor.set_pending(pending)
+        if pending:
+            log.info("pending payouts counted for gating: %s",
+                     {k: round(x, 2) for k, x in pending.items()})
 
     async def refresh_specs():
         # Discovery cycle: scans markets + confirms/caches new pairs (embeddings/LLM).
