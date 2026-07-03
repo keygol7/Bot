@@ -1832,3 +1832,27 @@ def test_recross_skipped_when_ask_beyond_breakeven():
     report = asyncio.run(ex.execute(opp()))
     assert report.status is ExecStatus.UNWOUND
     assert len(no.calls) == 1                        # no recross order was even attempted
+
+
+def test_recross_ceiling_is_pnl_breakeven_not_price_breakeven():
+    # With real fee models, the recross ceiling must net fees OUT so the worst salvage
+    # is -epsilon/ct (a price-breakeven ceiling locked -(fees+eps): -$0.83 on a 20-lot).
+    from bot.fees import KalshiFeeModel, PolymarketUSFeeModel
+    yes = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 20, 0.75)])
+    no = FakeVenue("kalshi", [
+        res("kalshi", Side.NO, OrderStatus.KILLED, 0, None),        # hedge fails
+        res("kalshi", Side.NO, OrderStatus.FILLED, 20, 0.23),       # recross fills
+    ])
+    risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({"poly": yes, "kalshi": no}, risk,
+                  fee_models={"kalshi": KalshiFeeModel(0.07),
+                              "poly": PolymarketUSFeeModel(0.05)},
+                  max_order_contracts=0, take_first_venue="poly", first_venue="kalshi")
+    report = asyncio.run(ex.execute(opp(yv="poly", nv="kalshi", max_contracts=20,
+                                        yes_price=0.75, no_price=0.22)))
+    assert report.status is ExecStatus.SUCCESS
+    # ceiling = 1 - 0.75 - fees(0.75)+fees(0.25) [~0.022] + 0.02 -> ~0.248, NOT 0.27
+    sent = no.calls[1][3]
+    assert sent < 0.26                                   # fee-aware, tighter than price+eps
+    # and the locked pnl at the actual 0.23 fill is small-positive/near-zero, not -0.8ish
+    assert report.realized_pnl > -0.45

@@ -32,7 +32,7 @@ from enum import Enum
 from bot.data.store import Store
 from bot.execution.orders import OrderResult, OrderStatus
 from bot.execution.risk import RiskManager
-from bot.fees import FeeModel, ZeroFeeModel
+from bot.fees import FeeModel, ZeroFeeModel, per_contract_fee
 from bot.models import Side
 from bot.strategies.arbitrage import ArbOpportunity
 from bot.venues.base import RawMarket
@@ -986,7 +986,14 @@ class Executor:
         for the unwind. One extra book read + at most one order, on the failure path only."""
         buy_px = leg1.avg_price if leg1.avg_price is not None else (
             opp.yes_price if leg1.side is Side.YES else opp.no_price)
-        ceiling = min(0.99, round((1.0 - buy_px) + self.recross_epsilon, 4))
+        # PnL-breakeven ceiling, not price-breakeven: fees are part of the trade, so a
+        # recross at price-breakeven locks -(fees) before epsilon even applies — at 20
+        # contracts that was a -$0.83 'lock' (~4.2c/ct). Net the per-contract fees out of
+        # the ceiling so the worst salvage is -epsilon/ct, full stop.
+        fees_ct = (per_contract_fee(self._fee(leg1.venue), buy_px)
+                   + per_contract_fee(self._fee(second[0]), min(0.99, 1.0 - buy_px)))
+        ceiling = min(0.99, max(0.01, round(
+            (1.0 - buy_px) - fees_ct + self.recross_epsilon, 4)))
         ask = await self._taker_ask(second, second_venue)
         if ask is not None and ask <= ceiling + 1e-9:
             retry = await self._place(
