@@ -80,3 +80,14 @@ def test_ambiguous_or_unknown_pairs_skipped():
     n = audit_settlements([{"ticker": "K1", "market_result": "yes"}],
                           {"p1": pos(10, 4.0, 6.0)}, store.acted_pair_map(), store)
     assert n == 0
+
+
+def test_void_refund_never_classified_as_a_result():
+    # A voided/refunded market realizes ~$0 — NOT a win or a loss. On a 42-lot costing
+    # $32.40 (the Atreides forfeit shape), $0 sits 9.6 from the "won" endpoint; a loose
+    # band would call that a win and record a false ground-truth verdict.
+    assert infer_poly_result(pos(42, 32.40, 0.0)) is None
+    # while genuine settlements (realized at an endpoint +- fees) still classify
+    assert infer_poly_result(pos(42, 32.40, 9.60)) == "yes"     # won exactly
+    assert infer_poly_result(pos(42, 32.40, 8.90)) == "yes"     # won minus fees
+    assert infer_poly_result(pos(42, 32.40, -32.40)) == "no"    # lost

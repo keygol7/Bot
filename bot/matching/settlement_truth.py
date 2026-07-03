@@ -47,10 +47,15 @@ def infer_poly_result(pos: dict) -> str | None:
     if n < 1e-9:
         return None
     won_r, lost_r = n - cost, -cost                    # realized if held side won / lost
-    span = abs(won_r - lost_r)                          # == n (dollars)
+    # TIGHT endpoint tolerance (fees/slippage only): a VOIDED/refunded market realizes
+    # ~$0, which a loose span/3 band could misread as a "win" whenever the position's
+    # cost is a large fraction of the payout (live case: a pre-match FORFEIT — Kalshi
+    # honored it as a win; had Poly voided, realized 0 sat 9.6 from the win endpoint on
+    # a 42-lot and would have passed a 14-dollar band). Void/odd economics -> no verdict.
+    tol = max(0.05 * n, 0.50)
     d_won, d_lost = abs(realized - won_r), abs(realized - lost_r)
-    if min(d_won, d_lost) > span / 3.0:
-        return None                                     # too far from both -> no verdict
+    if min(d_won, d_lost) > tol:
+        return None                                     # void/refund/unclear -> never guess
     held_won = d_won < d_lost
     held_yes = net > 0
     return "yes" if held_yes == held_won else "no"
