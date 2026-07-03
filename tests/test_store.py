@@ -366,3 +366,16 @@ def test_rules_divergent_pairs_dropped_from_watchlist():
     s.conn.execute("UPDATE rules_verdicts SET material=NULL")
     s.conn.commit()
     assert not s.rules_checked("kalshi", "K1", "polymarket_us", "p1")
+
+
+def test_recycle_remnant_roundtrip():
+    s = Store(":memory:")
+    s.record_recycle_remnant("poly", "p1", 20.0)
+    assert s.recycle_remnants() == {("poly", "p1"): 20.0}
+    s.record_recycle_remnant("poly", "p1", 5.0)            # upsert
+    assert s.recycle_remnants()[("poly", "p1")] == 5.0
+    s.record_recycle_remnant("poly", "p1", 0.0)            # 0 clears
+    assert s.recycle_remnants() == {}
+    s.record_recycle_remnant("kalshi", "K1", 3.0)
+    s.clear_recycle_remnant("kalshi", "K1")
+    assert s.recycle_remnants() == {}

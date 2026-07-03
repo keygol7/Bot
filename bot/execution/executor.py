@@ -129,6 +129,13 @@ class Executor:
         edge_budget_floor: float = 0.25,
         fresh_hedge_secs: float = 0.0,
         recross_epsilon: float = 0.02,
+        recycle_floor: float = 0.0,
+        recycle_itm_bid: float = 0.90,
+        recycle_max_cost: float = 0.03,
+        recycle_max_contracts: float = 50.0,
+        recycle_target: float = 0.0,
+        recycle_cooldown: float = 300.0,
+        recycle_pair_cooldown: float = 3600.0,
         min_lock_edge: float | None = None,
         leg2_slippage_share: float = 0.6,
         min_leg_depth: float = 0.0,
@@ -208,6 +215,25 @@ class Executor:
         # Breakeven recross (see _recross_or_unwind): how far past leg1's breakeven the
         # failed hedge may be re-taken before we accept the unwind's guaranteed loss.
         self.recross_epsilon = recross_epsilon
+        # Capital recycler (auto-rebalance v2): hedged pairs are portable capital — a
+        # decided pair's ITM leg can be sold at its bid to free the drained venue's cash
+        # NOW instead of waiting days for settlement. See recycle_capital.
+        self.recycle_floor = recycle_floor
+        self.recycle_itm_bid = recycle_itm_bid
+        self.recycle_max_cost = recycle_max_cost
+        self.recycle_max_contracts = recycle_max_contracts
+        self.recycle_target = recycle_target
+        self.recycle_cooldown = recycle_cooldown
+        self.recycle_pair_cooldown = recycle_pair_cooldown
+        self._recycled_until: dict[tuple, float] = {}   # pair key -> rebuy-cooldown expiry
+        self._last_recycle_ts: float = 0.0
+        # Held OTM remnants of recycled pairs (free upset-hedges, held to settlement).
+        # Persisted so a restart doesn't make the reconcile read them as naked exposure.
+        self.recycled_remnants: dict[tuple[str, str], float] = (
+            self.store.recycle_remnants() if self.store is not None else {})
+        # Known pending settlement payouts per venue (part B): counted by the GATING
+        # balances only — you can't spend a pending payout, so sizing stays on cash.
+        self._pending: dict[str, float] = {}
         self._market_rel: dict[tuple, tuple] = (
             self.store.market_reliability() if self.store is not None else {})
         # FAMILY-level reliability (aggregated from the per-market table): markets are
@@ -294,6 +320,15 @@ class Executor:
                 for pos in positions:
                     if getattr(pos, "is_open", False):
                         self._positions[(snap.venue, pos.market_id)] = float(pos.quantity)
+                # Prune recycled-pair remnants whose position is gone (settled/paid).
+                for key in [k for k in self.recycled_remnants if k[0] == snap.venue]:
+                    if key not in self._positions:
+                        self.recycled_remnants.pop(key, None)
+                        if self.store is not None:
+                            try:
+                                self.store.clear_recycle_remnant(*key)
+                            except Exception as exc:
+                                log.warning("remnant clear failed for %s: %s", key, exc)
 
     def _track_fill(self, yes_venue, yes_market, no_venue, no_market, size) -> None:
         """Update the cached net position after a settled hedge: +size YES on the yes-leg,
@@ -324,6 +359,20 @@ class Executor:
 
     def _balance(self, venue: str) -> float | None:
         return self._balances.get(venue)
+
+    def set_pending(self, pending: dict) -> None:
+        """Known pending settlement payouts per venue (settled-legs awaiting the venue's
+        payout run). Counted by the GATING balances only."""
+        self._pending = dict(pending or {})
+
+    def _effective_balance(self, venue: str) -> float | None:
+        """Cash + known pending payouts — what the venue is ABOUT to have. Used by the
+        steering gates (_rebalance_skip/_scarce_skip) so they stop starving a venue
+        that has cash hours away; real order sizing stays on spendable cash."""
+        b = self._balances.get(venue)
+        if b is None:
+            return None
+        return b + self._pending.get(venue, 0.0)
 
     def _spend(self, venue: str, amount: float) -> None:
         """Adjust tracked cash after a fill (negative ``amount`` credits it back)."""
@@ -654,8 +703,8 @@ class Executor:
         arb when a 2-3% one may follow. Returns a skip reason, or None to proceed."""
         if self.scarcity_balance <= 0 or opp.edge_per_contract >= self.scarcity_min_edge:
             return None
-        bals = [b for b in (self._balance(opp.buy_yes_venue), self._balance(opp.buy_no_venue))
-                if b is not None]
+        bals = [b for b in (self._effective_balance(opp.buy_yes_venue),
+                            self._effective_balance(opp.buy_no_venue)) if b is not None]
         if bals and min(bals) < self.scarcity_balance:
             return (f"capital scarce (${min(bals):.0f} < ${self.scarcity_balance:.0f}); "
                     f"reserving for edge >= {self.scarcity_min_edge:.2f} "
@@ -679,14 +728,17 @@ class Executor:
         legs = ((opp.buy_yes_venue, opp.yes_price), (opp.buy_no_venue, opp.no_price))
         for i, (venue, leg_price) in enumerate(legs):
             other_venue, other_price = legs[1 - i]
-            bal = self._balance(venue)
+            # EFFECTIVE balance (cash + known pending payouts): a venue with $200 of
+            # settled-legs paying out in hours is not actually drained — steering more
+            # favorites onto it would overshoot.
+            bal = self._effective_balance(venue)
             if bal is None or bal >= self.rebalance_floor or leg_price >= other_price:
                 continue                    # funded, or already holding the favorite
             # Only RESERVE if the COUNTERPART venue is funded (>= floor) — i.e. there's a
             # funded side to steer the longshot toward. If BOTH venues are below the floor
             # there's no rebalance target, so reserving would just deadlock the bot into
             # idle (the scarcity gate + min_venue_balance still guard genuine shortfalls).
-            other_bal = self._balance(other_venue)
+            other_bal = self._effective_balance(other_venue)
             if other_bal is not None and other_bal < self.rebalance_floor:
                 continue
             return (f"rebalance: {venue} low (${bal:.0f} < ${self.rebalance_floor:.0f}) and "
@@ -694,10 +746,257 @@ class Executor:
                     f"settlements must replenish it, so it only holds favorites now")
         return None
 
+    # ------------------------------------------------------------------
+    # Capital recycler (auto-rebalance v2). Cross-venue cash transfer cannot be
+    # automated (separate regulated exchanges), but hedged pairs ARE portable capital:
+    # a locked pair (+YES@A/+NO@B = guaranteed $1xn at settlement) whose event is
+    # effectively DECIDED can be early-exited — sell the ITM leg at its bid FIRST
+    # (recovers ~0.9xn on the drained venue NOW), then try the cheap OTM leg (pennies;
+    # unsold = a held upset-hedge remnant, so the ordering is bounded: worst case
+    # realizes give-up cents below settlement, with upside on an upset). NOTE: the
+    # bound assumes a TRUE complement pair — a false match makes it unbounded, which
+    # is gated upstream by the matching truth stack.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _rpair_key(va: str, ma: str, vb: str, mb: str) -> tuple:
+        """Order-independent flat pair key (mirrors Store._pair_key)."""
+        legs = sorted([(va, ma), (vb, mb)])
+        return legs[0] + legs[1]
+
+    def _recycle_skip(self, opp) -> str | None:
+        """Rebuy-churn guard: a just-recycled pair at ~0.92/0.05 sums to ~0.97 and looks
+        like a 3c edge — without this the engine re-buys exactly what the recycler just
+        sold, burning fees in a loop."""
+        key = self._rpair_key(opp.buy_yes_venue, opp.buy_yes_market,
+                              opp.buy_no_venue, opp.buy_no_market)
+        if time.time() < self._recycled_until.get(key, 0.0):
+            return "pair was capital-recycled recently — rebuy blocked (fee-churn guard)"
+        return None
+
+    def recycle_trigger(self) -> tuple[str, str] | None:
+        """(drained, funded) when the recycler should act: one venue's REAL cash below
+        the recycle floor while the other holds >= 3x its cash AND is itself funded.
+        Real cash, not effective — pending payouts don't pay today's hedges."""
+        if self.recycle_floor <= 0 or len(self._balances) < 2:
+            return None
+        items = sorted(self._balances.items(), key=lambda kv: kv[1])
+        (drained, dbal), (funded, fbal) = items[0], items[-1]
+        if (dbal < self.recycle_floor and fbal >= max(self.rebalance_floor, 1.0)
+                and fbal >= 3.0 * max(dbal, 1e-9)):
+            return drained, funded
+        return None
+
+    def plan_recycle(self, drained: str, pair_map: dict, quotes: dict, *,
+                     busy: frozenset = frozenset(),
+                     settled_counterparts: frozenset = frozenset()) -> list:
+        """PURE selection: which held ITM legs on ``drained`` to early-exit, and how.
+
+        ``quotes``: (venue, market) -> MarketQuote (bids derived as in _unwind:
+        YES bid = 1 - no_ask, NO bid = 1 - yes_ask). ``settled_counterparts``: markets
+        whose counterpart was AUTHORITATIVELY confirmed settled (open_check False) —
+        those become solo realizations. A flat counterpart NOT confirmed settled is
+        skipped entirely (a possible naked leg belongs to the reconcile, not us).
+        Returns dicts sorted cheapest-give-up first, truncated to the per-pass contract
+        budget and to the projected cash target."""
+        actions = []
+        target = self.recycle_target if self.recycle_target > 0 else 2 * self.recycle_floor
+        projected = self._balances.get(drained, 0.0)
+        for (venue, market), net in self._positions.items():
+            if venue != drained or abs(net) < 1.0 or (venue, market) in busy:
+                continue
+            held_side = Side.YES if net > 0 else Side.NO
+            q = quotes.get((venue, market))
+            if q is None:
+                continue
+            itm_bid = None
+            if held_side is Side.YES and q.no_ask is not None:
+                itm_bid = round(1.0 - q.no_ask, 4)
+            elif held_side is Side.NO and q.yes_ask is not None:
+                itm_bid = round(1.0 - q.yes_ask, 4)
+            if itm_bid is None or itm_bid < self.recycle_itm_bid:
+                continue
+            counter = pair_map.get((venue, market))
+            cnet = self._positions.get(counter, 0.0) if counter else 0.0
+            solo = False
+            otm = None                       # (venue, market, side, bid)
+            if counter is None or abs(cnet) < 0.5:
+                if counter is not None and counter in settled_counterparts:
+                    solo = True              # counterpart settled&paid -> pure realization
+                else:
+                    continue                 # possible naked leg -> reconcile's job
+            else:
+                if (cnet > 0) == (net > 0) or abs(abs(net) - abs(cnet)) > 0.5:
+                    continue                 # not a clean opposite hedge
+                cq = quotes.get(counter)
+                otm_side = Side.YES if cnet > 0 else Side.NO
+                otm_bid = None
+                if cq is not None:
+                    if otm_side is Side.YES and cq.no_ask is not None:
+                        otm_bid = round(1.0 - cq.no_ask, 4)
+                    elif otm_side is Side.NO and cq.yes_ask is not None:
+                        otm_bid = round(1.0 - cq.yes_ask, 4)
+                otm = (counter[0], counter[1], otm_side,
+                       otm_bid if otm_bid is not None and otm_bid >= 0.01 else None)
+            qty = float(int(abs(net)))
+            fees_ct = per_contract_fee(self._fee(venue), itm_bid)
+            otm_bid_val = otm[3] if (otm and otm[3]) else 0.0
+            if otm and otm[3]:
+                fees_ct += per_contract_fee(self._fee(otm[0]), otm[3])
+            give_up = round((1.0 - itm_bid - otm_bid_val) + fees_ct, 4)
+            if give_up > self.recycle_max_cost + 1e-9:
+                log.info("recycle: %s:%s ITM bid %.2f rejected — give-up %.3f/ct > cap %.3f",
+                         venue, market, itm_bid, give_up, self.recycle_max_cost)
+                continue
+            actions.append({
+                "event": f"{venue}:{market}" + (f"|{otm[0]}:{otm[1]}" if otm else " (solo)"),
+                "itm": (venue, market, held_side, itm_bid), "otm": otm,
+                "qty": qty, "give_up_ct": give_up, "solo": solo,
+            })
+        actions.sort(key=lambda a: a["give_up_ct"])
+        out, budget = [], self.recycle_max_contracts
+        for a in actions:
+            if budget < 1.0 or projected >= target:
+                break
+            a["qty"] = min(a["qty"], float(int(budget)))
+            if a["qty"] < 1.0:
+                continue
+            budget -= a["qty"]
+            projected += a["qty"] * a["itm"][3]
+            out.append(a)
+        return out
+
+    async def recycle_capital(self, *, pair_map: dict, quote_fetch, busy=frozenset(),
+                              open_check=None, snapshot_fn=None) -> list:
+        """Loop entrypoint (off the hot path). Returns reports of executed actions."""
+        if self.risk.is_killed or self.recycle_floor <= 0:
+            return []
+        now = time.time()
+        if now - self._last_recycle_ts < self.recycle_cooldown:
+            return []
+        trig = self.recycle_trigger()
+        if trig is None:
+            return []
+        drained, funded = trig
+        # Insurance re-read: a stale/mis-signed position cache could make us SELL
+        # inventory we don't hold (opening real exposure). One REST call, off hot path.
+        if snapshot_fn is not None:
+            try:
+                snap = await snapshot_fn(drained)
+                if snap is not None:
+                    self.set_balances([snap])
+            except Exception as exc:
+                log.warning("recycle: drained-venue snapshot failed (%s) — skipping pass", exc)
+                return []
+        # Candidate quotes: bounded reads for drained-venue holds + their counterparts.
+        candidates = [(v, m) for (v, m), n in self._positions.items()
+                      if v == drained and abs(n) >= 1.0 and (v, m) not in busy][:10]
+        quotes: dict = {}
+        settled: set = set()
+        for key in candidates:
+            try:
+                quotes[key] = await quote_fetch(*key)
+            except Exception:
+                continue
+            counter = pair_map.get(key)
+            if counter is None:
+                continue
+            try:
+                quotes[counter] = await quote_fetch(*counter)
+            except Exception:
+                quotes[counter] = None
+            if abs(self._positions.get(counter, 0.0)) < 0.5 and open_check is not None:
+                try:
+                    if (await open_check(*counter)) is False:   # authoritative ONLY
+                        settled.add(counter)
+                except Exception:
+                    pass
+        actions = self.plan_recycle(drained, pair_map, quotes, busy=busy,
+                                    settled_counterparts=frozenset(settled))
+        reports = []
+        for a in actions:
+            r = await self._recycle_one(a)
+            if r is not None:
+                reports.append(r)
+        if reports:
+            self._last_recycle_ts = now
+        return reports
+
+    async def _recycle_one(self, a: dict):
+        """Sell ITM first (bounded ordering), then match the OTM; book only the DELTA
+        vs the $1xn the lock already assumed at entry."""
+        iv, im, iside, ibid = a["itm"]
+        venue = self.venues.get(iv)
+        if venue is None:
+            return None
+        sell = await self._place(venue, im, iside, "sell", ibid, a["qty"],
+                                 "immediate_or_cancel")
+        log.info("recycle ITM sell %s", sell)
+        if sell.status is OrderStatus.ERROR:
+            # Ambiguous but SAFE either way (sold = cash; unsold = still hedged).
+            # Book nothing; the 30s poll resyncs. Cooldown so we don't hammer.
+            self._last_recycle_ts = time.time()
+            return None
+        k = sell.filled
+        if k <= 1e-9:
+            return None                          # book moved; retry next pass
+        itm_avg = sell.avg_price if sell.avg_price is not None else ibid
+        sign = 1.0 if iside is Side.YES else -1.0
+        self._spend(iv, -(k * itm_avg))          # credit the drained venue NOW
+        self._positions[(iv, im)] = self._positions.get((iv, im), 0.0) - k * sign
+        if self.store is not None:
+            self.store.record_fill(iv, im, f"{iside.value}_SELL", itm_avg, k)
+        j, otm_avg = 0.0, 0.0
+        if a["otm"] is not None:
+            ov, om, oside, obid = a["otm"]
+            oven = self.venues.get(ov)
+            if oven is not None and obid is not None:
+                osell = await self._place(oven, om, oside, "sell", obid, k,
+                                          "immediate_or_cancel")
+                log.info("recycle OTM sell %s", osell)
+                if osell.filled > 1e-9 and osell.status is not OrderStatus.ERROR:
+                    j = osell.filled
+                    otm_avg = osell.avg_price if osell.avg_price is not None else obid
+                    osign = 1.0 if oside is Side.YES else -1.0
+                    self._spend(ov, -(j * otm_avg))
+                    self._positions[(ov, om)] = (
+                        self._positions.get((ov, om), 0.0) - j * osign)
+                    if self.store is not None:
+                        self.store.record_fill(ov, om, f"{oside.value}_SELL", otm_avg, j)
+            remnant = round(k - j, 6)
+            if remnant > 1e-9:
+                self.recycled_remnants[(ov, om)] = (
+                    self.recycled_remnants.get((ov, om), 0.0) + remnant)
+                if self.store is not None:
+                    try:
+                        self.store.record_recycle_remnant(
+                            ov, om, self.recycled_remnants[(ov, om)])
+                    except Exception as exc:
+                        log.warning("remnant persist failed for %s: %s", om, exc)
+                log.warning("recycle: holding %g OTM remnant on %s:%s as upset-hedge "
+                            "(unbooked windfall if it wins)", remnant, ov, om)
+            self._recycled_until[self._rpair_key(iv, im, ov, om)] = (
+                time.time() + self.recycle_pair_cooldown)
+        # Delta vs the $1xk the entry-time lock assumed: realized k*itm + j*otm instead.
+        fees = self._fee(iv).fee(itm_avg, k)
+        if j > 1e-9:
+            fees += self._fee(a["otm"][0]).fee(otm_avg, j)
+        delta = round(k * itm_avg + j * otm_avg - k * 1.0 - fees, 6)
+        self.risk.record_pnl(delta)
+        if self.store is not None:
+            self.store.record_pnl(delta, note=f"early exit (capital recycle): {a['event']}")
+        log.warning("RECYCLED %s: sold %g ITM@%.2f%s -> freed $%.2f on %s (delta %+.2f "
+                    "vs settlement)", a["event"], k, itm_avg,
+                    f" + {j:g} OTM@{otm_avg:.2f}" if j > 1e-9 else "",
+                    k * itm_avg, iv, delta)
+        return {"event": a["event"], "freed": k * itm_avg, "delta": delta,
+                "remnant": round(k - j, 6) if a["otm"] is not None else 0.0}
+
     async def execute(self, opp: ArbOpportunity) -> ExecutionReport:
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
-        scarce = self._scarce_skip(opp) or self._rebalance_skip(opp) or self._churn_skip(opp)
+        scarce = (self._scarce_skip(opp) or self._rebalance_skip(opp)
+                  or self._churn_skip(opp) or self._recycle_skip(opp))
         if scarce is not None:
             return ExecutionReport(ExecStatus.SKIPPED, scarce)
 
@@ -1117,7 +1416,8 @@ class Executor:
         """
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
-        scarce = self._scarce_skip(opp) or self._rebalance_skip(opp) or self._churn_skip(opp)
+        scarce = (self._scarce_skip(opp) or self._rebalance_skip(opp)
+                  or self._churn_skip(opp) or self._recycle_skip(opp))
         if scarce is not None:
             return ExecutionReport(ExecStatus.SKIPPED, scarce)
         if self.fill_confirmer is None:

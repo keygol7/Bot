@@ -276,6 +276,24 @@ class Settings:
     # before unwinding leg 1 (unwinding is a guaranteed spread+slippage loss; a ~$0 lock
     # or an epsilon loss strictly dominates it).
     exec_recross_epsilon: float = 0.02
+    # ---- Capital recycler (auto-rebalance v2) ----
+    # Cross-venue cash transfer can't be automated, but hedged pairs ARE portable
+    # capital: a locked pair whose event is effectively decided can be EARLY-EXITED —
+    # sell the ITM leg at its bid (recovers ~0.9x/contract on the drained venue NOW),
+    # then the cheap OTM leg (unsold = a free upset-hedge remnant). Bounded give-up vs
+    # waiting days for settlement. Armed when a venue's REAL cash < recycle_floor AND
+    # the other venue holds >= 3x its cash. 0 = off.
+    exec_recycle_floor: float = 0.0
+    exec_recycle_itm_bid: float = 0.90      # candidate pre-filter; max_cost is the gate
+    exec_recycle_max_cost: float = 0.03     # max give-up/contract vs $1, incl. sell fees
+    exec_recycle_max_contracts: float = 50.0  # blast-radius bound per pass
+    exec_recycle_target: float = 0.0        # stop once drained cash >= this; 0 -> 2x floor
+    exec_recycle_interval_secs: float = 90.0
+    exec_recycle_cooldown_secs: float = 300.0   # between passes that placed orders
+    exec_recycle_pair_cooldown_secs: float = 3600.0  # rebuy guard (fee-churn loop)
+    # Structural-imbalance alert: drained + nothing recyclable for this long -> a loud
+    # log.critical telling the operator the exact manual transfer to make. 0 = off.
+    exec_imbalance_alert_secs: float = 900.0
     # Venue auto-balancing: when a venue's cash dips below exec_rebalance_floor, skip arbs
     # whose leg on THAT venue is the expensive (> $0.50) side, so new spend shifts to the
     # funded venue and the scarce side's cash lasts until settlements replenish it. Same edge
@@ -443,6 +461,15 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_edge_budget_floor=_env_float("EXEC_EDGE_BUDGET_FLOOR", 0.25),
         exec_fresh_hedge_secs=_env_float("EXEC_FRESH_HEDGE_SECS", 0.0),
         exec_recross_epsilon=_env_float("EXEC_RECROSS_EPSILON", 0.02),
+        exec_recycle_floor=_env_float("EXEC_RECYCLE_FLOOR", 0.0),
+        exec_recycle_itm_bid=_env_float("EXEC_RECYCLE_ITM_BID", 0.90),
+        exec_recycle_max_cost=_env_float("EXEC_RECYCLE_MAX_COST", 0.03),
+        exec_recycle_max_contracts=_env_float("EXEC_RECYCLE_MAX_CONTRACTS", 50.0),
+        exec_recycle_target=_env_float("EXEC_RECYCLE_TARGET", 0.0),
+        exec_recycle_interval_secs=_env_float("EXEC_RECYCLE_INTERVAL_SECS", 90.0),
+        exec_recycle_cooldown_secs=_env_float("EXEC_RECYCLE_COOLDOWN_SECS", 300.0),
+        exec_recycle_pair_cooldown_secs=_env_float("EXEC_RECYCLE_PAIR_COOLDOWN_SECS", 3600.0),
+        exec_imbalance_alert_secs=_env_float("EXEC_IMBALANCE_ALERT_SECS", 900.0),
         exec_rebalance_floor=_env_float("EXEC_REBALANCE_FLOOR", 0.0),
         exec_probe_contracts=_env_float("EXEC_PROBE_CONTRACTS", 0.0),
         exec_market_proven_fills=int(_env_float("EXEC_MARKET_PROVEN_FILLS", 3)),

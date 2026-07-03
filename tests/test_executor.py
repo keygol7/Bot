@@ -1856,3 +1856,200 @@ def test_recross_ceiling_is_pnl_breakeven_not_price_breakeven():
     assert sent < 0.26                                   # fee-aware, tighter than price+eps
     # and the locked pnl at the actual 0.23 fill is small-positive/near-zero, not -0.8ish
     assert report.realized_pnl > -0.45
+
+
+# ---------------- capital recycler (auto-rebalance v2) ----------------
+
+def _rec_exec(venues, **kw):
+    ex, risk = make_exec(venues, max_order_contracts=0, **kw)
+    ex.recycle_floor, ex.recycle_itm_bid, ex.recycle_max_cost = 40.0, 0.90, 0.03
+    ex.recycle_max_contracts, ex.recycle_target = 50.0, 0.0
+    ex.recycle_cooldown, ex.recycle_pair_cooldown = 0.0, 3600.0
+    return ex, risk
+
+
+def _q(venue, mid, yes_ask=None, no_ask=None):
+    from bot.models import MarketQuote
+    return MarketQuote(venue=venue, market_id=mid, title="", yes_ask=yes_ask,
+                       yes_ask_size=100, no_ask=no_ask, no_ask_size=100)
+
+
+def test_recycle_trigger_requires_drain_and_funded_other():
+    ex, _ = _rec_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])])
+    ex._balances = {"kalshi": 8.0, "poly": 380.0}
+    assert ex.recycle_trigger() == ("kalshi", "poly")       # drained + 3x imbalance
+    ex._balances = {"kalshi": 8.0, "poly": 20.0}            # imbalance < 3x
+    assert ex.recycle_trigger() is None
+    ex._balances = {"kalshi": 100.0, "poly": 380.0}         # nobody drained
+    assert ex.recycle_trigger() is None
+    ex.recycle_floor = 0.0                                  # disabled
+    ex._balances = {"kalshi": 8.0, "poly": 380.0}
+    assert ex.recycle_trigger() is None
+
+
+def test_plan_recycle_selects_itm_on_drained_venue_only():
+    ex, _ = _rec_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])])
+    ex._balances = {"kalshi": 8.0, "poly": 380.0}
+    # hedged pair: kalshi long 20 YES (ITM: NO ask 0.05 -> YES bid 0.95),
+    #              poly short 20 (long NO; OTM: yes_ask 0.96 -> NO bid 0.04)
+    ex._positions = {("kalshi", "K1"): 20.0, ("poly", "p1"): -20.0}
+    pm = {("kalshi", "K1"): ("poly", "p1"), ("poly", "p1"): ("kalshi", "K1")}
+    quotes = {("kalshi", "K1"): _q("kalshi", "K1", no_ask=0.05),
+              ("poly", "p1"): _q("poly", "p1", yes_ask=0.96)}
+    acts = ex.plan_recycle("kalshi", pm, quotes)
+    assert len(acts) == 1
+    a = acts[0]
+    assert a["itm"][:2] == ("kalshi", "K1") and a["itm"][3] == 0.95
+    assert a["otm"][:2] == ("poly", "p1") and a["otm"][3] == 0.04
+    assert a["qty"] == 20.0
+    # give-up = 1 - 0.95 - 0.04 + 0 fees = 0.01 <= 0.03 cap
+    assert abs(a["give_up_ct"] - 0.01) < 1e-6
+    # the ITM leg on the FUNDED venue is never recycled
+    assert ex.plan_recycle("poly", pm, quotes) == []
+
+
+def test_plan_recycle_guards():
+    ex, _ = _rec_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])])
+    ex._balances = {"kalshi": 8.0, "poly": 380.0}
+    pm = {("kalshi", "K1"): ("poly", "p1"), ("poly", "p1"): ("kalshi", "K1")}
+    # bid below ITM threshold -> skipped
+    ex._positions = {("kalshi", "K1"): 20.0, ("poly", "p1"): -20.0}
+    q_low = {("kalshi", "K1"): _q("kalshi", "K1", no_ask=0.15),
+             ("poly", "p1"): _q("poly", "p1", yes_ask=0.90)}
+    assert ex.plan_recycle("kalshi", pm, q_low) == []
+    # give-up beyond cap (bid 0.90, otm bid 0.02 -> 0.08) -> skipped
+    q_cost = {("kalshi", "K1"): _q("kalshi", "K1", no_ask=0.10),
+              ("poly", "p1"): _q("poly", "p1", yes_ask=0.98)}
+    assert ex.plan_recycle("kalshi", pm, q_cost) == []
+    q_ok = {("kalshi", "K1"): _q("kalshi", "K1", no_ask=0.05),
+            ("poly", "p1"): _q("poly", "p1", yes_ask=0.96)}
+    # busy market -> skipped
+    assert ex.plan_recycle("kalshi", pm, q_ok,
+                           busy=frozenset({("kalshi", "K1")})) == []
+    # counterpart flat and NOT confirmed settled -> skipped (possible naked)
+    ex._positions = {("kalshi", "K1"): 20.0}
+    assert ex.plan_recycle("kalshi", pm, q_ok) == []
+    # ...but confirmed settled -> SOLO realization. NOTE a solo exit has no OTM bid to
+    # recapture, so its give-up is (1 - bid) + fees: at bid 0.95 that's 5c > the 3c cap
+    # (correctly rejected); it needs a deeper bid.
+    assert ex.plan_recycle("kalshi", pm, q_ok,
+                           settled_counterparts=frozenset({("poly", "p1")})) == []
+    q_deep = {("kalshi", "K1"): _q("kalshi", "K1", no_ask=0.02),
+              ("poly", "p1"): _q("poly", "p1", yes_ask=0.99)}
+    acts = ex.plan_recycle("kalshi", pm, q_deep,
+                           settled_counterparts=frozenset({("poly", "p1")}))
+    assert len(acts) == 1 and acts[0]["solo"] and acts[0]["otm"] is None
+    assert abs(acts[0]["give_up_ct"] - 0.02) < 1e-6
+    # same-direction counterpart (not a hedge) -> skipped
+    ex._positions = {("kalshi", "K1"): 20.0, ("poly", "p1"): 20.0}
+    assert ex.plan_recycle("kalshi", pm, q_ok) == []
+    # per-pass contract budget truncation
+    ex._positions = {("kalshi", "K1"): 200.0, ("poly", "p1"): -200.0}
+    acts = ex.plan_recycle("kalshi", pm, q_ok)
+    assert acts and acts[0]["qty"] == 50.0                 # recycle_max_contracts
+
+
+def test_recycle_sells_itm_first_then_otm_and_books_delta():
+    kalshi = FakeVenue("kalshi", [
+        res("kalshi", Side.YES, OrderStatus.FILLED, 20, 0.95, action="sell", requested=20),
+    ])
+    poly = FakeVenue("poly", [
+        res("poly", Side.NO, OrderStatus.FILLED, 20, 0.04, action="sell", requested=20),
+    ])
+    store = Store(":memory:")
+    ex, risk = _rec_exec([kalshi, poly], store=store)
+    ex._balances = {"kalshi": 8.0, "poly": 380.0}
+    ex._positions = {("kalshi", "K1"): 20.0, ("poly", "p1"): -20.0}
+    a = {"event": "kalshi:K1|poly:p1",
+         "itm": ("kalshi", "K1", Side.YES, 0.95),
+         "otm": ("poly", "p1", Side.NO, 0.04), "qty": 20.0,
+         "give_up_ct": 0.01, "solo": False}
+    r = asyncio.run(ex._recycle_one(a))
+    # ordering: ITM (kalshi) sell first, then OTM (poly)
+    assert kalshi.calls[0][2] == "sell" and poly.calls[0][2] == "sell"
+    # drained venue credited with the ITM proceeds
+    assert abs(ex._balances["kalshi"] - (8.0 + 20 * 0.95)) < 1e-6
+    # positions decremented to flat
+    assert abs(ex._positions[("kalshi", "K1")]) < 1e-9
+    assert abs(ex._positions[("poly", "p1")]) < 1e-9
+    # delta = 20*0.95 + 20*0.04 - 20 = -0.20 (zero-fee models)
+    assert abs(r["delta"] - (-0.20)) < 1e-6
+    assert abs(risk.daily_pnl - (-0.20)) < 1e-6
+    row = store.conn.execute(
+        "SELECT amount, note FROM pnl ORDER BY id DESC LIMIT 1").fetchone()
+    assert "early exit (capital recycle)" in row["note"]
+    # rebuy cooldown armed
+    assert ex._recycled_until[ex._rpair_key("kalshi", "K1", "poly", "p1")] > 0
+
+
+def test_recycle_otm_unsold_registers_persistent_remnant():
+    kalshi = FakeVenue("kalshi", [
+        res("kalshi", Side.YES, OrderStatus.FILLED, 20, 0.95, action="sell", requested=20),
+    ])
+    poly = FakeVenue("poly", [
+        res("poly", Side.NO, OrderStatus.KILLED, 0, None, action="sell", requested=20),
+    ])
+    store = Store(":memory:")
+    ex, _ = _rec_exec([kalshi, poly], store=store)
+    ex._balances = {"kalshi": 8.0, "poly": 380.0}
+    ex._positions = {("kalshi", "K1"): 20.0, ("poly", "p1"): -20.0}
+    a = {"event": "kalshi:K1|poly:p1",
+         "itm": ("kalshi", "K1", Side.YES, 0.95),
+         "otm": ("poly", "p1", Side.NO, 0.04), "qty": 20.0,
+         "give_up_ct": 0.01, "solo": False}
+    r = asyncio.run(ex._recycle_one(a))
+    assert r["remnant"] == 20.0
+    assert ex.recycled_remnants[("poly", "p1")] == 20.0
+    assert store.recycle_remnants()[("poly", "p1")] == 20.0     # persisted
+    # conservative delta: treats the held OTM as $0 -> 20*(0.95-1) = -1.00
+    assert abs(r["delta"] - (-1.00)) < 1e-6
+    # a fresh executor loads the remnant back (restart safety)
+    ex2, _ = _rec_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], store=store)
+    assert ex2.recycled_remnants[("poly", "p1")] == 20.0
+
+
+def test_recycle_itm_killed_or_error_books_nothing():
+    for status in (OrderStatus.KILLED, OrderStatus.ERROR):
+        kalshi = FakeVenue("kalshi", [
+            res("kalshi", Side.YES, status, 0, None, action="sell", requested=20)])
+        poly = FakeVenue("poly", [])
+        store = Store(":memory:")
+        ex, risk = _rec_exec([kalshi, poly], store=store)
+        ex._positions = {("kalshi", "K1"): 20.0, ("poly", "p1"): -20.0}
+        a = {"event": "e", "itm": ("kalshi", "K1", Side.YES, 0.95),
+             "otm": ("poly", "p1", Side.NO, 0.04), "qty": 20.0,
+             "give_up_ct": 0.01, "solo": False}
+        r = asyncio.run(ex._recycle_one(a))
+        assert r is None and poly.calls == []               # no OTM attempt
+        assert risk.daily_pnl == 0.0 and not risk.is_killed
+        assert ex._positions[("kalshi", "K1")] == 20.0      # untouched
+
+
+def test_execute_blocks_recycled_pair_rebuy():
+    import time as _time
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
+    ex, _ = make_exec([yes, no])
+    o = opp()
+    ex._recycled_until[ex._rpair_key(o.buy_yes_venue, o.buy_yes_market,
+                                     o.buy_no_venue, o.buy_no_market)] = _time.time() + 60
+    rep = asyncio.run(ex.execute(o))
+    assert rep.status is ExecStatus.SKIPPED and "recycled" in rep.reason
+    # expired cooldown -> trades again
+    ex._recycled_until.clear()
+    assert asyncio.run(ex.execute(o)).status is ExecStatus.SUCCESS
+
+
+def test_effective_balance_gates_only():
+    # Pending payouts flip the STEERING gates but never the cash sizing caps.
+    ex, _ = make_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])],
+                      max_order_contracts=0)
+    ex.rebalance_floor = 40.0
+    ex._balances = {"kalshi": 10.0, "poly": 100.0}
+    o = opp(yv="kalshi", nv="poly", yes_price=0.17, no_price=0.80)  # kalshi = longshot
+    assert ex._rebalance_skip(o) is not None                # drained -> reserved
+    ex.set_pending({"kalshi": 75.0})                        # $75 landing in hours
+    assert ex._rebalance_skip(o) is None                    # effectively funded
+    # sizing caps unchanged: cash_yes still uses REAL $10
+    _, caps = ex._max_size(o)
+    assert caps["cash_yes"] <= 10.0 / 0.17 + 1e-6

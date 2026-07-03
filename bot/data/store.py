@@ -215,6 +215,17 @@ CREATE TABLE IF NOT EXISTS rules_verdicts (
     PRIMARY KEY (venue_a, market_a, venue_b, market_b)
 );
 
+-- Capital-recycler remnants: the unsold cheap OTM leg of an early-exited pair, held to
+-- settlement as a free upset-hedge. Persisted so a restart doesn't make the reconcile
+-- read the lone leg as naked exposure (-> false kill switch).
+CREATE TABLE IF NOT EXISTS recycle_remnants (
+    venue      TEXT NOT NULL,
+    market_id  TEXT NOT NULL,
+    qty        REAL NOT NULL,
+    ts         REAL NOT NULL,
+    PRIMARY KEY (venue, market_id)
+);
+
 -- Time/market indices: the settled-PnL reconciliation, reconcile pairing, and every
 -- "last N hours" query scan these tables, which grow without bound.
 CREATE INDEX IF NOT EXISTS idx_pnl_ts            ON pnl (ts);
@@ -443,6 +454,27 @@ class Store:
             out[a] = b
             out[b] = a
         return out
+
+    # ---- capital-recycler remnants ----
+
+    def record_recycle_remnant(self, venue: str, market_id: str, qty: float) -> None:
+        """Upsert the held OTM remnant qty for a recycled pair (0 clears it)."""
+        if qty <= 1e-9:
+            self.clear_recycle_remnant(venue, market_id)
+            return
+        self.conn.execute(
+            "INSERT OR REPLACE INTO recycle_remnants (venue, market_id, qty, ts) "
+            "VALUES (?, ?, ?, ?)", (venue, market_id, qty, time.time()))
+        self.conn.commit()
+
+    def recycle_remnants(self) -> dict:
+        return {(r["venue"], r["market_id"]): r["qty"] for r in self.conn.execute(
+            "SELECT venue, market_id, qty FROM recycle_remnants")}
+
+    def clear_recycle_remnant(self, venue: str, market_id: str) -> None:
+        self.conn.execute("DELETE FROM recycle_remnants WHERE venue=? AND market_id=?",
+                          (venue, market_id))
+        self.conn.commit()
 
     # ---- settlement ground truth ----
 
