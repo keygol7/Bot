@@ -812,3 +812,25 @@ def test_prune_market_removes_verdicts():
     assert s.conn.execute(
         "SELECT COUNT(*) c FROM markets WHERE market_id='K'").fetchone()["c"] == 0
     s.close()
+
+
+def test_imbalance_alert_wording_and_rate_limit():
+    from bot.dryrun import imbalance_alert
+    bals = {"kalshi": 8.42, "polymarket_us": 388.51}
+    # not drained long enough -> quiet
+    assert imbalance_alert(bals, drained_since=1000.0, now=1100.0, recyclable=False,
+                           alert_secs=900.0, last_alert=0.0) is None
+    # drained long enough + nothing recyclable -> fires with the exact manual action
+    msg = imbalance_alert(bals, drained_since=1000.0, now=2000.0, recyclable=False,
+                          alert_secs=900.0, last_alert=0.0)
+    assert msg is not None and "STRUCTURAL IMBALANCE" in msg
+    assert "withdraw $190 from polymarket_us" in msg and "deposit to kalshi" in msg
+    # recyclable inventory -> the recycler handles it, no alert
+    assert imbalance_alert(bals, 1000.0, 2000.0, recyclable=True,
+                           alert_secs=900.0, last_alert=0.0) is None
+    # rate limit: one per hour
+    assert imbalance_alert(bals, 1000.0, 2000.0, recyclable=False,
+                           alert_secs=900.0, last_alert=1900.0) is None
+    # disabled
+    assert imbalance_alert(bals, 1000.0, 2000.0, recyclable=False,
+                           alert_secs=0.0, last_alert=0.0) is None

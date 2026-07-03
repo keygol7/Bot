@@ -1432,3 +1432,23 @@ def test_fat_edge_rejects_wide_book_high_sum_history():
 
     asyncio.run(driver())
     assert fe.calls == []
+
+
+def test_reconcile_ignores_recycle_remnant():
+    # A capital-recycled pair holds only the cheap OTM leg (upset-hedge remnant) with
+    # both markets still OPEN — the reconcile must read it from the remnant registry,
+    # not as naked exposure. Larger-than-remnant imbalance still halts.
+    eng, fe = _settled_engine(
+        open_states={"kalshi": True, "poly": True},
+        depth_states={"kalshi": "MARKET_STATE_OPEN", "poly": "MARKET_STATE_OPEN"})
+    fe.recycled_remnants = {("poly", "P1"): 2.0}
+    snaps = [_snap("kalshi", []), _snap("poly", [("P1", 2)])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
+    # imbalance beyond the registered remnant -> still a genuine naked -> halts
+    fe.recycled_remnants = {("poly", "P1"): 2.0}
+    snaps = [_snap("kalshi", []), _snap("poly", [("P1", 8)])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert fe.risk.is_killed

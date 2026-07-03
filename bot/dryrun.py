@@ -347,6 +347,25 @@ async def run_cycle(
     return result
 
 
+def imbalance_alert(balances: dict, drained_since: float, now: float, recyclable: bool,
+                    alert_secs: float, last_alert: float) -> str | None:
+    """Structural-imbalance alert (pure, testable): when one venue stays drained, the
+    recycler has NOTHING to recycle, and enough time has passed, tell the operator the
+    exact manual bank transfer to make — the one rebalance no code can automate."""
+    if alert_secs <= 0 or recyclable or len(balances) < 2:
+        return None
+    if now - drained_since < alert_secs:
+        return None
+    if last_alert > 0 and now - last_alert < 3600.0:    # at most one alert per hour
+        return None
+    items = sorted(balances.items(), key=lambda kv: kv[1])
+    (drained, dbal), (funded, fbal) = items[0], items[-1]
+    move = max(10.0, round((sum(balances.values()) / 2.0 - dbal) / 10.0) * 10.0)
+    return (f"STRUCTURAL IMBALANCE: {drained}=${dbal:.2f} vs {funded}=${fbal:.2f} and "
+            f"nothing to recycle. MANUAL ACTION: withdraw ${move:.0f} from {funded} and "
+            f"deposit to {drained} (target ~50/50). Bank transfer takes days — start it now.")
+
+
 def apply_balance_caps(risk, snapshots, per_market_fraction: float = 1.0) -> float:
     """Set the per-market and total exposure caps from the live balance check.
 
@@ -696,6 +715,13 @@ async def stream(
         fresh_hedge_secs=settings.exec_fresh_hedge_secs,
         recross_epsilon=settings.exec_recross_epsilon,
         rebalance_floor=settings.exec_rebalance_floor,
+        recycle_floor=settings.exec_recycle_floor,
+        recycle_itm_bid=settings.exec_recycle_itm_bid,
+        recycle_max_cost=settings.exec_recycle_max_cost,
+        recycle_max_contracts=settings.exec_recycle_max_contracts,
+        recycle_target=settings.exec_recycle_target,
+        recycle_cooldown=settings.exec_recycle_cooldown_secs,
+        recycle_pair_cooldown=settings.exec_recycle_pair_cooldown_secs,
         probe_contracts=settings.exec_probe_contracts,
         market_proven_fills=settings.exec_market_proven_fills,
         market_max_fails=settings.exec_market_max_fails,
@@ -1051,12 +1077,75 @@ async def stream(
             except Exception as exc:
                 log.warning("canon extraction pass failed: %s", exc)
 
+    async def capital_recycler_loop():
+        # Auto-rebalance v2 (executor.recycle_capital): when one venue is drained and
+        # the other holds >=3x its cash, early-exit DECIDED pairs' ITM legs on the
+        # drained venue — hedged pairs are portable capital; selling a ~$0.95 leg frees
+        # the cash days before settlement at a bounded give-up. Off the hot path.
+        if settings.exec_recycle_floor <= 0:
+            return
+        drained_since = 0.0
+        last_alert = 0.0
+        while True:
+            await asyncio.sleep(settings.exec_recycle_interval_secs)
+            try:
+                # Busy set: never touch a pair mid-execution (take/maker inflight).
+                busy = set()
+                for key in (getattr(engine, "_take_inflight", set())
+                            | getattr(engine, "_maker_inflight", set())):
+                    p = engine._pairs.get(key)
+                    if p is not None:
+                        busy.add((p.venue_a, p.market_a))
+                        busy.add((p.venue_b, p.market_b))
+
+                async def _snapshot(venue_name: str):
+                    v = venue_by_name.get(venue_name)
+                    fn = getattr(v, "account_snapshot", None) if v is not None else None
+                    return await fn() if fn is not None else None
+
+                pair_map = store.acted_pair_map() if store is not None else {}
+                reports = await executor.recycle_capital(
+                    pair_map=pair_map, quote_fetch=depth_fetch,
+                    busy=frozenset(busy), open_check=open_check,
+                    snapshot_fn=_snapshot)
+                if reports:
+                    freed = sum(r.get("freed", 0.0) for r in reports)
+                    log.warning("capital recycler: %d early exit(s), freed $%.2f on the "
+                                "drained venue", len(reports), freed)
+                    await refresh_balances()
+                # Structural alert: drained + nothing recyclable for long enough ->
+                # tell the operator the exact manual transfer (code can't wire money).
+                trig = executor.recycle_trigger()
+                if trig is None:
+                    drained_since = 0.0
+                else:
+                    now = time.time()
+                    if drained_since <= 0:
+                        drained_since = now
+                    msg = imbalance_alert(
+                        dict(executor._balances), drained_since, now,
+                        recyclable=bool(reports),
+                        alert_secs=settings.exec_imbalance_alert_secs,
+                        last_alert=last_alert)
+                    if msg is not None:
+                        last_alert = now
+                        log.critical(msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("capital recycler pass failed: %s", exc)
+
     private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
     private_tasks += [asyncio.create_task(feed_lifecycle(v)) for v in venues]
     private_tasks.append(asyncio.create_task(poll_balances()))
     private_tasks.append(asyncio.create_task(settlement_truth_loop()))
     private_tasks.append(asyncio.create_task(rules_verify_loop()))
     private_tasks.append(asyncio.create_task(canon_extract_loop()))
+    private_tasks.append(asyncio.create_task(capital_recycler_loop()))
+    if settings.exec_recycle_floor > 0:
+        log.warning("capital recycler ON: floor $%.0f + 3x imbalance -> early-exit decided "
+                    "pairs at <= %.0fc/ct give-up (EXEC_RECYCLE_*)",
+                    settings.exec_recycle_floor, settings.exec_recycle_max_cost * 100)
     log.warning("matching mode: %s metrics=%s (MATCH_USE_FINGERPRINT/MATCH_COMBINE_VERDICTS)",
                 ("fingerprint+LLM verdicts UNION"
                  if settings.match_use_fingerprint and settings.match_combine_verdicts

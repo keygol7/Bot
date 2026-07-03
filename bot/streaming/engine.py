@@ -837,6 +837,26 @@ class StreamingEngine:
                             "on it — treating as venue DOWN/stale read, NOT naked; skipping halt "
                             "for those this cycle", ",".join(sorted(down)), before - len(imbalanced))
 
+        # Drop imbalances that are CAPITAL-RECYCLE remnants: the deliberately-held cheap
+        # OTM leg of an early-exited pair (an upset-hedge, not a stranded hedge). The
+        # registry is persisted, so a restart can't misread one as naked. Without this
+        # filter every recycle with an unsold OTM would trip a RECONCILE HALT.
+        if imbalanced:
+            remnants = getattr(self.executor, "recycled_remnants", {}) or {}
+            if remnants:
+                kept = []
+                for p, qa, qb in imbalanced:
+                    surviving = ((p.venue_a, p.market_a) if qa > qb
+                                 else (p.venue_b, p.market_b))
+                    qty = max(qa, qb) - min(qa, qb)
+                    if qty <= remnants.get(surviving, 0.0) + self._reconcile_tol:
+                        log.info("RECONCILE: %s imbalance (Δ%g) is an intentional "
+                                 "upset-hedge remnant from a capital recycle — not naked",
+                                 p.event_key, qty)
+                        continue
+                    kept.append((p, qa, qb))
+                imbalanced = kept
+
         # Drop imbalances where a leg's market has SETTLED — a realized arb leftover, not a
         # stranded hedge (those halt at execution time). Checked only on imbalance (rare).
         if imbalanced:
