@@ -1131,17 +1131,28 @@ async def stream(
         while True:
             await asyncio.sleep(150)
             try:
+                # Select markets NOT YET extracted, recent first. The old "recent 600"
+                # window was saturated by constantly-updating sports books, so static
+                # non-sports markets (elections/CPI rarely change updated_at) never
+                # entered it and were never extracted. A LEFT JOIN on the cache sweeps
+                # every un-extracted market exactly once, regardless of churn.
                 pool = store.conn.execute(
-                    "SELECT venue, market_id, title FROM markets "
-                    "ORDER BY updated_at DESC LIMIT 600").fetchall()
-                budget = 8
+                    "SELECT m.venue, m.market_id, m.title FROM markets m "
+                    "LEFT JOIN market_canon c "
+                    "  ON c.venue = m.venue AND c.market_id = m.market_id "
+                    "WHERE c.market_id IS NULL "
+                    "ORDER BY m.updated_at DESC LIMIT 600").fetchall()
+                budget = 12
                 done = 0
+                attempts = 0                          # cap rules-fetches per pass so a
+                                                      # run of no-rules markets (which stay
+                                                      # in the un-extracted pool) can't spin
+                                                      # the whole 600 in one pass
                 for r in pool:
-                    if budget <= 0:
+                    if budget <= 0 or attempts >= 60:
                         break
                     venue, mid, title = r["venue"], r["market_id"], r["title"]
-                    if store.canon_checked(venue, mid):
-                        continue
+                    attempts += 1
                     if venue == "kalshi" and kalshi_v is not None:
                         rules = await kalshi_v.market_rules(mid)
                     elif venue == "polymarket_us" and poly_v is not None:
