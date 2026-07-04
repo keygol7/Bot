@@ -136,6 +136,14 @@ class Executor:
         recycle_target: float = 0.0,
         recycle_cooldown: float = 300.0,
         recycle_pair_cooldown: float = 3600.0,
+        early_exit_enabled: bool = False,
+        early_exit_margin: float = 0.0,
+        early_exit_cooldown: float = 300.0,
+        early_exit_max_pairs: float = 8.0,
+        early_exit_max_contracts: float = 50.0,
+        early_exit_min_bid_depth: float = 0.0,
+        max_settle_days: float = 0.0,
+        longdated_min_edge: float = 0.0,
         min_lock_edge: float | None = None,
         leg2_slippage_share: float = 0.6,
         min_leg_depth: float = 0.0,
@@ -227,6 +235,20 @@ class Executor:
         self.recycle_pair_cooldown = recycle_pair_cooldown
         self._recycled_until: dict[tuple, float] = {}   # pair key -> rebuy-cooldown expiry
         self._last_recycle_ts: float = 0.0
+        # Early-profit exit: generalizes the recycler to realize a hedged pair's locked
+        # profit BEFORE settlement whenever the two venues dislocate favorably (both
+        # exit bids recover >= entry cost + margin). No drained-venue precondition.
+        self.early_exit_enabled = early_exit_enabled
+        self.early_exit_margin = early_exit_margin
+        self.early_exit_cooldown = early_exit_cooldown
+        self.early_exit_max_pairs = early_exit_max_pairs
+        self.early_exit_max_contracts = early_exit_max_contracts
+        self.early_exit_min_bid_depth = early_exit_min_bid_depth
+        self._last_early_exit_ts: float = 0.0
+        # Capital-horizon gate: reject entries settling beyond max_settle_days unless the
+        # edge clears longdated_min_edge (a fat edge justifies the long capital lock).
+        self.max_settle_days = max_settle_days
+        self.longdated_min_edge = longdated_min_edge
         # Held OTM remnants of recycled pairs (free upset-hedges, held to settlement).
         # Persisted so a restart doesn't make the reconcile read them as naked exposure.
         self.recycled_remnants: dict[tuple[str, str], float] = (
@@ -774,6 +796,19 @@ class Executor:
             return "pair was capital-recycled recently — rebuy blocked (fee-churn guard)"
         return None
 
+    def _horizon_skip(self, opp) -> str | None:
+        """Capital-horizon gate: don't lock capital in a far-out settlement unless the
+        edge is fat enough to justify the wait. A thin edge on a November election ties
+        up cash for months; the early-exit loop can only free it opportunistically."""
+        if self.max_settle_days <= 0 or not opp.settle_ts:
+            return None
+        days = (opp.settle_ts - time.time()) / 86400.0
+        if days > self.max_settle_days and opp.edge_per_contract < self.longdated_min_edge:
+            return (f"horizon: settles in {days:.0f}d (> {self.max_settle_days:.0f}d) and "
+                    f"edge {opp.edge_per_contract:.3f} < long-dated min "
+                    f"{self.longdated_min_edge:.3f} — capital better used near-dated")
+        return None
+
     def recycle_trigger(self) -> tuple[str, str] | None:
         """(drained, funded) when the recycler should act: one venue's REAL cash below
         the recycle floor while the other holds >= 3x its cash AND is itself funded.
@@ -922,6 +957,143 @@ class Executor:
             self._last_recycle_ts = now
         return reports
 
+    # ------------------------------------------------------------------
+    # Early-profit exit — generalizes the recycler. The recycler exits when one leg is
+    # ITM (~$1, the event decided) to free a DRAINED venue's capital. This exits ANY
+    # held hedged pair, drained or not, when the market offers a profitable early
+    # unwind: the two legs sit on DIFFERENT venues, so when the books dislocate the
+    # other way (both exit bids rise on news) their sum can exceed the entry cost —
+    # realizing the locked profit months before settlement. It NEVER exits below entry
+    # (the trigger enforces >= entry_cost + margin), so a quiet pair simply stays held.
+    # Reuses _recycle_one for the sell-both plumbing + accounting (delta-vs-$1, which
+    # equals exit_value - entry_cost once the entry-time lock is included).
+    # ------------------------------------------------------------------
+
+    def plan_early_exit(self, pair_map: dict, quotes: dict, entry_costs: dict, *,
+                        busy: frozenset = frozenset()) -> list:
+        """PURE: which held hedged pairs to unwind early at a profit-vs-entry. Each pair
+        is considered once (dedup by pair key). ``entry_costs``: pair key ->
+        (yes_price, no_price) sum = what we paid. Bids derived as in plan_recycle."""
+        actions, seen = [], set()
+        for (venue, market), net in list(self._positions.items()):
+            if abs(net) < 1.0 or (venue, market) in busy:
+                continue
+            counter = pair_map.get((venue, market))
+            if counter is None or counter in busy:
+                continue
+            cnet = self._positions.get(counter, 0.0)
+            # clean opposite hedge only
+            if abs(cnet) < 1.0 or (cnet > 0) == (net > 0) or abs(abs(net) - abs(cnet)) > 0.5:
+                continue
+            key = self._rpair_key(venue, market, counter[0], counter[1])
+            if key in seen:
+                continue
+            seen.add(key)
+            entry = entry_costs.get(key)
+            if entry is None:
+                continue                        # no cost basis -> can't judge profit
+            q, cq = quotes.get((venue, market)), quotes.get(counter)
+            if q is None or cq is None:
+                continue
+
+            def _bid(quote, held):               # held side's sellable bid + its depth
+                if held is Side.YES and quote.no_ask is not None:
+                    return round(1.0 - quote.no_ask, 4), (quote.no_ask_size or 0.0)
+                if held is Side.NO and quote.yes_ask is not None:
+                    return round(1.0 - quote.yes_ask, 4), (quote.yes_ask_size or 0.0)
+                return None, 0.0
+
+            side = Side.YES if net > 0 else Side.NO
+            cside = Side.YES if cnet > 0 else Side.NO
+            bid, depth = _bid(q, side)
+            cbid, cdepth = _bid(cq, cside)
+            if bid is None or cbid is None:
+                continue
+            if depth < self.early_exit_min_bid_depth or cdepth < self.early_exit_min_bid_depth:
+                continue                         # thin exit -> partial-fill/naked risk
+            qty = float(int(min(abs(net), abs(cnet))))
+            if qty < 1.0:
+                continue
+            exit_fees = (per_contract_fee(self._fee(venue), bid)
+                         + per_contract_fee(self._fee(counter[0]), cbid))
+            exit_value = round(bid + cbid - exit_fees, 4)
+            entry_cost = entry[0] + entry[1]
+            if exit_value < entry_cost + self.early_exit_margin - 1e-9:
+                continue                         # market isn't offering a profitable exit
+            # itm = higher-bid leg (sold first); otm = cheaper leg (a partial leaves the
+            # LEAST capital exposed as the remnant).
+            legs = sorted([(bid, venue, market, side), (cbid, counter[0], counter[1], cside)],
+                          reverse=True)
+            (hi_bid, hv, hm, hs), (lo_bid, lv, lm, ls) = legs
+            actions.append({
+                "event": f"{hv}:{hm}|{lv}:{lm} (early-exit +{exit_value - entry_cost:.3f})",
+                "itm": (hv, hm, hs, hi_bid),
+                "otm": (lv, lm, ls, lo_bid if lo_bid >= 0.01 else None),
+                "qty": qty, "gain": round(exit_value - entry_cost, 4), "solo": False,
+            })
+        actions.sort(key=lambda a: -a["gain"])   # bank the biggest gains first
+        out, budget = [], self.early_exit_max_contracts
+        for a in actions:
+            if budget < 1.0:
+                break
+            a["qty"] = min(a["qty"], float(int(budget)))
+            if a["qty"] < 1.0:
+                continue
+            budget -= a["qty"]
+            out.append(a)
+        return out
+
+    async def early_exit(self, *, pair_map: dict, quote_fetch, store, busy=frozenset(),
+                         snapshot_fn=None) -> list:
+        """Loop entrypoint (off the hot path). Scans ALL held hedged pairs for a
+        profitable early unwind. Returns reports of executed exits."""
+        if self.risk.is_killed or not self.early_exit_enabled:
+            return []
+        now = time.time()
+        if now - self._last_early_exit_ts < self.early_exit_cooldown:
+            return []
+        # Candidate pairs: held markets with a known held counterpart, deduped, bounded.
+        cands, seen = [], set()
+        for (v, m), n in list(self._positions.items()):
+            if abs(n) < 1.0 or (v, m) in busy:
+                continue
+            counter = pair_map.get((v, m))
+            if counter is None or counter in busy or abs(self._positions.get(counter, 0.0)) < 1.0:
+                continue
+            key = self._rpair_key(v, m, counter[0], counter[1])
+            if key in seen:
+                continue
+            seen.add(key)
+            cands.append(((v, m), counter))
+            if len(cands) >= int(self.early_exit_max_pairs):
+                break
+        if not cands:
+            return []
+        quotes, entry_costs = {}, {}
+        for leg, counter in cands:
+            for key in (leg, counter):
+                if key not in quotes:
+                    try:
+                        quotes[key] = await quote_fetch(*key)
+                    except Exception:
+                        quotes[key] = None
+            pk = self._rpair_key(leg[0], leg[1], counter[0], counter[1])
+            try:
+                ec = store.entry_cost_for_pair(leg[0], leg[1], counter[0], counter[1])
+            except Exception:
+                ec = None
+            if ec is not None:
+                entry_costs[pk] = ec
+        actions = self.plan_early_exit(pair_map, quotes, entry_costs, busy=busy)
+        reports = []
+        for a in actions:
+            r = await self._recycle_one(a)
+            if r is not None:
+                reports.append(r)
+        if reports:
+            self._last_early_exit_ts = now
+        return reports
+
     async def _recycle_one(self, a: dict):
         """Sell ITM first (bounded ordering), then match the OTM; book only the DELTA
         vs the $1xn the lock already assumed at entry."""
@@ -996,7 +1168,8 @@ class Executor:
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
         scarce = (self._scarce_skip(opp) or self._rebalance_skip(opp)
-                  or self._churn_skip(opp) or self._recycle_skip(opp))
+                  or self._churn_skip(opp) or self._recycle_skip(opp)
+                  or self._horizon_skip(opp))
         if scarce is not None:
             return ExecutionReport(ExecStatus.SKIPPED, scarce)
 
@@ -1417,7 +1590,8 @@ class Executor:
         if self.risk.is_killed:
             return ExecutionReport(ExecStatus.SKIPPED, f"kill switch: {self.risk.kill_reason}")
         scarce = (self._scarce_skip(opp) or self._rebalance_skip(opp)
-                  or self._churn_skip(opp) or self._recycle_skip(opp))
+                  or self._churn_skip(opp) or self._recycle_skip(opp)
+                  or self._horizon_skip(opp))
         if scarce is not None:
             return ExecutionReport(ExecStatus.SKIPPED, scarce)
         if self.fill_confirmer is None:

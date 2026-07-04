@@ -371,6 +371,21 @@ class Store:
         # Order-independent: a pair is the same regardless of argument order.
         return tuple(sorted([(va, ma), (vb, mb)]))[0] + tuple(sorted([(va, ma), (vb, mb)]))[1]
 
+    def entry_cost_for_pair(self, va: str, ma: str, vb: str, mb: str):
+        """(yes_price, no_price) of the most-recent ACTED opportunity for this pair, or
+        None if never acted. Order-independent — the early-exit trigger needs the entry
+        cost basis regardless of which leg the caller names first."""
+        key = self._pair_key(va, ma, vb, mb)
+        for r in self.conn.execute(
+            "SELECT buy_yes_venue, buy_yes_market, buy_no_venue, buy_no_market, "
+            "yes_price, no_price FROM opportunities WHERE acted = 1 ORDER BY rowid DESC"):
+            if self._pair_key(r["buy_yes_venue"], r["buy_yes_market"],
+                              r["buy_no_venue"], r["buy_no_market"]) == key:
+                if r["yes_price"] is None or r["no_price"] is None:
+                    return None
+                return float(r["yes_price"]), float(r["no_price"])
+        return None
+
     # ---- empirical false-match blacklist (Layer 2 learning loop) ----
     def blacklist_pair(self, va: str, ma: str, vb: str, mb: str, *,
                        reason: str = "", mean_sum: float | None = None,

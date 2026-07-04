@@ -722,6 +722,14 @@ async def stream(
         recycle_target=settings.exec_recycle_target,
         recycle_cooldown=settings.exec_recycle_cooldown_secs,
         recycle_pair_cooldown=settings.exec_recycle_pair_cooldown_secs,
+        early_exit_enabled=settings.exec_early_exit_enabled,
+        early_exit_margin=settings.exec_early_exit_margin,
+        early_exit_cooldown=settings.exec_early_exit_cooldown_secs,
+        early_exit_max_pairs=settings.exec_early_exit_max_pairs,
+        early_exit_max_contracts=settings.exec_early_exit_max_contracts,
+        early_exit_min_bid_depth=settings.exec_early_exit_min_bid_depth,
+        max_settle_days=settings.exec_max_settle_days,
+        longdated_min_edge=settings.exec_longdated_min_edge,
         probe_contracts=settings.exec_probe_contracts,
         market_proven_fills=settings.exec_market_proven_fills,
         market_max_fails=settings.exec_market_max_fails,
@@ -1192,6 +1200,36 @@ async def stream(
             except Exception as exc:
                 log.warning("capital recycler pass failed: %s", exc)
 
+    async def early_exit_loop():
+        # Early-profit exit (executor.early_exit): realize any held hedged pair's locked
+        # profit BEFORE settlement whenever both venues' exit bids recover >= entry cost
+        # + margin. Frees capital months early on long-dated markets; never exits below
+        # entry. Off the hot path, bounded REST.
+        if not settings.exec_early_exit_enabled or store is None:
+            return
+        while True:
+            await asyncio.sleep(settings.exec_early_exit_interval_secs)
+            try:
+                busy = set()
+                for key in (getattr(engine, "_take_inflight", set())
+                            | getattr(engine, "_maker_inflight", set())):
+                    p = engine._pairs.get(key)
+                    if p is not None:
+                        busy.add((p.venue_a, p.market_a))
+                        busy.add((p.venue_b, p.market_b))
+                reports = await executor.early_exit(
+                    pair_map=store.acted_pair_map(), quote_fetch=depth_fetch,
+                    store=store, busy=frozenset(busy))
+                if reports:
+                    gained = sum(r.get("delta", 0.0) for r in reports)
+                    log.warning("early-profit exit: %d pair(s) unwound early for a booked "
+                                "$%.2f, freeing capital before settlement", len(reports), gained)
+                    await refresh_balances()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("early-exit pass failed: %s", exc)
+
     private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
     private_tasks += [asyncio.create_task(feed_lifecycle(v)) for v in venues]
     private_tasks.append(asyncio.create_task(poll_balances()))
@@ -1199,10 +1237,18 @@ async def stream(
     private_tasks.append(asyncio.create_task(rules_verify_loop()))
     private_tasks.append(asyncio.create_task(canon_extract_loop()))
     private_tasks.append(asyncio.create_task(capital_recycler_loop()))
+    private_tasks.append(asyncio.create_task(early_exit_loop()))
     if settings.exec_recycle_floor > 0:
         log.warning("capital recycler ON: floor $%.0f + 3x imbalance -> early-exit decided "
                     "pairs at <= %.0fc/ct give-up (EXEC_RECYCLE_*)",
                     settings.exec_recycle_floor, settings.exec_recycle_max_cost * 100)
+    if settings.exec_early_exit_enabled:
+        log.warning("early-profit exit ON: unwind hedged pairs early when exit value >= "
+                    "entry + %.0fc margin (EXEC_EARLY_EXIT_*)",
+                    settings.exec_early_exit_margin * 100)
+    if settings.exec_max_settle_days > 0:
+        log.warning("horizon gate ON: reject entries settling > %.0fd unless edge >= %.3f",
+                    settings.exec_max_settle_days, settings.exec_longdated_min_edge)
     log.warning("matching mode: %s metrics=%s (MATCH_USE_FINGERPRINT/MATCH_COMBINE_VERDICTS)",
                 ("fingerprint+LLM verdicts UNION"
                  if settings.match_use_fingerprint and settings.match_combine_verdicts

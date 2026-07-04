@@ -294,6 +294,22 @@ class Settings:
     # Structural-imbalance alert: drained + nothing recyclable for this long -> a loud
     # log.critical telling the operator the exact manual transfer to make. 0 = off.
     exec_imbalance_alert_secs: float = 900.0
+    # ---- Early-profit exit (generalizes the recycler) ----
+    # Realize a hedged pair's locked profit BEFORE settlement whenever the two venues
+    # dislocate favorably (both exit bids recover >= entry cost + margin). Never exits
+    # below entry, so a quiet pair stays held. Frees capital months early on long-dated
+    # markets. 0 margin = exit at breakeven-vs-entry; >0 requires real profit.
+    exec_early_exit_enabled: bool = False
+    exec_early_exit_margin: float = 0.0
+    exec_early_exit_interval_secs: float = 300.0
+    exec_early_exit_cooldown_secs: float = 300.0
+    exec_early_exit_max_pairs: float = 8.0
+    exec_early_exit_max_contracts: float = 50.0
+    exec_early_exit_min_bid_depth: float = 0.0    # both legs need >= this sellable depth
+    # Capital-horizon gate: reject entries settling beyond this many days unless the edge
+    # clears exec_longdated_min_edge. Keeps thin edges from locking cash for months. 0=off.
+    exec_max_settle_days: float = 0.0
+    exec_longdated_min_edge: float = 0.0
     # Venue auto-balancing: when a venue's cash dips below exec_rebalance_floor, skip arbs
     # whose leg on THAT venue is the expensive (> $0.50) side, so new spend shifts to the
     # funded venue and the scarce side's cash lasts until settlements replenish it. Same edge
@@ -470,6 +486,15 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_recycle_cooldown_secs=_env_float("EXEC_RECYCLE_COOLDOWN_SECS", 300.0),
         exec_recycle_pair_cooldown_secs=_env_float("EXEC_RECYCLE_PAIR_COOLDOWN_SECS", 3600.0),
         exec_imbalance_alert_secs=_env_float("EXEC_IMBALANCE_ALERT_SECS", 900.0),
+        exec_early_exit_enabled=(env("EXEC_EARLY_EXIT_ENABLED", "false") or "false").lower() == "true",
+        exec_early_exit_margin=_env_float("EXEC_EARLY_EXIT_MARGIN", 0.0),
+        exec_early_exit_interval_secs=_env_float("EXEC_EARLY_EXIT_INTERVAL_SECS", 300.0),
+        exec_early_exit_cooldown_secs=_env_float("EXEC_EARLY_EXIT_COOLDOWN_SECS", 300.0),
+        exec_early_exit_max_pairs=_env_float("EXEC_EARLY_EXIT_MAX_PAIRS", 8.0),
+        exec_early_exit_max_contracts=_env_float("EXEC_EARLY_EXIT_MAX_CONTRACTS", 50.0),
+        exec_early_exit_min_bid_depth=_env_float("EXEC_EARLY_EXIT_MIN_BID_DEPTH", 0.0),
+        exec_max_settle_days=_env_float("EXEC_MAX_SETTLE_DAYS", 0.0),
+        exec_longdated_min_edge=_env_float("EXEC_LONGDATED_MIN_EDGE", 0.0),
         exec_rebalance_floor=_env_float("EXEC_REBALANCE_FLOOR", 0.0),
         exec_probe_contracts=_env_float("EXEC_PROBE_CONTRACTS", 0.0),
         exec_market_proven_fills=int(_env_float("EXEC_MARKET_PROVEN_FILLS", 3)),

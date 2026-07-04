@@ -2053,3 +2053,125 @@ def test_effective_balance_gates_only():
     # sizing caps unchanged: cash_yes still uses REAL $10
     _, caps = ex._max_size(o)
     assert caps["cash_yes"] <= 10.0 / 0.17 + 1e-6
+
+
+# ---------------- early-profit exit (generalized recycler) ----------------
+
+def _ee_exec(venues, store, **kw):
+    ex, risk = make_exec(venues, max_order_contracts=0, store=store, **kw)
+    ex.early_exit_enabled = True
+    ex.early_exit_margin = 0.0
+    ex.early_exit_cooldown = 0.0
+    ex.early_exit_max_pairs = 8.0
+    ex.early_exit_max_contracts = 100.0
+    ex.early_exit_min_bid_depth = 0.0
+    return ex, risk
+
+
+def test_entry_cost_for_pair_order_independent():
+    store = Store(":memory:")
+    from types import SimpleNamespace
+    store.record_opportunity(SimpleNamespace(
+        event_key="e", buy_yes_venue="kalshi", buy_yes_market="K1",
+        buy_no_venue="poly", buy_no_market="p1", yes_price=0.40, no_price=0.55,
+        edge_per_contract=0.05, max_contracts=10, total_profit=0.5), acted=True)
+    assert store.entry_cost_for_pair("kalshi", "K1", "poly", "p1") == (0.40, 0.55)
+    assert store.entry_cost_for_pair("poly", "p1", "kalshi", "K1") == (0.40, 0.55)  # order-independent
+    assert store.entry_cost_for_pair("kalshi", "K1", "poly", "nope") is None
+
+
+def test_plan_early_exit_fires_only_above_entry_plus_margin():
+    store = Store(":memory:")
+    ex, _ = _ee_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], store)
+    # Held hedged pair: kalshi long 20 YES, poly long 20 NO. Entry cost 0.40+0.55=0.95.
+    ex._positions = {("kalshi", "K1"): 20.0, ("poly", "p1"): -20.0}
+    pm = {("kalshi", "K1"): ("poly", "p1"), ("poly", "p1"): ("kalshi", "K1")}
+    pk = ex._rpair_key("kalshi", "K1", "poly", "p1")
+    entry = {pk: (0.40, 0.55)}
+    # Books dislocated favorably: YES@kalshi bid 0.60 (no_ask 0.40), NO@poly bid 0.50 (yes_ask 0.50)
+    # exit_value = 0.60 + 0.50 - fees(0) = 1.10 > entry 0.95 -> fire
+    good = {("kalshi", "K1"): _q("kalshi", "K1", no_ask=0.40),
+            ("poly", "p1"): _q("poly", "p1", yes_ask=0.50)}
+    acts = ex.plan_early_exit(pm, good, entry)
+    assert len(acts) == 1 and acts[0]["qty"] == 20.0 and acts[0]["gain"] > 0.14
+    # Quiet market BELOW entry: asks 0.60+0.50 -> exit 0.40+0.50=0.90 < entry 0.95 -> hold
+    flat = {("kalshi", "K1"): _q("kalshi", "K1", no_ask=0.60),
+            ("poly", "p1"): _q("poly", "p1", yes_ask=0.50)}
+    assert ex.plan_early_exit(pm, flat, entry) == []
+    # margin requirement: exit 0.98 (gain 0.03) meets a 0.03 margin exactly -> fires;
+    # raise the margin to 0.05 and the same book no longer qualifies -> hold
+    fair = {("kalshi", "K1"): _q("kalshi", "K1", no_ask=0.44),
+            ("poly", "p1"): _q("poly", "p1", yes_ask=0.58)}   # exit 0.56+0.42=0.98, gain 0.03
+    ex.early_exit_margin = 0.03
+    assert len(ex.plan_early_exit(pm, fair, entry)) == 1
+    ex.early_exit_margin = 0.05
+    assert ex.plan_early_exit(pm, fair, entry) == []
+
+
+def test_plan_early_exit_no_entry_cost_skips():
+    store = Store(":memory:")
+    ex, _ = _ee_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], store)
+    ex._positions = {("kalshi", "K1"): 20.0, ("poly", "p1"): -20.0}
+    pm = {("kalshi", "K1"): ("poly", "p1"), ("poly", "p1"): ("kalshi", "K1")}
+    good = {("kalshi", "K1"): _q("kalshi", "K1", no_ask=0.20),
+            ("poly", "p1"): _q("poly", "p1", yes_ask=0.20)}
+    assert ex.plan_early_exit(pm, good, {}) == []            # no cost basis -> can't judge
+
+
+def test_plan_early_exit_respects_busy_and_min_depth():
+    store = Store(":memory:")
+    ex, _ = _ee_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], store)
+    ex._positions = {("kalshi", "K1"): 20.0, ("poly", "p1"): -20.0}
+    pm = {("kalshi", "K1"): ("poly", "p1"), ("poly", "p1"): ("kalshi", "K1")}
+    entry = {ex._rpair_key("kalshi", "K1", "poly", "p1"): (0.40, 0.55)}
+    good = {("kalshi", "K1"): _q("kalshi", "K1", no_ask=0.30),
+            ("poly", "p1"): _q("poly", "p1", yes_ask=0.30)}
+    assert ex.plan_early_exit(pm, good, entry, busy=frozenset({("kalshi", "K1")})) == []
+    # min depth gate: quote sizes are 100 (from _q); require 200 -> skipped
+    ex.early_exit_min_bid_depth = 200.0
+    assert ex.plan_early_exit(pm, good, entry) == []
+
+
+def test_early_exit_books_realized_profit_via_recycle_one():
+    # exit_value - entry = realized profit; _recycle_one books delta-vs-$1 which, added
+    # to the entry-time lock, equals that realized profit.
+    kalshi = FakeVenue("kalshi", [
+        res("kalshi", Side.YES, OrderStatus.FILLED, 20, 0.60, action="sell", requested=20)])
+    poly = FakeVenue("poly", [
+        res("poly", Side.NO, OrderStatus.FILLED, 20, 0.50, action="sell", requested=20)])
+    store = Store(":memory:")
+    ex, risk = _ee_exec([kalshi, poly], store)
+    ex._positions = {("kalshi", "K1"): 20.0, ("poly", "p1"): -20.0}
+    a = {"event": "kalshi:K1|poly:p1 (early-exit)",
+         "itm": ("kalshi", "K1", Side.YES, 0.60),
+         "otm": ("poly", "p1", Side.NO, 0.50), "qty": 20.0, "gain": 0.15, "solo": False}
+    r = asyncio.run(ex._recycle_one(a))
+    # delta-vs-$1 = 20*0.60 + 20*0.50 - 20 = +2.00 (zero-fee). Entry lock was 20*(1-0.95)=+1.00.
+    # total realized = +3.00 = 20*(exit 1.10 - entry 0.95). delta booked = +2.00.
+    assert abs(r["delta"] - 2.00) < 1e-6
+    assert abs(risk.daily_pnl - 2.00) < 1e-6
+    row = store.conn.execute("SELECT note FROM pnl ORDER BY id DESC LIMIT 1").fetchone()
+    assert "early exit" in row["note"] or "capital recycle" in row["note"]
+
+
+def test_horizon_gate_blocks_thin_longdated_entry():
+    import time as _time
+    yes = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
+    ex, _ = make_exec([yes, no])
+    ex.max_settle_days = 30.0
+    ex.longdated_min_edge = 0.05
+    o = opp()
+    o.edge_per_contract = 0.02                    # thin
+    o.settle_ts = _time.time() + 90 * 86400       # 90 days out
+    assert asyncio.run(ex.execute(o)).status is ExecStatus.SKIPPED
+    # fat edge on the same long-dated market -> allowed
+    o.edge_per_contract = 0.08
+    assert asyncio.run(ex.execute(o)).status is ExecStatus.SUCCESS
+    # near-dated thin edge -> allowed (fresh venues so the scripted fills aren't drained)
+    yes2 = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    no2 = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
+    ex2, _ = make_exec([yes2, no2])
+    ex2.max_settle_days = 30.0; ex2.longdated_min_edge = 0.05
+    o2 = opp(); o2.edge_per_contract = 0.02; o2.settle_ts = _time.time() + 5 * 86400
+    assert asyncio.run(ex2.execute(o2)).status is ExecStatus.SUCCESS

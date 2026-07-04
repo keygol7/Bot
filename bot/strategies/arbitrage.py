@@ -46,6 +46,8 @@ class ArbOpportunity:
     notional: float            # capital deployed = gross_cost * max_contracts
     yes_size: float = 0.0      # YES leg's own top-of-book depth (0 = unknown)
     no_size: float = 0.0       # NO leg's own top-of-book depth (0 = unknown)
+    settle_ts: float = 0.0     # earliest leg close_time (epoch s); 0 = unknown. Used by
+                               # the horizon gate + early-exit prioritization.
     fresh_ts: float = 0.0      # wall-clock ts of the OLDEST leg quote backing this opp
                                # (both legs WS-fresh); 0 = unknown/stale -> re-read books
 
@@ -112,6 +114,8 @@ def _build(
         total_fees=total_fees,
         total_profit=total_profit,
         notional=gross_cost * max_contracts,
+        settle_ts=min([t for t in (yes_q.close_time, no_q.close_time) if t is not None],
+                      default=0.0),
     )
 
 
