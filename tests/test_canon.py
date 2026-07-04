@@ -157,3 +157,5 @@ def test_lenient_json_repairs_trailing_comma_and_comments():
     assert _lenient_json('{"a": 1, "b": 2}') == {"a": 1, "b": 2}
     assert _lenient_json('{"a": 1, "b": 2,}') == {"a": 1, "b": 2}         # trailing comma
     assert _lenient_json('{"a": 1, // note\n "b": 2}') == {"a": 1, "b": 2}  # line comment
+    assert _lenient_json('{"a": 1, /* why */ "b": 2}') == {"a": 1, "b": 2}   # block comment
+    assert _lenient_json('{"d": "x", /* multi\nline */ "b": 2}') == {"d": "x", "b": 2}

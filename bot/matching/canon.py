@@ -97,16 +97,33 @@ def _lenient_json(s: str) -> dict:
     try:
         return json.loads(s)
     except ValueError:
-        repaired = re.sub(r"//[^\n]*", "", s)               # strip // comments
-        repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)  # strip trailing commas
+        repaired = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)  # strip /* block */ comments
+        repaired = re.sub(r"//[^\n]*", "", repaired)            # strip // line comments
+        repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)      # strip trailing commas
         return json.loads(repaired)
 
 
 def extract_canon(complete: CompleteFn, *, venue: str, market_id: str,
-                  title: str, rules: str) -> Canon | None:
-    """One LLM extraction -> Canon, or None (fail closed) on anything unparseable."""
+                  title: str, rules: str, attempts: int = 3) -> Canon | None:
+    """One LLM extraction -> Canon, or None (fail closed) on anything unparseable.
+
+    The local model is non-deterministic and emits malformed JSON on a minority of
+    calls (unquoted keys, stray text) — the SAME prompt parses fine on a re-roll. Retry
+    a few times before giving up so a good market isn't lost to a one-off bad generation.
+    """
     prompt = _PROMPT.format(venue=venue, title=(title or "")[:300],
                             rules=(rules or "")[:1500])
+    last_exc = None
+    for attempt in range(attempts):
+        c = _extract_once(complete, prompt, venue, market_id)
+        if c is not None:
+            return c
+    log.warning("canon parse failed for %s after %d attempts", market_id, attempts)
+    return None
+
+
+def _extract_once(complete: CompleteFn, prompt: str, venue: str,
+                  market_id: str) -> Canon | None:
     try:
         raw = complete(prompt)
     except Exception as exc:
@@ -134,7 +151,7 @@ def extract_canon(complete: CompleteFn, *, venue: str, market_id: str,
             confidence=float(obj.get("confidence") or 0.0),
         )
     except (ValueError, TypeError, KeyError) as exc:
-        log.warning("canon parse failed for %s: %s", market_id, exc)
+        log.debug("canon parse attempt failed for %s: %s", market_id, exc)
         return None
 
 
