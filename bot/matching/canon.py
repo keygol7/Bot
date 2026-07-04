@@ -122,6 +122,16 @@ _TITLE_METRIC_HINTS = (            # generic metric + title keyword -> real metr
     (("gdp",), "gdp_growth"),
 )
 _GENERIC_METRICS = frozenset({"other", "value", "increase", "change", "rate", "number"})
+# Generic PARTY/organization subjects that do NOT identify a specific race. An election
+# market whose YES pays "the Republican party" is ambiguous across every race on the
+# same date — and Poly extracts these as bare "republican party nominee" with NO
+# state/office in entities, so "Alaska governor / Republican" would join "Iowa senate /
+# Republican". Candidate-level markets (subject "steve hilton") are unaffected. Until a
+# deterministic race key (office+state) is parsed from both venues' ids, party-subject
+# election joins are rejected — they are exactly the unidentifiable-race false matches.
+_PARTY_TOKENS = frozenset({"republican", "democratic", "democrat", "gop", "party",
+                           "nominee", "labour", "conservative", "green", "independent",
+                           "libertarian", "coalition", "union"})
 _COMPARATORS = frozenset({">=", "<=", ">", "<", "=="})
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -313,4 +323,15 @@ def complementary(a: Canon, b: Canon, *, min_confidence: float = 0.7) -> bool:
         pass
     elif not _subjects_align(a.subject, b.subject):
         return False
+    # Election party-subject guard: a subject made ONLY of party/generic tokens doesn't
+    # identify the race, so it can't be safely joined cross-venue (Poly drops the
+    # state/office). Reject rather than risk pairing different races of the same party.
+    if a.event_type == "election" and (_is_party_subject(a.subject)
+                                       or _is_party_subject(b.subject)):
+        return False
     return _events_align(a, b)
+
+
+def _is_party_subject(subject: str | None) -> bool:
+    toks = _tokens(subject)
+    return bool(toks) and toks <= _PARTY_TOKENS

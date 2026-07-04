@@ -379,3 +379,23 @@ def test_recycle_remnant_roundtrip():
     s.record_recycle_remnant("kalshi", "K1", 3.0)
     s.clear_recycle_remnant("kalshi", "K1")
     assert s.recycle_remnants() == {}
+
+
+def test_prune_stale_markets():
+    import time as _t
+    s = Store(":memory:")
+    now = _t.time()
+    s.conn.execute("INSERT INTO markets (venue, market_id, title, updated_at) VALUES (?,?,?,?)",
+                   ("kalshi", "LIVE", "live", now))
+    s.conn.execute("INSERT INTO markets (venue, market_id, title, updated_at) VALUES (?,?,?,?)",
+                   ("kalshi", "STALE", "stale", now - 10 * 86400))
+    s.conn.execute("INSERT INTO markets (venue, market_id, title, updated_at) VALUES (?,?,?,?)",
+                   ("kalshi", "STALE_CANON", "stale but canon'd", now - 10 * 86400))
+    s.conn.commit()
+    from bot.matching.canon import Canon
+    s.record_canon(Canon("kalshi", "STALE_CANON", "election", ("x",), "x", "winner",
+                          None, None, "full", "2026-11-03", 0.9))
+    pruned = s.prune_stale_markets(older_than_days=7.0)
+    assert pruned == 1                                          # only STALE (not canon'd)
+    ids = {r["market_id"] for r in s.conn.execute("SELECT market_id FROM markets")}
+    assert ids == {"LIVE", "STALE_CANON"}                      # live + canon-referenced kept

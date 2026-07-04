@@ -1865,6 +1865,7 @@ def _rec_exec(venues, **kw):
     ex.recycle_floor, ex.recycle_itm_bid, ex.recycle_max_cost = 40.0, 0.90, 0.03
     ex.recycle_max_contracts, ex.recycle_target = 50.0, 0.0
     ex.recycle_cooldown, ex.recycle_pair_cooldown = 0.0, 3600.0
+    ex.recycle_max_settle_days = 0.0    # off by default; horizon test sets it
     return ex, risk
 
 
@@ -2200,3 +2201,26 @@ def test_early_exit_skips_near_dated_pairs():
     # unknown close_time -> conservative skip (can't confirm the fee is worth it)
     und_k = _q("kalshi", "K1", no_ask=0.40); und_p = _q("poly", "p1", yes_ask=0.50)
     assert ex.plan_early_exit(pm, {("kalshi","K1"): und_k, ("poly","p1"): und_p}, entry) == []
+
+
+def test_recycle_skips_fardated_undecided_favorite():
+    import time as _time
+    store = Store(":memory:")
+    ex, _ = _rec_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], store=store)
+    ex.recycle_max_settle_days = 3.0
+    ex.recycle_decided_bid = 0.98
+    ex._balances = {"kalshi": 8.0, "poly": 380.0}
+    ex._positions = {("kalshi", "K1"): 20.0, ("poly", "p1"): -20.0}
+    pm = {("kalshi", "K1"): ("poly", "p1"), ("poly", "p1"): ("kalshi", "K1")}
+    # pre-decision favorite (0.92 ITM) settling in 30 days (a months-out election) -> skip
+    far = _q("kalshi", "K1", no_ask=0.08); far.close_time = _time.time() + 30 * 86400
+    farc = _q("poly", "p1", yes_ask=0.94); farc.close_time = _time.time() + 30 * 86400
+    assert ex.plan_recycle("kalshi", pm, {("kalshi","K1"): far, ("poly","p1"): farc}) == []
+    # same far date but near-certain (0.99) -> decided, allowed
+    cert = _q("kalshi", "K1", no_ask=0.01); cert.close_time = _time.time() + 30 * 86400
+    certc = _q("poly", "p1", yes_ask=0.99); certc.close_time = _time.time() + 30 * 86400
+    assert len(ex.plan_recycle("kalshi", pm, {("kalshi","K1"): cert, ("poly","p1"): certc})) == 1
+    # near-dated favorite (settles today) at 0.92 -> decided/imminent, allowed
+    near = _q("kalshi", "K1", no_ask=0.08); near.close_time = _time.time() + 3600
+    nearc = _q("poly", "p1", yes_ask=0.94); nearc.close_time = _time.time() + 3600
+    assert len(ex.plan_recycle("kalshi", pm, {("kalshi","K1"): near, ("poly","p1"): nearc})) == 1

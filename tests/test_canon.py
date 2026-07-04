@@ -226,3 +226,25 @@ def test_id_threshold_override_beats_llm():
     assert _id_threshold("KXGDPYEAR-30-T6.0") == (">", 6.0)
     assert _id_threshold("aec-valorant-rbn-ep-2026-07-02") is None     # no threshold
     assert _id_threshold("KXVALORANTGAME-26JUL021330EPRBN-RBN") is None
+
+
+def test_election_party_subject_rejected_candidate_kept():
+    from bot.matching.canon import complementary
+    # PARTY-level: Alaska governor / Republican vs Iowa senate / Republican (the live
+    # false match) — same party, same date, different race. Must NOT join.
+    ak = _canon("kalshi", "KXGOVPARTYAK-26-R", event_type="election", metric="winner",
+                comparator=None, value=None, subject="republican party",
+                entities=("alaska governor", "republican party"), date="2026-11-03")
+    ia = _canon("polymarket_us", "ewc-usse-ia-2026-11-03-rep", event_type="election",
+                metric="winner", comparator=None, value=None,
+                subject="republican party nominee",
+                entities=("republican party nominee",), date="2026-11-03")
+    assert complementary(ak, ia) is False
+    # CANDIDATE-level: California governor / Steve Hilton on both — must STILL join.
+    k = _canon("kalshi", "KXGOVCA-26-SHIL", event_type="election", metric="winner",
+               comparator=None, value=None, subject="steve hilton",
+               entities=("steve hilton", "california governor"), date="2026-11-03")
+    p = _canon("polymarket_us", "ewc-usgub-ca-2026-11-03-stehil", event_type="election",
+               metric="winner", comparator=None, value=None, subject="steve hilton",
+               entities=("steve hilton",), date="2026-11-03")
+    assert complementary(k, p) is True

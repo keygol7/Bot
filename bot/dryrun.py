@@ -743,6 +743,8 @@ async def stream(
         recycle_target=settings.exec_recycle_target,
         recycle_cooldown=settings.exec_recycle_cooldown_secs,
         recycle_pair_cooldown=settings.exec_recycle_pair_cooldown_secs,
+        recycle_max_settle_days=settings.exec_recycle_max_settle_days,
+        recycle_decided_bid=settings.exec_recycle_decided_bid,
         early_exit_enabled=settings.exec_early_exit_enabled,
         early_exit_margin=settings.exec_early_exit_margin,
         early_exit_cooldown=settings.exec_early_exit_cooldown_secs,
@@ -1064,6 +1066,12 @@ async def stream(
                     ok, bad = store.settlement_consistency()
                     log.info("settlement truth: %d new check(s); track record "
                              "%d consistent / %d divergent", n, ok, bad)
+                # Housekeeping: drop markets not scanned in a week (dead/settled) so the
+                # sweep + canon scans and RAM don't grow unbounded. Preserves markets
+                # referenced by a canon extraction or verdict.
+                pruned = store.prune_stale_markets(older_than_days=7.0)
+                if pruned:
+                    log.info("pruned %d stale market rows (>7d unscanned)", pruned)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

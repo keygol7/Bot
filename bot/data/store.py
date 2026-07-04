@@ -846,6 +846,25 @@ class Store:
             pairs = drop_fanout_pairs(pairs, max_fanout=max_fanout)
         return pairs
 
+    def prune_stale_markets(self, older_than_days: float = 7.0) -> int:
+        """Bulk-delete markets not scanned in ``older_than_days`` — they're no longer live
+        (the scan refreshes updated_at for every current market each cycle), so they only
+        bloat the fingerprint-sweep/canon scans and RAM. Preserves markets referenced by
+        a cached CANON extraction (the join reads market_canon, but keep the pair for
+        settled-leg realization) and by any confirmed verdict. Returns rows deleted."""
+        cutoff = time.time() - older_than_days * 86400.0
+        cur = self.conn.execute(
+            """DELETE FROM markets WHERE updated_at < ?
+               AND NOT EXISTS (SELECT 1 FROM market_canon c
+                               WHERE c.venue = markets.venue AND c.market_id = markets.market_id)
+               AND NOT EXISTS (SELECT 1 FROM match_verdicts v
+                               WHERE (v.venue_a = markets.venue AND v.market_a = markets.market_id)
+                                  OR (v.venue_b = markets.venue AND v.market_b = markets.market_id))""",
+            (cutoff,))
+        n = cur.rowcount
+        self.conn.commit()
+        return n
+
     def prune_market(self, venue: str, market_id: str) -> int:
         """Delete a settled/closed market and every cached verdict referencing it.
 

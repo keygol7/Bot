@@ -136,6 +136,8 @@ class Executor:
         recycle_target: float = 0.0,
         recycle_cooldown: float = 300.0,
         recycle_pair_cooldown: float = 3600.0,
+        recycle_max_settle_days: float = 0.0,
+        recycle_decided_bid: float = 0.98,
         early_exit_enabled: bool = False,
         early_exit_margin: float = 0.0,
         early_exit_cooldown: float = 300.0,
@@ -236,6 +238,13 @@ class Executor:
         self.recycle_pair_cooldown = recycle_pair_cooldown
         self._recycled_until: dict[tuple, float] = {}   # pair key -> rebuy-cooldown expiry
         self._last_recycle_ts: float = 0.0
+        # Don't recycle a pair settling more than this far out UNLESS its ITM leg is
+        # near-certain (>= recycle_decided_bid). Blocks recycling an UNDECIDED long-dated
+        # favorite (a months-out election at 0.92) — its price isn't a settled outcome,
+        # and the rebalance gate wants settlement, not an early sale, to replenish the
+        # venue. Near-dated games (decided/imminent) recycle at any ITM bid. 0 = no limit.
+        self.recycle_max_settle_days = recycle_max_settle_days
+        self.recycle_decided_bid = recycle_decided_bid
         # Early-profit exit: generalizes the recycler to realize a hedged pair's locked
         # profit BEFORE settlement whenever the two venues dislocate favorably (both
         # exit bids recover >= entry cost + margin). No drained-venue precondition.
@@ -856,6 +865,14 @@ class Executor:
                 itm_bid = round(1.0 - q.yes_ask, 4)
             if itm_bid is None or itm_bid < self.recycle_itm_bid:
                 continue
+            # Horizon guard: a far-dated pair's ITM bid is a pre-decision favorite price,
+            # not a settled outcome — don't sell it early (churn vs the rebalance gate's
+            # settlement plan). Recycle it only if near-certain (>= decided bid). Near-
+            # dated pairs (decided/imminent) always pass.
+            if self.recycle_max_settle_days > 0 and itm_bid < self.recycle_decided_bid:
+                close = q.close_time
+                if close and (close - time.time()) > self.recycle_max_settle_days * 86400.0:
+                    continue
             counter = pair_map.get((venue, market))
             cnet = self._positions.get(counter, 0.0) if counter else 0.0
             solo = False
