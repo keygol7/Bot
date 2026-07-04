@@ -216,3 +216,13 @@ def test_legacy_rows_normalized_on_read_and_join():
                               metric="inflation_rate", comparator=">", value=3.8,
                               date="2026-06-01"))
     assert len(store.canon_pairs()) == 1
+
+
+def test_id_threshold_override_beats_llm():
+    from bot.matching.canon import _id_threshold
+    assert _id_threshold("cpic-uscpi-june-yoy-2026-07-14-gt3pt6pct") == (">", 3.6)
+    assert _id_threshold("astatc-fwc-esp-aut-2026-07-02-g-fwcalebae-gte1") == (">=", 1.0)
+    assert _id_threshold("KXCPIYOY-26JUN-T3.6") == (">", 3.6)
+    assert _id_threshold("KXGDPYEAR-30-T6.0") == (">", 6.0)
+    assert _id_threshold("aec-valorant-rbn-ep-2026-07-02") is None     # no threshold
+    assert _id_threshold("KXVALORANTGAME-26JUL021330EPRBN-RBN") is None

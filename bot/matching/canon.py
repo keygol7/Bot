@@ -163,6 +163,26 @@ def normalize_stored(metric: str | None, date: str | None,
     return m, _normalize_date(date if date and _DATE_RE.match(date) else None, et)
 
 
+# Deterministic threshold from the MARKET ID — ground truth that beats the LLM.
+# Poly encodes "greater than 3.6%" as ...-gt3pt6pct (gte = >=); Kalshi's T-series
+# suffix -T3.6 means "above 3.6" (>). The model non-deterministically drops the
+# threshold on a minority of extractions; the id never lies.
+_POLY_THRESH = re.compile(r"-(gte|gt|lte|lt)(\d+)(?:pt(\d+))?", re.IGNORECASE)
+_KALSHI_T = re.compile(r"-T(\d+(?:\.\d+)?)$")
+_ID_CMP = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+
+
+def _id_threshold(market_id: str) -> tuple[str, float] | None:
+    m = _POLY_THRESH.search(market_id or "")
+    if m:
+        val = float(f"{m.group(2)}.{m.group(3)}" if m.group(3) else m.group(2))
+        return _ID_CMP[m.group(1).lower()], val
+    m = _KALSHI_T.search(market_id or "")
+    if m:
+        return ">", float(m.group(1))
+    return None
+
+
 def _lenient_json(s: str) -> dict:
     """Parse LLM JSON, repairing the two failures we see in the wild: trailing commas
     (``... "x": 1, }``) and ``// line comments``. Local models emit these on ~5% of
@@ -217,6 +237,11 @@ def _extract_once(complete: CompleteFn, prompt: str, venue: str,
         comparator = str(obj["comparator"]).strip() if obj.get("comparator") else None
         if comparator is not None and comparator not in _COMPARATORS:
             comparator = None                       # unknown symbol -> not a threshold
+        # Market-id threshold override: the id encodes the threshold deterministically
+        # (poly -gt3pt6pct, kalshi -T3.6); it beats a non-deterministic LLM read.
+        idt = _id_threshold(market_id)
+        if idt is not None:
+            comparator, value = idt[0], idt[1]
         return Canon(
             venue=venue, market_id=market_id,
             event_type=event_type,
