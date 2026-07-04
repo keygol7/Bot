@@ -2065,6 +2065,7 @@ def _ee_exec(venues, store, **kw):
     ex.early_exit_max_pairs = 8.0
     ex.early_exit_max_contracts = 100.0
     ex.early_exit_min_bid_depth = 0.0
+    ex.early_exit_min_settle_days = 0.0     # undated test quotes -> disable horizon gate here
     return ex, risk
 
 
@@ -2175,3 +2176,27 @@ def test_horizon_gate_blocks_thin_longdated_entry():
     ex2.max_settle_days = 30.0; ex2.longdated_min_edge = 0.05
     o2 = opp(); o2.edge_per_contract = 0.02; o2.settle_ts = _time.time() + 5 * 86400
     assert asyncio.run(ex2.execute(o2)).status is ExecStatus.SUCCESS
+
+
+def test_early_exit_skips_near_dated_pairs():
+    import time as _time
+    store = Store(":memory:")
+    ex, _ = _ee_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], store)
+    ex.early_exit_min_settle_days = 3.0        # only unwind pairs locked >= 3 days
+    ex._positions = {("kalshi", "K1"): 20.0, ("poly", "p1"): -20.0}
+    pm = {("kalshi", "K1"): ("poly", "p1"), ("poly", "p1"): ("kalshi", "K1")}
+    entry = {ex._rpair_key("kalshi", "K1", "poly", "p1"): (0.40, 0.55)}
+    # profitable exit (0.60+0.50=1.10 > entry 0.95) but settles TOMORROW -> skip
+    def q(mid, **kw):
+        z = _q("kalshi" if mid == "K1" else "poly", mid, **kw)
+        return z
+    near_k = _q("kalshi", "K1", no_ask=0.40); near_k.close_time = _time.time() + 1 * 86400
+    near_p = _q("poly", "p1", yes_ask=0.50);   near_p.close_time = _time.time() + 1 * 86400
+    assert ex.plan_early_exit(pm, {("kalshi","K1"): near_k, ("poly","p1"): near_p}, entry) == []
+    # same book but settles in 10 days -> eligible
+    far_k = _q("kalshi", "K1", no_ask=0.40); far_k.close_time = _time.time() + 10 * 86400
+    far_p = _q("poly", "p1", yes_ask=0.50);   far_p.close_time = _time.time() + 10 * 86400
+    assert len(ex.plan_early_exit(pm, {("kalshi","K1"): far_k, ("poly","p1"): far_p}, entry)) == 1
+    # unknown close_time -> conservative skip (can't confirm the fee is worth it)
+    und_k = _q("kalshi", "K1", no_ask=0.40); und_p = _q("poly", "p1", yes_ask=0.50)
+    assert ex.plan_early_exit(pm, {("kalshi","K1"): und_k, ("poly","p1"): und_p}, entry) == []

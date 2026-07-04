@@ -314,6 +314,7 @@ class Settings:
     exec_early_exit_max_pairs: float = 8.0
     exec_early_exit_max_contracts: float = 50.0
     exec_early_exit_min_bid_depth: float = 0.0    # both legs need >= this sellable depth
+    exec_early_exit_min_settle_days: float = 3.0  # only unwind pairs locked >= this long
     # Capital-horizon gate: reject entries settling beyond this many days unless the edge
     # clears exec_longdated_min_edge. Keeps thin edges from locking cash for months. 0=off.
     exec_max_settle_days: float = 0.0
@@ -507,6 +508,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_early_exit_max_pairs=_env_float("EXEC_EARLY_EXIT_MAX_PAIRS", 8.0),
         exec_early_exit_max_contracts=_env_float("EXEC_EARLY_EXIT_MAX_CONTRACTS", 50.0),
         exec_early_exit_min_bid_depth=_env_float("EXEC_EARLY_EXIT_MIN_BID_DEPTH", 0.0),
+        exec_early_exit_min_settle_days=_env_float("EXEC_EARLY_EXIT_MIN_SETTLE_DAYS", 3.0),
         exec_max_settle_days=_env_float("EXEC_MAX_SETTLE_DAYS", 0.0),
         exec_longdated_min_edge=_env_float("EXEC_LONGDATED_MIN_EDGE", 0.0),
         exec_rebalance_floor=_env_float("EXEC_REBALANCE_FLOOR", 0.0),

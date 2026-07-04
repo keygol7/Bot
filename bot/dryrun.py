@@ -749,6 +749,7 @@ async def stream(
         early_exit_max_pairs=settings.exec_early_exit_max_pairs,
         early_exit_max_contracts=settings.exec_early_exit_max_contracts,
         early_exit_min_bid_depth=settings.exec_early_exit_min_bid_depth,
+        early_exit_min_settle_days=settings.exec_early_exit_min_settle_days,
         max_settle_days=settings.exec_max_settle_days,
         longdated_min_edge=settings.exec_longdated_min_edge,
         probe_contracts=settings.exec_probe_contracts,

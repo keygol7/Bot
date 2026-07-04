@@ -142,6 +142,7 @@ class Executor:
         early_exit_max_pairs: float = 8.0,
         early_exit_max_contracts: float = 50.0,
         early_exit_min_bid_depth: float = 0.0,
+        early_exit_min_settle_days: float = 3.0,
         max_settle_days: float = 0.0,
         longdated_min_edge: float = 0.0,
         min_lock_edge: float | None = None,
@@ -244,6 +245,10 @@ class Executor:
         self.early_exit_max_pairs = early_exit_max_pairs
         self.early_exit_max_contracts = early_exit_max_contracts
         self.early_exit_min_bid_depth = early_exit_min_bid_depth
+        # Only early-exit pairs settling at least this far out — a near-dated pair pays
+        # full value in hours, so paying exit fees to unwind it early is pure leakage;
+        # early-exit's value is freeing capital locked for DAYS/months, not hours.
+        self.early_exit_min_settle_days = early_exit_min_settle_days
         self._last_early_exit_ts: float = 0.0
         # Capital-horizon gate: reject entries settling beyond max_settle_days unless the
         # edge clears longdated_min_edge (a fat edge justifies the long capital lock).
@@ -995,6 +1000,16 @@ class Executor:
             q, cq = quotes.get((venue, market)), quotes.get(counter)
             if q is None or cq is None:
                 continue
+            # Settlement-horizon gate: only unwind pairs LOCKED for a while. A pair
+            # settling in hours pays full value imminently — paying exit fees to beat
+            # that is leakage. Require a KNOWN close_time far enough out (unknown = skip,
+            # since we can't confirm the fee is worth it).
+            if self.early_exit_min_settle_days > 0:
+                closes = [t for t in (q.close_time, cq.close_time) if t]
+                nearest = min(closes) if closes else None
+                if nearest is None or (nearest - time.time()) < (
+                        self.early_exit_min_settle_days * 86400.0):
+                    continue
 
             def _bid(quote, held):               # held side's sellable bid + its depth
                 if held is Side.YES and quote.no_ask is not None:
