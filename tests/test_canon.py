@@ -150,3 +150,10 @@ def test_nonsport_canon_pair_survives_confirmed_pairs():
     want = store._pair_key("kalshi", "KXCPIYOY-26NOV-T5.0",
                            "polymarket_us", "cpi-yoy-nov-2026-5")
     assert want in keys                                           # not dropped by allowlist
+
+
+def test_lenient_json_repairs_trailing_comma_and_comments():
+    from bot.matching.canon import _lenient_json
+    assert _lenient_json('{"a": 1, "b": 2}') == {"a": 1, "b": 2}
+    assert _lenient_json('{"a": 1, "b": 2,}') == {"a": 1, "b": 2}         # trailing comma
+    assert _lenient_json('{"a": 1, // note\n "b": 2}') == {"a": 1, "b": 2}  # line comment

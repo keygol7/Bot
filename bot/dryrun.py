@@ -1131,17 +1131,30 @@ async def stream(
         while True:
             await asyncio.sleep(150)
             try:
-                # Select markets NOT YET extracted, recent first. The old "recent 600"
-                # window was saturated by constantly-updating sports books, so static
-                # non-sports markets (elections/CPI rarely change updated_at) never
-                # entered it and were never extracted. A LEFT JOIN on the cache sweeps
-                # every un-extracted market exactly once, regardless of churn.
+                # Select un-extracted markets, NON-SPORTS FIRST. Two reasons non-sports
+                # was starved: (1) the old recency window was saturated by constantly-
+                # updating sports books, and (2) even un-extracted, sports outnumber
+                # non-sports and sort ahead by updated_at. But sports is matched by the
+                # fingerprint sweep WITHOUT canon — canon exists ONLY for non-sports, so
+                # prioritize it. Non-sports is identifiable by title keyword on BOTH
+                # venues (CPI/GDP/Nobel/IPO/Oscar/election...). LEFT JOIN sweeps each
+                # market once regardless of churn.
+                kw = ("CPI", "GDP", "NOBEL", "OSCAR", "IPO", "SENATE", "GOVERNOR",
+                      "MIDTERM", "ELECTION", "PRESIDENT", "LOVE ISLAND", "INFLATION",
+                      "RIKSBANK", "PRICE OF")
+                like = " OR ".join("upper(m.title) LIKE '%%%s%%'" % k for k in kw)
+                # Only consider RECENTLY-SCANNED markets (last 2 days) — the markets table
+                # accumulates ~100k+ stale rows from history that are no longer tradeable;
+                # canonicalizing them wastes budget and the ORDER BY would sort the whole
+                # table each pass. Recent scan => fresh updated_at, so current markets qualify.
+                recent_floor = time.time() - 2 * 86400
                 pool = store.conn.execute(
                     "SELECT m.venue, m.market_id, m.title FROM markets m "
                     "LEFT JOIN market_canon c "
                     "  ON c.venue = m.venue AND c.market_id = m.market_id "
-                    "WHERE c.market_id IS NULL "
-                    "ORDER BY m.updated_at DESC LIMIT 600").fetchall()
+                    "WHERE c.market_id IS NULL AND m.updated_at >= ? "
+                    f"ORDER BY (CASE WHEN {like} THEN 0 ELSE 1 END), "
+                    "m.updated_at DESC LIMIT 600", (recent_floor,)).fetchall()
                 budget = 12
                 done = 0
                 attempts = 0                          # cap rules-fetches per pass so a

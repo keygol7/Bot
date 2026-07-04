@@ -89,6 +89,19 @@ def _tokens(name: str | None) -> frozenset[str]:
                      if w not in _GENERIC and len(w) > 1)
 
 
+def _lenient_json(s: str) -> dict:
+    """Parse LLM JSON, repairing the two failures we see in the wild: trailing commas
+    (``... "x": 1, }``) and ``// line comments``. Local models emit these on ~5% of
+    extractions (seen on the Love Island winner markets), which otherwise fail-close and
+    the market never canonicalizes."""
+    try:
+        return json.loads(s)
+    except ValueError:
+        repaired = re.sub(r"//[^\n]*", "", s)               # strip // comments
+        repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)  # strip trailing commas
+        return json.loads(repaired)
+
+
 def extract_canon(complete: CompleteFn, *, venue: str, market_id: str,
                   title: str, rules: str) -> Canon | None:
     """One LLM extraction -> Canon, or None (fail closed) on anything unparseable."""
@@ -103,7 +116,7 @@ def extract_canon(complete: CompleteFn, *, venue: str, market_id: str,
     if not m:
         return None
     try:
-        obj = json.loads(m.group(0))
+        obj = _lenient_json(m.group(0))
         ents = tuple(sorted(str(e).lower().strip() for e in (obj.get("entities") or [])
                             if str(e).strip()))
         subject = obj.get("subject")
