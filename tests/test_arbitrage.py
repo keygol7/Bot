@@ -118,3 +118,31 @@ def test_cross_price_edge_subtracts_fees():
     with_fee = cross_price_edge(a, b, fee_a=KalshiFeeModel(), fee_b=ZeroFeeModel())
     without = cross_price_edge(a, b)
     assert with_fee < without
+
+
+def test_settle_ts_from_id():
+    from bot.strategies.arbitrage import settle_ts_from_id
+    from datetime import datetime, timezone
+    # poly ISO date slug
+    ts = settle_ts_from_id("ewc-usgub-ca-2026-11-03-stehil")
+    assert datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d") == "2026-11-03"
+    # kalshi YYMONDD ticker
+    ts = settle_ts_from_id("KXWCGOAL-26JUL04PARFRA-FRAKMBAPP10-2")
+    assert datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d") == "2026-07-04"
+    # year-only kalshi election ticker -> no parseable date
+    assert settle_ts_from_id("KXGOVCA-26-SHIL") == 0.0
+    assert settle_ts_from_id("") == 0.0
+
+
+def test_build_settle_ts_falls_back_to_id_date():
+    # A long-dated election pair with NO close_time on either quote must still get a
+    # settle_ts from the id (the horizon gate was blind to these before).
+    from bot.strategies.arbitrage import detect_cross_venue
+    from datetime import datetime, timezone
+    a = q("kalshi", "KXGOVCA-26-SHIL", yes_ask=0.08, ya=100, no_ask=0.93, na=100)
+    b = q("polymarket_us", "ewc-usgub-ca-2026-11-03-stehil",
+          yes_ask=0.90, ya=100, no_ask=0.10, na=100)
+    opps = detect_cross_venue(a, b)
+    assert opps
+    got = datetime.fromtimestamp(opps[0].settle_ts, timezone.utc).strftime("%Y-%m-%d")
+    assert got == "2026-11-03"                          # from the poly leg's slug

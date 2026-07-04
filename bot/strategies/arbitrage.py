@@ -18,10 +18,40 @@ matcher's job (see ``bot.matching``); never trade an unconfirmed cross-venue pai
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from bot.fees import FeeModel, ZeroFeeModel, per_contract_fee
 from bot.models import MarketQuote
+
+# Settlement date parsed from a market id when the quote omits close_time — which is
+# exactly the case for long-dated non-sports markets (elections/awards return
+# close_time=None), leaving the horizon gate blind. Poly slugs carry an ISO date
+# (...-2026-11-03-...); Kalshi tickers a YYMONDD code (26JUL04).
+_ISO_DATE = re.compile(r"(20\d{2})-(\d{2})-(\d{2})")
+_KALSHI_DATE = re.compile(r"(\d{2}[A-Z]{3}\d{2})")
+
+
+def settle_ts_from_id(market_id: str) -> float:
+    """Best-effort settlement epoch from a market id, or 0.0 if none parseable."""
+    if not market_id:
+        return 0.0
+    m = _ISO_DATE.search(market_id)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                            tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+    m = _KALSHI_DATE.search(market_id.upper())
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%y%b%d").replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+    return 0.0
 
 
 @dataclass
@@ -64,6 +94,16 @@ class ArbOpportunity:
             f"(cost {self.gross_cost:.3f}) | edge/ct ${self.edge_per_contract:.4f} | "
             f"max {self.max_contracts:g} ct -> ${self.total_profit:.2f} profit"
         )
+
+
+def _pair_settle_ts(yes_q: MarketQuote, no_q: MarketQuote) -> float:
+    """Earliest settlement across both legs — prefer the venue-reported close_time, fall
+    back to the id-parsed date (so long-dated non-sports markets that omit close_time
+    still gate). 0.0 only if neither leg yields anything."""
+    cands = [t for t in (yes_q.close_time, no_q.close_time) if t]
+    cands += [t for t in (settle_ts_from_id(yes_q.market_id),
+                          settle_ts_from_id(no_q.market_id)) if t]
+    return min(cands) if cands else 0.0
 
 
 def _build(
@@ -114,8 +154,7 @@ def _build(
         total_fees=total_fees,
         total_profit=total_profit,
         notional=gross_cost * max_contracts,
-        settle_ts=min([t for t in (yes_q.close_time, no_q.close_time) if t is not None],
-                      default=0.0),
+        settle_ts=_pair_settle_ts(yes_q, no_q),
     )
 
 
