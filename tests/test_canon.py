@@ -159,3 +159,60 @@ def test_lenient_json_repairs_trailing_comma_and_comments():
     assert _lenient_json('{"a": 1, // note\n "b": 2}') == {"a": 1, "b": 2}  # line comment
     assert _lenient_json('{"a": 1, /* why */ "b": 2}') == {"a": 1, "b": 2}   # block comment
     assert _lenient_json('{"d": "x", /* multi\nline */ "b": 2}') == {"d": "x", "b": 2}
+
+
+# ---------------- canon audit fixes ----------------
+
+def test_scalar_both_none_subject_joins():
+    # THE structural bug: the prompt instructs subject=null for numeric ranges, but
+    # complementary required subject alignment unconditionally -> identical CPI
+    # contracts could NEVER join. Both-None must pass (identity via the exact fields).
+    from bot.matching.canon import complementary
+    a = _canon("kalshi", "K1", subject=None, metric="inflation_rate",
+               comparator=">", value=3.7, date="2026-06-01")
+    b = _canon("polymarket_us", "p1", subject=None, metric="inflation_rate",
+               comparator=">", value=3.7, date="2026-06-01")
+    assert complementary(a, b) is True
+    # one-sided None still rejects (entity vs non-entity contract)
+    c = _canon("polymarket_us", "p2", subject="cpi", metric="inflation_rate",
+               comparator=">", value=3.7, date="2026-06-01")
+    assert complementary(a, c) is False
+
+
+def test_metric_normalization_closed_vocab():
+    from bot.matching.canon import _normalize_metric
+    assert _normalize_metric("cpi_increase", "") == "inflation_rate"     # synonym
+    assert _normalize_metric("inflation_rate", "") == "inflation_rate"   # already canonical
+    assert _normalize_metric("value", "Will CPI inflation be above 3.7%?") == "inflation_rate"
+    assert _normalize_metric("increase", "US GDP growth in Q2") == "gdp_growth"
+    assert _normalize_metric("bananas", "Some unrelated title") == "other"  # never invented
+
+
+def test_date_normalization():
+    from bot.matching.canon import _normalize_date
+    assert _normalize_date("2026-XX-XX", "election") is None             # placeholder junk
+    assert _normalize_date("2026-11-03", "election") == "2026-11-03"
+    # econ joins at month granularity: 06-01 / 06-30 -> same bucket
+    assert _normalize_date("2026-06-01", "econ_release") == "2026-06-01"
+    assert _normalize_date("2026-06-30", "econ_release") == "2026-06-01"
+    assert _normalize_date(None, "econ_release") is None
+
+
+def test_legacy_rows_normalized_on_read_and_join():
+    # Rows extracted BEFORE the normalization layer (free-form metric, day-level dates)
+    # must join after normalize-on-read, without re-extraction.
+    from bot.data.store import Store
+    store = Store(":memory:")
+    store.record_canon(_canon("kalshi", "KXCPIYOY-26JUN-T3.7", subject=None,
+                              metric="cpi_increase", comparator=">", value=3.7,
+                              date="2026-06-30"))
+    store.record_canon(_canon("polymarket_us", "cpic-uscpi-june", subject=None,
+                              metric="inflation_rate", comparator=">", value=3.7,
+                              date="2026-06-01"))
+    pairs = store.canon_pairs()
+    assert len(pairs) == 1                                   # joined despite raw fields
+    # adjacent bucket still never joins
+    store.record_canon(_canon("polymarket_us", "cpic-uscpi-june-38", subject=None,
+                              metric="inflation_rate", comparator=">", value=3.8,
+                              date="2026-06-01"))
+    assert len(store.canon_pairs()) == 1

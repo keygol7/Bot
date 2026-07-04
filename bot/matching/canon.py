@@ -45,14 +45,28 @@ Fields (use null when not applicable):
   index/asset), lowercase canonical real-world names
 - subject: the ONE entity the YES side pays for (lowercase). null if YES is not about
   a single entity (e.g. "draw", a numeric range).
-- metric: what is measured — "winner", "goals", "assists", "points", "price_close",
-  "vote_share", "temperature", "count", "other"
-- comparator: ">=", "<=", "==" or null (winner markets have none)
+- metric: EXACTLY one of "winner", "goals", "assists", "points", "price_close",
+  "vote_share", "inflation_rate", "gdp_growth", "temperature", "count", "other".
+  Never invent a new word: CPI/inflation markets -> "inflation_rate"; GDP -> "gdp_growth".
+- comparator: ">=", "<=", ">", "<", "==" or null (winner markets have none).
+  "above X" / "more than X" -> ">".  "X or above" / "at least X" -> ">=".
+  These are DIFFERENT contracts — copy the rules' wording exactly.
 - value: the numeric threshold/line (2.5 for a -2.5 handicap; 100000 for BTC>100k;
   1 for "1 or more goals") or null
 - period: "full" (default), "1h", "2h", "et_included", "regulation", "set", "round",
   or null if unclear
-- date: the event/measurement date as YYYY-MM-DD, null if unstated
+- date: YYYY-MM-DD. For matches/awards: the event date. For econ_release: the LAST DAY
+  of the MEASUREMENT period (June CPI -> 2026-06-30), NEVER the announcement/release
+  date. Use null if unstated — never guess or use placeholders.
+
+Example (econ): "Will CPI inflation be above 3.7% for June 2026?" ->
+{{"event_type": "econ_release", "entities": ["us cpi"], "subject": null,
+  "metric": "inflation_rate", "comparator": ">", "value": 3.7, "period": "full",
+  "date": "2026-06-30", "confidence": 0.95}}
+Example (election): "Will the Democratic candidate win the 2026 Ohio governor race?" ->
+{{"event_type": "election", "entities": ["democratic party", "ohio governor race"],
+  "subject": "democratic party", "metric": "winner", "comparator": null, "value": null,
+  "period": "full", "date": "2026-11-03", "confidence": 0.9}}
 
 Respond with ONLY a JSON object:
 {{"event_type": "...", "entities": [...], "subject": "...", "metric": "...",
@@ -89,6 +103,66 @@ def _tokens(name: str | None) -> frozenset[str]:
                      if w not in _GENERIC and len(w) > 1)
 
 
+# Closed metric vocabulary + synonym normalization. The model invents variants
+# (cpi_increase / inflation_rate / increase / value / cpi for the SAME contract) and the
+# join requires EXACT equality — free-form metrics put identical contracts in different
+# buckets forever. Deterministic normalization beats prompt hope.
+_METRICS = frozenset({"winner", "goals", "assists", "points", "price_close",
+                      "vote_share", "inflation_rate", "gdp_growth", "temperature",
+                      "count", "other"})
+_METRIC_SYNONYMS = {
+    "cpi": "inflation_rate", "cpi_increase": "inflation_rate",
+    "cpi_change": "inflation_rate", "inflation": "inflation_rate",
+    "gdp": "gdp_growth", "gdp_change": "gdp_growth", "growth": "gdp_growth",
+    "win": "winner", "victory": "winner", "champion": "winner",
+    "price": "price_close", "goal": "goals", "assist": "assists", "point": "points",
+}
+_TITLE_METRIC_HINTS = (            # generic metric + title keyword -> real metric
+    (("cpi", "inflation"), "inflation_rate"),
+    (("gdp",), "gdp_growth"),
+)
+_GENERIC_METRICS = frozenset({"other", "value", "increase", "change", "rate", "number"})
+_COMPARATORS = frozenset({">=", "<=", ">", "<", "=="})
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _normalize_metric(metric: str, title: str) -> str:
+    m = (metric or "other").lower().strip().replace(" ", "_")
+    if m in _METRICS:
+        return m
+    if m in _METRIC_SYNONYMS:
+        return _METRIC_SYNONYMS[m]
+    if m in _GENERIC_METRICS or m not in _METRICS:
+        t = (title or "").lower()
+        for keys, real in _TITLE_METRIC_HINTS:
+            if any(k in t for k in keys):
+                return real
+    return "other"
+
+
+def _normalize_date(date: str | None, event_type: str) -> str | None:
+    """Strict YYYY-MM-DD or None (placeholders like 2026-XX-XX are junk). Economic
+    releases join at MONTH granularity: the model dates 'June CPI' as 06-01, 06-30 or
+    the July release day — truncate to YYYY-MM-01 so one contract lands in one bucket."""
+    if not date or not _DATE_RE.match(date):
+        return None
+    if event_type == "econ_release":
+        return date[:7] + "-01"
+    return date
+
+
+def normalize_stored(metric: str | None, date: str | None,
+                     event_type: str | None) -> tuple[str, str | None]:
+    """Normalize a LEGACY canon row read back from the db (rows extracted before the
+    normalization layer existed carry free-form metrics and raw dates). No title
+    context here, so only the synonym map + date rules apply."""
+    et = (event_type or "other").lower()
+    m = (metric or "other").lower().strip().replace(" ", "_")
+    if m not in _METRICS:
+        m = _METRIC_SYNONYMS.get(m, "other")
+    return m, _normalize_date(date if date and _DATE_RE.match(date) else None, et)
+
+
 def _lenient_json(s: str) -> dict:
     """Parse LLM JSON, repairing the two failures we see in the wild: trailing commas
     (``... "x": 1, }``) and ``// line comments``. Local models emit these on ~5% of
@@ -115,7 +189,7 @@ def extract_canon(complete: CompleteFn, *, venue: str, market_id: str,
                             rules=(rules or "")[:1500])
     last_exc = None
     for attempt in range(attempts):
-        c = _extract_once(complete, prompt, venue, market_id)
+        c = _extract_once(complete, prompt, venue, market_id, title)
         if c is not None:
             return c
     log.warning("canon parse failed for %s after %d attempts", market_id, attempts)
@@ -123,7 +197,7 @@ def extract_canon(complete: CompleteFn, *, venue: str, market_id: str,
 
 
 def _extract_once(complete: CompleteFn, prompt: str, venue: str,
-                  market_id: str) -> Canon | None:
+                  market_id: str, title: str = "") -> Canon | None:
     try:
         raw = complete(prompt)
     except Exception as exc:
@@ -139,15 +213,20 @@ def _extract_once(complete: CompleteFn, prompt: str, venue: str,
         subject = obj.get("subject")
         subject = str(subject).lower().strip() if subject else None
         value = obj.get("value")
+        event_type = str(obj.get("event_type") or "other").lower()
+        comparator = str(obj["comparator"]).strip() if obj.get("comparator") else None
+        if comparator is not None and comparator not in _COMPARATORS:
+            comparator = None                       # unknown symbol -> not a threshold
         return Canon(
             venue=venue, market_id=market_id,
-            event_type=str(obj.get("event_type") or "other").lower(),
+            event_type=event_type,
             entities=ents, subject=subject,
-            metric=str(obj.get("metric") or "other").lower(),
-            comparator=(str(obj["comparator"]) if obj.get("comparator") else None),
+            metric=_normalize_metric(str(obj.get("metric") or "other"), title),
+            comparator=comparator,
             value=(float(value) if value is not None else None),
             period=str(obj.get("period") or "full").lower(),
-            date=(str(obj["date"])[:10] if obj.get("date") else None),
+            date=_normalize_date(
+                str(obj["date"])[:10] if obj.get("date") else None, event_type),
             confidence=float(obj.get("confidence") or 0.0),
         )
     except (ValueError, TypeError, KeyError) as exc:
@@ -199,6 +278,14 @@ def complementary(a: Canon, b: Canon, *, min_confidence: float = 0.7) -> bool:
         return False
     if a.comparator != b.comparator or a.value != b.value:
         return False                                  # a -2.5 line never joins a moneyline
-    if not _subjects_align(a.subject, b.subject):
-        return False                                  # YES must pay the same party
+    # Subject: YES must pay the same party. BOTH-None is legitimate — the prompt itself
+    # instructs null for non-entity contracts (numeric ranges: "CPI above 3.7%", draws),
+    # whose identity is fully carried by the remaining exact fields (metric, comparator,
+    # value, period, date) + entity alignment below. Requiring alignment unconditionally
+    # made scalar contracts UNMATCHABLE by construction (None never aligns). One-sided
+    # None still rejects: an entity contract can't join a non-entity one.
+    if a.subject is None and b.subject is None:
+        pass
+    elif not _subjects_align(a.subject, b.subject):
+        return False
     return _events_align(a, b)

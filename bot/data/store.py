@@ -537,7 +537,7 @@ class Store:
         """Cross-venue complements from the canonical-contract join. SQL blocks by the
         exact join fields (event_type, metric, date) so the Python complement check runs
         on tiny buckets, not N^2. Pre-fan-out (the caller's shared backstop applies)."""
-        from bot.matching.canon import Canon, complementary
+        from bot.matching.canon import Canon, complementary, normalize_stored
         cutoff_date = None
         if max_past_s is not None:
             cutoff_date = time.strftime(
@@ -549,12 +549,15 @@ class Store:
                 " WHERE confidence >= ?", (min_confidence,)):
             if cutoff_date and r["date"] and r["date"] < cutoff_date:
                 continue                             # long-settled event
+            # Normalize on read: legacy rows carry free-form metrics ("cpi_increase")
+            # and raw dates; normalizing here makes them joinable without re-extraction.
+            n_metric, n_date = normalize_stored(r["metric"], r["date"], r["event_type"])
             c = Canon(venue=r["venue"], market_id=r["market_id"],
                       event_type=r["event_type"] or "other",
                       entities=tuple(json.loads(r["entities"] or "[]")),
-                      subject=r["subject"], metric=r["metric"] or "other",
+                      subject=r["subject"], metric=n_metric,
                       comparator=r["comparator"], value=r["value"],
-                      period=r["period"] or "full", date=r["date"],
+                      period=r["period"] or "full", date=n_date,
                       confidence=r["confidence"] or 0.0)
             b = buckets.setdefault((c.event_type, c.metric, c.date), {})
             b.setdefault(c.venue, []).append(c)
