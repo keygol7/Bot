@@ -118,3 +118,35 @@ def test_sub_org_teams_never_align():
     c = mk(venue="polymarket_us", mid="p2", entities=("patins da ferrari", "bestia academy"),
            subject="bestia academy esports")
     assert complementary(a, c)
+
+
+def _canon(venue, mid, **kw):
+    from bot.matching.canon import Canon
+    d = dict(event_type="econ_release", entities=("cpi",), subject="cpi", metric="price_close",
+             comparator=">=", value=5.0, period="full", date="2026-11-01", confidence=0.9)
+    d.update(kw)
+    return Canon(venue=venue, market_id=mid, **d)
+
+
+def test_scalar_threshold_exact_value_guard():
+    from bot.matching.canon import complementary
+    a = _canon("kalshi", "KXCPIYOY-26NOV-T5.0")
+    same = _canon("polymarket_us", "cpi-yoy-nov-5", value=5.0)
+    diff = _canon("polymarket_us", "cpi-yoy-nov-49", value=4.9)   # adjacent bucket
+    assert complementary(a, same) is True
+    assert complementary(a, diff) is False                        # bucket-boundary guard
+
+
+def test_nonsport_canon_pair_survives_confirmed_pairs():
+    # A non-sports (KXCPI) canon pair must reach the watchlist — the sports-only series
+    # allowlist lives in the verdict path and must NOT drop the canon union member.
+    from bot.data.store import Store
+    store = Store(":memory:")
+    store.record_canon(_canon("kalshi", "KXCPIYOY-26NOV-T5.0"))
+    store.record_canon(_canon("polymarket_us", "cpi-yoy-nov-2026-5", value=5.0))
+    pairs = store.confirmed_pairs(use_fingerprint=True, combine_verdicts=True,
+                                  use_canon=True, safe_types_only=True, max_fanout=None)
+    keys = {store._pair_key(p[0], p[1], p[2], p[3]) for p in pairs}
+    want = store._pair_key("kalshi", "KXCPIYOY-26NOV-T5.0",
+                           "polymarket_us", "cpi-yoy-nov-2026-5")
+    assert want in keys                                           # not dropped by allowlist

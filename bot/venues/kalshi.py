@@ -398,6 +398,7 @@ class KalshiVenue:
     async def scan_quotes(
         self, limit: int = 500, *, max_close_ts: int | None = None,
         ticker_patterns: tuple[str, ...] | None = None,
+        deny_patterns: tuple[str, ...] | None = None,
     ) -> list[MarketQuote]:
         """Phase 1: price-only quotes for open markets, up to ``limit`` markets total.
 
@@ -451,6 +452,11 @@ class KalshiVenue:
                 # Per-game allowlist: keep only arbable head-to-head market types, dropping
                 # the election/crypto/streaming bulk before it ever reaches the matcher.
                 if ticker_patterns and not any(p in tk for p in ticker_patterns):
+                    continue
+                # Deny-list: drop multi-outcome place/rank/spread junk that an allowlist
+                # substring would otherwise admit (e.g. KXPRIMARYPLACE under a "SENATE"
+                # pattern) — keeps non-sports scanning to binary winner markets.
+                if deny_patterns and any(d in tk for d in deny_patterns):
                     continue
                 q = normalize_summary(m)
                 # Client-side fail-safe for the targeted window (server may ignore the

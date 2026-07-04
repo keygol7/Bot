@@ -165,6 +165,14 @@ class Settings:
     # markets (FEWER embeds than the 5000 baseline) while covering ~3.4x the per-game lines
     # AND every currently-confirmed pair. Empty = disabled. Applied to KALSHI only.
     kalshi_scan_patterns: tuple[str, ...] = ()
+    # Non-sports scan expansion: extra Kalshi allowlist patterns for BINARY winner markets
+    # (elections/awards/macro/finance) unioned into kalshi_scan_patterns. Kept separate so
+    # it's toggleable independently. Empty = sports only.
+    kalshi_nonsport_patterns: tuple[str, ...] = ()
+    # Scan deny-list: drop tickers containing any of these even if allowlisted — kills the
+    # multi-outcome place/rank/spread bulk (KXPRIMARYPLACE etc.) a winner-pattern would
+    # otherwise admit, so non-sports stays binary-only. Empty = no deny filter.
+    kalshi_scan_deny: tuple[str, ...] = ()
     # Canonicalize-then-join matching (see bot/matching/canon.py): per-market cached LLM
     # extraction of the canonical contract from its RESOLUTION RULES, matched by a
     # deterministic join — the domain-agnostic third member of the watchlist union.
@@ -448,6 +456,12 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         scan_kalshi_close_within_days=_env_float("SCAN_KALSHI_CLOSE_WITHIN_DAYS", 0.0),
         kalshi_scan_patterns=tuple(
             p.strip().upper() for p in os.getenv("KALSHI_SCAN_PATTERNS", "").split(",") if p.strip()
+        ),
+        kalshi_nonsport_patterns=tuple(
+            p.strip().upper() for p in os.getenv("KALSHI_NONSPORT_PATTERNS", "").split(",") if p.strip()
+        ),
+        kalshi_scan_deny=tuple(
+            p.strip().upper() for p in os.getenv("KALSHI_SCAN_DENY", "").split(",") if p.strip()
         ),
         scan_limit=int(_env_float("SCAN_LIMIT", 0)),
         match_sweep_past_days=_env_float("MATCH_SWEEP_PAST_DAYS", 1.0),

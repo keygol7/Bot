@@ -104,6 +104,8 @@ async def run_cycle(
     close_within_days: float = 0.0,
     kalshi_close_within_days: float = 0.0,
     kalshi_ticker_patterns: tuple[str, ...] = (),
+    kalshi_deny_patterns: tuple[str, ...] = (),
+    kalshi_nonsport_patterns: tuple[str, ...] = (),
     match_cross_venue: bool = True,
 ) -> CycleResult:
     result = CycleResult()
@@ -146,6 +148,8 @@ async def run_cycle(
         if v.name == "kalshi" and kalshi_ticker_patterns:
             v_limit = 0
             v_kw = {"max_close_ts": None, "ticker_patterns": kalshi_ticker_patterns}
+            if kalshi_deny_patterns:
+                v_kw["deny_patterns"] = kalshi_deny_patterns
         elif v.name == "kalshi" and kalshi_max_close_ts is not None:
             v_limit, v_kw = 0, {"max_close_ts": kalshi_max_close_ts}
         try:
@@ -191,6 +195,20 @@ async def run_cycle(
         except Exception as exc:
             log.warning("matching failed this cycle (%s); skipping cross-venue", exc)
             return []
+
+    # OOM guardrail: keep NON-SPORTS markets out of the embedding shortlist. Non-sports
+    # matches via the canon join (DB-cached, no embeddings) — embedding thousands of
+    # election/macro titles is exactly what OOM'd the 4GB box. Scope the embed inputs to
+    # sports tickers; canon still matches non-sports off the trade path.
+    if match_cross_venue and kalshi_nonsport_patterns:
+        ksports = [q for q in quotes_by_venue.get("kalshi", [])
+                   if not any(p in q.market_id for p in kalshi_nonsport_patterns)]
+        dropped = len(quotes_by_venue.get("kalshi", [])) - len(ksports)
+        if dropped:
+            quotes_by_venue = dict(quotes_by_venue)
+            quotes_by_venue["kalshi"] = ksports
+            log.info("embed shortlist scoped to sports: held %d non-sports Kalshi markets "
+                     "out of embeddings (canon matches them off-path)", dropped)
 
     confirmed_lite: list[tuple[MarketQuote, MarketQuote]] = []
     # Skip the cross-venue match loop (embedding shortlist + LLM confirm) when discovery is
@@ -485,7 +503,10 @@ async def run(
                 max_confirms=max_confirms, max_resolve_gap_days=max_resolve_gap_days,
                 executor=executor, close_within_days=close_within_days,
                 kalshi_close_within_days=settings.scan_kalshi_close_within_days,
-                kalshi_ticker_patterns=settings.kalshi_scan_patterns,
+                kalshi_ticker_patterns=(settings.kalshi_scan_patterns
+                                        + settings.kalshi_nonsport_patterns),
+                kalshi_deny_patterns=settings.kalshi_scan_deny,
+                kalshi_nonsport_patterns=settings.kalshi_nonsport_patterns,
             )
             log.info("cycle: %s", last.summary())
             if once:
@@ -928,7 +949,10 @@ async def stream(
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             close_within_days=settings.scan_close_within_days,
             kalshi_close_within_days=settings.scan_kalshi_close_within_days,
-            kalshi_ticker_patterns=settings.kalshi_scan_patterns,
+            kalshi_ticker_patterns=(settings.kalshi_scan_patterns
+                                    + settings.kalshi_nonsport_patterns),
+            kalshi_deny_patterns=settings.kalshi_scan_deny,
+            kalshi_nonsport_patterns=settings.kalshi_nonsport_patterns,
             match_cross_venue=discover,
         )
         # Push the strongest-evidence pair set (rules-verified identical + settlement-
