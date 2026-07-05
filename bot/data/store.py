@@ -226,6 +226,20 @@ CREATE TABLE IF NOT EXISTS recycle_remnants (
     PRIMARY KEY (venue, market_id)
 );
 
+-- Equity snapshots: total account value (cash + open-position cost basis, per venue)
+-- sampled periodically. The ONLY reliable PnL source — venue records don't window by
+-- time, local fills overstate cost, and Poly's settled positions age out. A "last N
+-- hours" PnL is then just latest_equity - equity_N_hours_ago (mind external transfers).
+CREATE TABLE IF NOT EXISTS equity_snapshots (
+    ts            REAL NOT NULL,
+    kalshi_cash   REAL NOT NULL,
+    poly_cash     REAL NOT NULL,
+    kalshi_pos    REAL NOT NULL,
+    poly_pos      REAL NOT NULL,
+    total         REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_snapshots(ts);
+
 -- Time/market indices: the settled-PnL reconciliation, reconcile pairing, and every
 -- "last N hours" query scan these tables, which grow without bound.
 CREATE INDEX IF NOT EXISTS idx_pnl_ts            ON pnl (ts);
@@ -370,6 +384,33 @@ class Store:
     def _pair_key(va: str, ma: str, vb: str, mb: str) -> tuple[str, str, str, str]:
         # Order-independent: a pair is the same regardless of argument order.
         return tuple(sorted([(va, ma), (vb, mb)]))[0] + tuple(sorted([(va, ma), (vb, mb)]))[1]
+
+    def record_equity(self, kalshi_cash: float, poly_cash: float,
+                      kalshi_pos: float, poly_pos: float) -> None:
+        total = kalshi_cash + poly_cash + kalshi_pos + poly_pos
+        self.conn.execute(
+            "INSERT INTO equity_snapshots (ts, kalshi_cash, poly_cash, kalshi_pos, "
+            "poly_pos, total) VALUES (?, ?, ?, ?, ?, ?)",
+            (time.time(), kalshi_cash, poly_cash, kalshi_pos, poly_pos, total))
+        self.conn.commit()
+
+    def equity_pnl(self, hours: float = 24.0):
+        """(pnl, from_total, to_total, from_ts) over the window, or None if no baseline
+        snapshot that old exists yet. pnl = latest total - the oldest snapshot at/after
+        the cutoff (assumes no external deposits/withdrawals in the window)."""
+        cutoff = time.time() - hours * 3600.0
+        latest = self.conn.execute(
+            "SELECT ts, total FROM equity_snapshots ORDER BY ts DESC LIMIT 1").fetchone()
+        base = self.conn.execute(
+            "SELECT ts, total FROM equity_snapshots WHERE ts <= ? ORDER BY ts DESC LIMIT 1",
+            (cutoff,)).fetchone()
+        if base is None:                          # not enough history yet -> oldest we have
+            base = self.conn.execute(
+                "SELECT ts, total FROM equity_snapshots ORDER BY ts ASC LIMIT 1").fetchone()
+        if latest is None or base is None or latest["ts"] == base["ts"]:
+            return None
+        return (round(latest["total"] - base["total"], 2), round(base["total"], 2),
+                round(latest["total"], 2), base["ts"])
 
     def entry_cost_for_pair(self, va: str, ma: str, vb: str, mb: str):
         """(yes_price, no_price) of the most-recent ACTED opportunity for this pair, or

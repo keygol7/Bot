@@ -734,7 +734,8 @@ class KalshiVenue:
             # reading only it silently reported every held position as flat.
             qty = float(mp.get("position_fp") or mp.get("position") or 0)
             resting = int(mp.get("resting_orders_count") or 0)
-            pos = VenuePosition(mp.get("ticker", ""), qty, resting)
+            cost = abs(float(mp.get("market_exposure_dollars") or 0))
+            pos = VenuePosition(mp.get("ticker", ""), qty, resting, cost=cost)
             if pos.is_open:
                 positions.append(pos)
         return AccountSnapshot(self.name, balance, positions)

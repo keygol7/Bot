@@ -399,3 +399,23 @@ def test_prune_stale_markets():
     assert pruned == 1                                          # only STALE (not canon'd)
     ids = {r["market_id"] for r in s.conn.execute("SELECT market_id FROM markets")}
     assert ids == {"LIVE", "STALE_CANON"}                      # live + canon-referenced kept
+
+
+def test_equity_snapshot_and_pnl():
+    import time as _t
+    s = Store(":memory:")
+    now = _t.time()
+    # baseline 24h ago, then now
+    s.conn.execute("INSERT INTO equity_snapshots VALUES (?,?,?,?,?,?)",
+                   (now - 24*3600, 50, 100, 40, 110, 300))
+    s.conn.execute("INSERT INTO equity_snapshots VALUES (?,?,?,?,?,?)",
+                   (now, 55, 123, 39, 108, 325))
+    s.conn.commit()
+    pnl, frm, to, ts = s.equity_pnl(hours=24.0)
+    assert pnl == 25.0 and frm == 300.0 and to == 325.0
+    # record_equity computes total
+    s2 = Store(":memory:")
+    s2.record_equity(55.0, 123.0, 39.0, 108.0)
+    row = s2.conn.execute("SELECT total FROM equity_snapshots").fetchone()
+    assert abs(row["total"] - 325.0) < 1e-6
+    assert s2.equity_pnl() is None                # single snapshot -> no baseline yet

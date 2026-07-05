@@ -243,7 +243,9 @@ def _parse_positions(body: Any):
                       or r.get("netShares")) or 0.0
         resting = int(r.get("openOrders") or r.get("restingOrders")
                       or r.get("resting_orders_count") or 0)
-        pos = VenuePosition(slug, qty, resting)
+        cost = abs(_amount((r.get("cost") or {}).get("value")
+                           if isinstance(r.get("cost"), dict) else r.get("cost")) or 0.0)
+        pos = VenuePosition(slug, qty, resting, cost=cost)
         if pos.is_open:
             out.append(pos)
     return out

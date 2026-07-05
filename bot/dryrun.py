@@ -1072,6 +1072,20 @@ async def stream(
                 pruned = store.prune_stale_markets(older_than_days=7.0)
                 if pruned:
                     log.info("pruned %d stale market rows (>7d unscanned)", pruned)
+                # Equity snapshot: the reliable PnL baseline (cash + open-position cost per
+                # venue). Every ~10 min -> a 'last N hours' PnL is a simple subtraction.
+                try:
+                    ksnap = await kalshi_v.account_snapshot()
+                    psnap = await poly_v.account_snapshot()
+                    kpos = sum(abs(getattr(x, "cost", 0.0) or 0.0)
+                               for x in getattr(ksnap, "positions", []) or []
+                               if getattr(x, "is_open", False))
+                    ppos = sum(abs(getattr(x, "cost", 0.0) or 0.0)
+                               for x in getattr(psnap, "positions", []) or []
+                               if getattr(x, "is_open", False))
+                    store.record_equity(ksnap.balance, psnap.balance, kpos, ppos)
+                except Exception as exc:
+                    log.warning("equity snapshot failed: %s", exc)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
