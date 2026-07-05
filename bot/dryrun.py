@@ -495,7 +495,7 @@ async def run(
         from bot.matching.embed_cache import CachingEmbedFn
         from bot.matching.embed_client import make_embed_fn
 
-        embed_fn = CachingEmbedFn(make_embed_fn(settings.llm), store,
+        embed_fn = CachingEmbedFn(make_embed_fn(settings.llm), store, max_new_per_call=1500,
                                   model=settings.llm.embedding_model)
 
     last: CycleResult | None = None
@@ -855,7 +855,7 @@ async def stream(
 
         # Cache title->vector (memory LRU + SQLite): each discovery pass embeds only
         # NEW titles instead of the whole board — the ~8-minute cycle becomes seconds.
-        embed_fn = CachingEmbedFn(make_embed_fn(settings.llm), store,
+        embed_fn = CachingEmbedFn(make_embed_fn(settings.llm), store, max_new_per_call=1500,
                                   model=settings.llm.embedding_model)
 
     async def refresh_balances():

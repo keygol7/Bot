@@ -34,7 +34,7 @@ class CachingEmbedFn:
     """
 
     def __init__(self, embed_fn, store=None, *, model: str = "", max_memory: int = 16000,
-                 prune_days: float = 30.0) -> None:
+                 prune_days: float = 30.0, max_new_per_call: int = 0) -> None:
         self._embed = embed_fn
         self._store = store
         self._model = model or "default"
@@ -42,6 +42,12 @@ class CachingEmbedFn:
         self._max_memory = max_memory
         self._prune_days = prune_days
         self._pruned_once = False
+        # Incremental-backfill budget: embed at most this many NEVER-SEEN titles per
+        # call; the rest return None this cycle and get embedded on later cycles. An
+        # unbounded backfill of a whole 62k board froze the event loop for ~10min and
+        # ground a 4GB box into D-state memory-reclaim stalls (no swap, 189MB free).
+        # 0 = unlimited.
+        self._max_new = max_new_per_call
 
     def _remember(self, key: str, vec: array) -> None:
         self._mem[key] = vec
@@ -82,7 +88,13 @@ class CachingEmbedFn:
                     still.append(i)
             misses = still
 
-        # 3) the real embedder, only for never-seen titles
+        # 3) the real embedder, only for never-seen titles (budgeted)
+        deferred: list[int] = []
+        if misses and self._max_new > 0 and len(misses) > self._max_new:
+            deferred = misses[self._max_new:]
+            misses = misses[:self._max_new]
+            log.info("embeddings: deferring %d uncached titles to later cycles "
+                     "(budget %d/cycle)", len(deferred), self._max_new)
         if misses:
             vecs = self._embed([texts[i] for i in misses])
             rows: list[tuple[str, bytes]] = []
@@ -105,4 +117,4 @@ class CachingEmbedFn:
             log.info("embeddings: %d/%d titles were new (rest served from cache)",
                      len(misses), len(texts))
 
-        return [out[i] for i in range(len(texts))]
+        return [out.get(i) for i in range(len(texts))]   # None = deferred this cycle

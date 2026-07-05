@@ -100,6 +100,15 @@ def semantic_candidate_pairs(
         return []
     vecs_a = embed_fn([q.title for q in group_a])
     vecs_b = embed_fn([q.title for q in group_b])
+    # Deferred embeds (a budgeted cache may return None for never-seen titles this
+    # cycle): those markets simply sit out the semantic shortlist until embedded —
+    # the fingerprint/canon paths still see them.
+    ga = [(q, v) for q, v in zip(group_a, vecs_a) if v is not None]
+    gb = [(q, v) for q, v in zip(group_b, vecs_b) if v is not None]
+    if not ga or not gb:
+        return []
+    group_a, vecs_a = [g[0] for g in ga], [g[1] for g in ga]
+    group_b, vecs_b = [g[0] for g in gb], [g[1] for g in gb]
 
     # CHUNKED float32 similarity: the old path materialized the FULL AxB matrix in
     # float64 (a 65k x 9k board = ~4.7GB -> the OOM that forced the category
@@ -116,7 +125,8 @@ def semantic_candidate_pairs(
         b /= np.linalg.norm(b, axis=1, keepdims=True) + 1e-12
         bt = b.T
         chunk = 1024
-        for start in range(0, a.shape[0], chunk):
+        cap = 40000                          # candidate flood guard on giant boards:
+        for start in range(0, a.shape[0], chunk):   # keep the best, drop the tail
             sim = a[start:start + chunk] @ bt                # (chunk, |B|) float32
             ii, jj = np.nonzero(sim >= threshold)
             for i, j in zip(ii.tolist(), jj.tolist()):
@@ -124,6 +134,12 @@ def semantic_candidate_pairs(
                 if qa.venue == qb.venue:
                     continue
                 out.append(Candidate(a=qa, b=qb, score=float(sim[i, j])))
+            if len(out) > 2 * cap:
+                out.sort(key=lambda c: c.score, reverse=True)
+                del out[cap:]
+        if len(out) > cap:
+            out.sort(key=lambda c: c.score, reverse=True)
+            del out[cap:]
     except ImportError:
         for qa, va in zip(group_a, vecs_a):
             for qb, vb in zip(group_b, vecs_b):
