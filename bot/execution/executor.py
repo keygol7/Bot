@@ -871,6 +871,13 @@ class Executor:
             # dated pairs (decided/imminent) always pass.
             if self.recycle_max_settle_days > 0 and itm_bid < self.recycle_decided_bid:
                 close = q.close_time
+                if not close:
+                    # close_time is None for many markets (the CA-gov class); the id
+                    # usually carries the date — same fallback as the horizon gate.
+                    from bot.strategies.arbitrage import settle_ts_from_id
+                    _c = pair_map.get((venue, market))
+                    close = (settle_ts_from_id(market)
+                             or (settle_ts_from_id(_c[1]) if _c else 0.0) or 0.0)
                 if close and (close - time.time()) > self.recycle_max_settle_days * 86400.0:
                     continue
             counter = pair_map.get((venue, market))

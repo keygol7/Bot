@@ -2224,3 +2224,23 @@ def test_recycle_skips_fardated_undecided_favorite():
     near = _q("kalshi", "K1", no_ask=0.08); near.close_time = _time.time() + 3600
     nearc = _q("poly", "p1", yes_ask=0.94); nearc.close_time = _time.time() + 3600
     assert len(ex.plan_recycle("kalshi", pm, {("kalshi","K1"): near, ("poly","p1"): nearc})) == 1
+
+
+def test_recycle_horizon_uses_id_date_when_close_time_missing():
+    import time as _time
+    store = Store(":memory:")
+    ex, _ = _rec_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], store=store)
+    ex.recycle_max_settle_days = 3.0
+    ex.recycle_decided_bid = 0.98
+    ex._balances = {"kalshi": 380.0, "poly": 8.0}
+    # UFC-class pair: quote has NO close_time, but the kalshi id is dated 6 days out
+    from datetime import datetime, timezone, timedelta
+    d = (datetime.now(timezone.utc) + timedelta(days=6)).strftime("%y%b%d").upper()
+    km = f"KXUFCFIGHT-{d}STEELL-STE"
+    ex._positions = {("poly", "p1"): 5.0, ("kalshi", km): -5.0}
+    pm = {("poly", "p1"): ("kalshi", km), ("kalshi", km): ("poly", "p1")}
+    q_itm = _q("poly", "p1", no_ask=0.09)          # poly ITM bid 0.91 < decided 0.98
+    q_otm = _q("kalshi", km, yes_ask=0.93)
+    # drained venue = poly; ITM leg on poly at 0.91, undated quote, far-dated id -> SKIP
+    acts = ex.plan_recycle("poly", pm, {("poly","p1"): q_itm, ("kalshi",km): q_otm})
+    assert acts == []
