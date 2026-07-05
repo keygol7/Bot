@@ -834,3 +834,22 @@ def test_imbalance_alert_wording_and_rate_limit():
     # disabled
     assert imbalance_alert(bals, 1000.0, 2000.0, recyclable=False,
                            alert_secs=0.0, last_alert=0.0) is None
+
+
+def test_run_cycle_forwards_unknown_fingerprint_to_llm():
+    # An F1-class pair: the sports-tuned fingerprint can't read the poly side
+    # (metric=unknown) — that must FORWARD to the LLM, not die at the gate (the
+    # watchlist stopped growing when unknown was killed). Positively-classified
+    # novelty (unmatchable) stays killed per the test above.
+    k = mq("kalshi", "KXF1FASTLAP-BRIGP26-ALB",
+           "Will Alexander Albon set the fastest lap in the British Grand Prix?",
+           yes_ask=0.10, yes_ask_size=100, no_ask=0.85, no_ask_size=100)
+    p = mq("polymarket_us", "aachc-f1-gbr-2026-07-05-fastlap-alealb",
+           "British Grand Prix Main Race Fastest Lap - Alexander Albon",
+           yes_ask=0.86, yes_ask_size=100, no_ask=0.11, no_ask_size=100)
+    venues = [StubVenue("kalshi", {k.market_id: k}),
+              StubVenue("polymarket_us", {p.market_id: p})]
+    fake = lambda prompt: '{"same_event": true, "confidence": 0.95, "rationale": "x"}'
+    res = run_cycle_kw(venues, complete_fn=fake, use_fingerprint=True)
+    confirmed = {(a, b) for (_, a, _, b, _) in res.confirmed_pairs}
+    assert ("KXF1FASTLAP-BRIGP26-ALB", "aachc-f1-gbr-2026-07-05-fastlap-alealb") in confirmed

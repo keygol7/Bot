@@ -263,9 +263,19 @@ async def run_cycle(
                     # to the LLM (full titles, warned about academy squads); any verdict-
                     # admitted pair still faces the empirical sum gate + rules
                     # verification (material divergence demotes) before real size fires.
-                    if reason not in ("ok", "subject-sub-org"):
+                    # Gate policy: kill only what the fingerprint POSITIVELY rejects —
+                    # mismatches between well-parsed prints (metric/date/matchup/...)
+                    # and types it CLASSIFIED as junk ("unmatchable": novelty/futures,
+                    # e.g. MENTION). "a-unknown"/"b-unknown" = a side the sports-tuned
+                    # parser simply CAN'T READ (F1 props, politics, awards): no opinion
+                    # is not a "no" — forward to the LLM (budgeted, similarity-ranked);
+                    # the truth stack vets whatever it admits. Killing on unknown was
+                    # why the watchlist stopped growing once the allowlist retired.
+                    unparsed = reason in ("a-unknown", "b-unknown")
+                    if reason not in ("ok", "subject-sub-org") and not unparsed:
                         continue
-                    if fingerprint_metrics and fa.metric not in fingerprint_metrics:
+                    if (reason == "ok" and fingerprint_metrics
+                            and fa.metric not in fingerprint_metrics):
                         continue
                 result.candidate_pairs += 1
 
