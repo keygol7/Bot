@@ -379,6 +379,7 @@ class StreamingEngine:
             log.warning("blacklist write failed for %s: %s", p.event_key, exc)
 
     def _build_opp(self, p, edge, yq, nq, size) -> ArbOpportunity:
+        from bot.strategies.arbitrage import _pair_settle_ts
         gross = yq.yes_ask + nq.no_ask
         ts_y = getattr(yq, "timestamp", 0.0) or 0.0
         ts_n = getattr(nq, "timestamp", 0.0) or 0.0
@@ -390,6 +391,11 @@ class StreamingEngine:
             fee_per_pair=max(0.0, 1.0 - gross - edge), edge_per_contract=edge,
             max_contracts=size, total_fees=0.0, total_profit=edge * size, notional=gross * size,
             yes_size=yq.yes_ask_size, no_size=nq.no_ask_size,
+            # Settlement horizon (close_time, falling back to the id-parsed date). The
+            # fast path is where ALL live fires happen — omitting this left settle_ts=0
+            # and the horizon gate silently OFF for streaming trades (the CA-gov pair
+            # kept locking months-out capital at a ~1% edge straight through the gate).
+            settle_ts=_pair_settle_ts(yq, nq),
             # Oldest leg quote's wall-clock ts, only when BOTH legs are WS-stamped —
             # lets the executor skip its hedge REST re-read on a fresh, deep book.
             fresh_ts=min(ts_y, ts_n) if ts_y > 0 and ts_n > 0 else 0.0,

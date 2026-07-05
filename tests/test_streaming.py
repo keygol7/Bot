@@ -1452,3 +1452,21 @@ def test_reconcile_ignores_recycle_remnant():
     asyncio.run(eng.reconcile_positions(snaps))
     asyncio.run(eng.reconcile_positions(snaps))
     assert fe.risk.is_killed
+
+
+def test_stream_build_opp_carries_settle_ts_from_id():
+    # The CA-gov leak: _build_opp omitted settle_ts -> 0 -> horizon gate silently OFF
+    # on the fast path (where all live fires happen). The id-parsed date must flow in.
+    from datetime import datetime, timezone
+    from bot.models import MarketQuote
+    eng = make_engine(FakeExec())
+    p = ConfirmedPair("E1", "kalshi", "KXGOVCA-26-SHIL",
+                      "poly", "ewc-usgub-ca-2026-11-03-stehil")
+    yq = MarketQuote(venue="kalshi", market_id="KXGOVCA-26-SHIL", title="",
+                     yes_ask=0.08, yes_ask_size=100, no_ask=0.93, no_ask_size=100)
+    nq = MarketQuote(venue="poly", market_id="ewc-usgub-ca-2026-11-03-stehil", title="",
+                     yes_ask=0.11, yes_ask_size=100, no_ask=0.90, no_ask_size=100)
+    opp = eng._build_opp(p, 0.01, yq, nq, 10)
+    assert opp.settle_ts > 0
+    got = datetime.fromtimestamp(opp.settle_ts, timezone.utc).strftime("%Y-%m-%d")
+    assert got == "2026-11-03"
