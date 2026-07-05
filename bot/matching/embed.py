@@ -101,16 +101,37 @@ def semantic_candidate_pairs(
     vecs_a = embed_fn([q.title for q in group_a])
     vecs_b = embed_fn([q.title for q in group_b])
 
-    sim = _similarity_matrix(vecs_a, vecs_b)  # sim[i][j] = cosine(a_i, b_j)
+    # CHUNKED float32 similarity: the old path materialized the FULL AxB matrix in
+    # float64 (a 65k x 9k board = ~4.7GB -> the OOM that forced the category
+    # allowlist). Chunking rows keeps peak memory at ~chunk x |B| x 4B (~40MB) no
+    # matter the board size, which is what makes UNFILTERED whole-board scanning
+    # safe — categories become self-discovering instead of hand-curated.
     out: list[Candidate] = []
-    for i, qa in enumerate(group_a):
-        row = sim[i]
-        for j, qb in enumerate(group_b):
-            if qa.venue == qb.venue:
-                continue
-            score = row[j]
-            if score >= threshold:
-                out.append(Candidate(a=qa, b=qb, score=float(score)))
+    try:
+        import numpy as np
+
+        a = np.asarray(vecs_a, dtype=np.float32)
+        b = np.asarray(vecs_b, dtype=np.float32)
+        a /= np.linalg.norm(a, axis=1, keepdims=True) + 1e-12
+        b /= np.linalg.norm(b, axis=1, keepdims=True) + 1e-12
+        bt = b.T
+        chunk = 1024
+        for start in range(0, a.shape[0], chunk):
+            sim = a[start:start + chunk] @ bt                # (chunk, |B|) float32
+            ii, jj = np.nonzero(sim >= threshold)
+            for i, j in zip(ii.tolist(), jj.tolist()):
+                qa, qb = group_a[start + i], group_b[j]
+                if qa.venue == qb.venue:
+                    continue
+                out.append(Candidate(a=qa, b=qb, score=float(sim[i, j])))
+    except ImportError:
+        for qa, va in zip(group_a, vecs_a):
+            for qb, vb in zip(group_b, vecs_b):
+                if qa.venue == qb.venue:
+                    continue
+                score = cosine(va, vb)
+                if score >= threshold:
+                    out.append(Candidate(a=qa, b=qb, score=score))
     out.sort(key=lambda c: c.score, reverse=True)
     return out
 

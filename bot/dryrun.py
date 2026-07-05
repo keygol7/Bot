@@ -145,13 +145,18 @@ async def run_cycle(
         # close-time window, both with an UNBOUNDED limit. Other venues keep the shared
         # limit + global window. The pattern filter is a Kalshi-only kwarg.
         v_limit, v_kw = limit, {"max_close_ts": max_close_ts}
-        if v.name == "kalshi" and kalshi_ticker_patterns:
+        if v.name == "kalshi":
+            # Whole-board scan, ALWAYS (the list endpoint is cheap). Category
+            # allowlists are gone: they required hand-curation and silently dropped
+            # whole categories (F1, elections). Memory safety now comes from the
+            # chunked float32 similarity in the matcher, not from scanning less.
+            # Patterns remain optional narrowing knobs if ever configured.
             v_limit = 0
-            v_kw = {"max_close_ts": None, "ticker_patterns": kalshi_ticker_patterns}
+            v_kw = {"max_close_ts": kalshi_max_close_ts or max_close_ts}
+            if kalshi_ticker_patterns:
+                v_kw["ticker_patterns"] = kalshi_ticker_patterns
             if kalshi_deny_patterns:
                 v_kw["deny_patterns"] = kalshi_deny_patterns
-        elif v.name == "kalshi" and kalshi_max_close_ts is not None:
-            v_limit, v_kw = 0, {"max_close_ts": kalshi_max_close_ts}
         try:
             qs = await v.scan_quotes(v_limit, **v_kw)
         except Exception as exc:
