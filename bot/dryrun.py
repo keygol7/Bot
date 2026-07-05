@@ -2144,6 +2144,100 @@ def poly_depth_report(settings: Settings, *, top: int = 40) -> int:
     return 0
 
 
+def pnl_report(settings: Settings, hours: float = 24.0) -> int:
+    """Accurate profit report (read-only). Three sections, each from its most
+    authoritative source (see bot/analysis/pnl_report.py for why the naive methods
+    were wrong): LOCKED from the average-cost fills ledger; SETTLED from Kalshi's
+    settlement records (+ Poly venue realized where visible); the equity-snapshot
+    delta as the untrickable cross-check."""
+    import asyncio as _asyncio
+    import time as _time
+
+    from bot.analysis.pnl_report import kalshi_settled_pnl, locked_pairs_report
+    from bot.data.store import Store
+
+    async def run() -> int:
+        store = Store(settings.db_path)
+        fee_models = {}
+        try:
+            from bot.fees import KalshiFeeModel, PolymarketUSFeeModel
+            fee_models = {"kalshi": KalshiFeeModel(0.07),
+                          "polymarket_us": PolymarketUSFeeModel(0.05)}
+        except Exception:
+            pass
+        venues = _build_venues(settings)
+        # Venue positions are the authoritative open-pair mask (the fills ledger can't
+        # see settlements) and the authoritative hedged count.
+        open_pos: dict = {}
+        for v in venues:
+            fn = getattr(v, "account_snapshot", None)
+            if fn is None:
+                continue
+            try:
+                snap = await fn()
+                for x in getattr(snap, "positions", None) or []:
+                    if getattr(x, "is_open", False):
+                        open_pos[(snap.venue, x.market_id)] = abs(float(x.quantity))
+            except Exception as exc:
+                print(f"  ({v.name} positions unavailable: {exc})")
+        print(f"=== LOCKED (open hedged pairs, avg-cost basis incl. buy fees) ===")
+        total_locked = 0.0
+        for pr in locked_pairs_report(store, fee_models, open_positions=open_pos):
+            total_locked += pr.locked
+            imb = f"  (imbalance {pr.imbalance:g})" if pr.imbalance >= 1 else ""
+            print(f"  {pr.event_key[:58]:60} {pr.hedged:5.0f}ct  "
+                  f"cost {pr.cost_basis:7.2f}  locked {pr.locked:+7.2f}{imb}")
+        print(f"  TOTAL LOCKED: {total_locked:+.2f}")
+
+        print(f"\n=== SETTLED, last {hours:g}h (venue-authoritative) ===")
+        kalshi_v = next((v for v in venues if v.name == "kalshi"), None)
+        poly_v = next((v for v in venues if v.name == "polymarket_us"), None)
+        since = _time.time() - hours * 3600
+        ktot = 0.0
+        if kalshi_v is not None:
+            try:
+                rows = kalshi_settled_pnl(await kalshi_v.settlements(limit=400), since)
+                for tk, amt in sorted(rows, key=lambda r: r[1]):
+                    ktot += amt
+                    print(f"  K {tk[:56]:58} {amt:+7.2f}")
+                print(f"  KALSHI settled total: {ktot:+.2f}")
+            except Exception as exc:
+                print(f"  kalshi settlements unavailable: {exc}")
+        ptot = 0.0
+        if poly_v is not None:
+            try:
+                ppos = await poly_v.settled_positions()
+                for slug, q in ppos.items():
+                    real = float((q.get("realized") or {}).get("value") or 0)
+                    if abs(real) > 1e-6:
+                        ptot += real
+                        print(f"  P {slug[:56]:58} {real:+7.2f}")
+                print(f"  POLY realized (visible window; cumulative, not strictly "
+                      f"{hours:g}h): {ptot:+.2f}")
+            except Exception as exc:
+                print(f"  poly settled positions unavailable: {exc}")
+        print(f"  NOTE: kalshi+poly settled sides of the SAME pair offset — judge pairs, "
+              f"not venues.")
+
+        print(f"\n=== EQUITY cross-check (snapshots every ~10min) ===")
+        ep = store.equity_pnl(hours=hours)
+        if ep is None:
+            print("  not enough snapshot history yet")
+        else:
+            pnl, frm, to, ts = ep
+            age_h = (_time.time() - ts) / 3600
+            print(f"  equity {frm:.2f} -> {to:.2f} over {age_h:.1f}h = {pnl:+.2f} "
+                  f"(assumes no external transfers)")
+        for v in venues:
+            aclose = getattr(v, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        store.close()
+        return 0
+
+    return _asyncio.run(run())
+
+
 def check_flat(settings: Settings) -> int:
     """Print each venue's balance, open positions, and resting orders, with a FLAT / NOT
     FLAT verdict per venue. 'Flat' = no held positions and no resting orders. Read-only."""
@@ -2352,6 +2446,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--check-flat", action="store_true",
                    help="print each venue's balance, open positions, and resting orders "
                         "with a FLAT / NOT FLAT verdict (read-only)")
+    p.add_argument("--pnl-report", nargs="?", const=24.0, type=float, metavar="HOURS",
+                   help="accurate profit report (read-only): per-pair LOCKED profit of "
+                        "open hedged pairs from the average-cost fills ledger, venue-"
+                        "authoritative SETTLED pnl over the last HOURS (default 24), and "
+                        "the equity-snapshot delta as cross-check")
     p.add_argument("--poly-depth-report", action="store_true",
                    help="rank matched pairs by real Polymarket book depth + show the live "
                         "edge at each, to find the tradeable overlap (read-only)")
@@ -2451,6 +2550,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.check_flat:
         raise SystemExit(check_flat(load_settings()))
+
+    if args.pnl_report is not None:
+        raise SystemExit(pnl_report(load_settings(), hours=args.pnl_report))
 
     if args.poly_depth_report:
         raise SystemExit(poly_depth_report(

@@ -1188,7 +1188,8 @@ class Executor:
         delta = round(k * itm_avg + j * otm_avg - k * 1.0 - fees, 6)
         self.risk.record_pnl(delta)
         if self.store is not None:
-            self.store.record_pnl(delta, note=f"early exit (capital recycle): {a['event']}")
+            self.store.record_pnl(delta, note=f"early exit (capital recycle): {a['event']}",
+                                  event_key=a["event"])
         log.warning("RECYCLED %s: sold %g ITM@%.2f%s -> freed $%.2f on %s (delta %+.2f "
                     "vs settlement)", a["event"], k, itm_avg,
                     f" + {j:g} OTM@{otm_avg:.2f}" if j > 1e-9 else "",
@@ -1911,7 +1912,7 @@ class Executor:
         if self.store is not None:
             self.store.record_fill(yes_leg.venue, yes_leg.market_id, "YES", ya, size)
             self.store.record_fill(no_leg.venue, no_leg.market_id, "NO", na, size)
-            self.store.record_pnl(pnl, note="arb locked")
+            self.store.record_pnl(pnl, note="arb locked", event_key=opp.event_key)
             self.store.record_opportunity(opp, acted=True)
         self._audit("execute_success", opp, pnl=pnl)
         log.info("ARB LOCKED %s | pnl=%+.2f", opp.event_key, pnl)
@@ -2017,7 +2018,7 @@ class Executor:
             self.store.record_fill(leg1.venue, leg1.market_id, side.value, buy_px, leg1.filled)
             self.store.record_fill(
                 unwind.venue, unwind.market_id, f"{side.value}_SELL", sell_avg, unwind.filled)
-            self.store.record_pnl(pnl, note=f"unwind ({reason})")
+            self.store.record_pnl(pnl, note=f"unwind ({reason})", event_key=opp.event_key)
         self._audit("execute_unwound", opp, pnl=pnl)
         log.warning("UNWOUND %s (%s) | pnl=%+.2f", opp.event_key, reason, pnl)
         return ExecutionReport(ExecStatus.UNWOUND, f"{reason}; leg1 unwound", legs, pnl)
@@ -2046,7 +2047,9 @@ class Executor:
                 self.store.record_fill(leg.venue, leg.market_id, side, price, leg.filled)
         tag = "HALT" if trip else "QUARANTINE"
         if self.store is not None:
-            self.store.record_pnl(cash, note=f"{tag} provisional, unreconciled ({reason})")
+            halt_key = "|".join(f"{l.venue}:{l.market_id}" for l in legs if l is not None) or None
+            self.store.record_pnl(cash, note=f"{tag} provisional, unreconciled ({reason})",
+                                  event_key=halt_key)
             self.store.audit("execute_halt" if trip else "execute_quarantine",
                              {"reason": reason, "cash": round(cash, 4),
                               "legs": [str(leg) for leg in legs]})

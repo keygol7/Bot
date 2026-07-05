@@ -282,6 +282,12 @@ class Store:
         _rv_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(rules_verdicts)")}
         if "material" not in _rv_cols:
             self.conn.execute("ALTER TABLE rules_verdicts ADD COLUMN material INTEGER")
+        # pnl.event_key: pair attribution for every booking. Without it, per-pair booked
+        # profit is unqueryable (note='arb locked' carries no identity) — the root of the
+        # QOR mis-analysis. NULL = legacy rows.
+        _pnl_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(pnl)")}
+        if "event_key" not in _pnl_cols:
+            self.conn.execute("ALTER TABLE pnl ADD COLUMN event_key TEXT")
         self.conn.commit()
 
     def close(self) -> None:
@@ -368,10 +374,10 @@ class Store:
         )
         self.conn.commit()
 
-    def record_pnl(self, amount: float, note: str = "") -> None:
+    def record_pnl(self, amount: float, note: str = "", event_key: str | None = None) -> None:
         self.conn.execute(
-            "INSERT INTO pnl (ts, amount, note) VALUES (?, ?, ?)",
-            (time.time(), amount, note),
+            "INSERT INTO pnl (ts, amount, note, event_key) VALUES (?, ?, ?, ?)",
+            (time.time(), amount, note, event_key),
         )
         self.conn.commit()
 
