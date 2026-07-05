@@ -1086,6 +1086,19 @@ async def stream(
                     store.record_equity(ksnap.balance, psnap.balance, kpos, ppos)
                 except Exception as exc:
                     log.warning("equity snapshot failed: %s", exc)
+                # Sync Kalshi deposits/withdrawals (idempotent by external id) so the
+                # equity PnL can subtract them — a deposit is not a gain. Poly has no
+                # transfer API; record those manually via --record-transfer.
+                try:
+                    new_x = 0
+                    for x in await kalshi_v.transfers():
+                        if store.record_transfer("kalshi", x["amount"], source="kalshi_api",
+                                                 external_id=x["id"], ts=x["ts"]):
+                            new_x += 1
+                    if new_x:
+                        log.info("synced %d new kalshi transfer(s)", new_x)
+                except Exception as exc:
+                    log.warning("kalshi transfer sync failed: %s", exc)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -2196,6 +2209,12 @@ def pnl_report(settings: Settings, hours: float = 24.0) -> int:
         ktot = 0.0
         if kalshi_v is not None:
             try:
+                for x in await kalshi_v.transfers():
+                    store.record_transfer("kalshi", x["amount"], source="kalshi_api",
+                                          external_id=x["id"], ts=x["ts"])
+            except Exception:
+                pass
+            try:
                 rows = kalshi_settled_pnl(await kalshi_v.settlements(limit=400), since)
                 for tk, amt in sorted(rows, key=lambda r: r[1]):
                     ktot += amt
@@ -2224,10 +2243,13 @@ def pnl_report(settings: Settings, hours: float = 24.0) -> int:
         if ep is None:
             print("  not enough snapshot history yet")
         else:
-            pnl, frm, to, ts = ep
+            pnl, frm, to, ts, xfers = ep
             age_h = (_time.time() - ts) / 3600
-            print(f"  equity {frm:.2f} -> {to:.2f} over {age_h:.1f}h = {pnl:+.2f} "
-                  f"(assumes no external transfers)")
+            xnote = f" − transfers {xfers:+.2f}" if abs(xfers) > 0.005 else ""
+            print(f"  equity {frm:.2f} -> {to:.2f} over {age_h:.1f}h{xnote} = "
+                  f"TRADING pnl {pnl:+.2f}")
+            print(f"  (kalshi transfers auto-synced; POLY deposits must be recorded via "
+                  f"--record-transfer or they appear as phantom pnl)")
         for v in venues:
             aclose = getattr(v, "aclose", None)
             if aclose is not None:
@@ -2446,6 +2468,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--check-flat", action="store_true",
                    help="print each venue's balance, open positions, and resting orders "
                         "with a FLAT / NOT FLAT verdict (read-only)")
+    p.add_argument("--record-transfer", nargs=2, metavar=("VENUE", "AMOUNT"),
+                   help="record an external deposit (+) / withdrawal (-) so equity PnL "
+                        "doesn't count it as trading gains — needed for POLY (no API); "
+                        "kalshi transfers sync automatically. e.g. --record-transfer "
+                        "polymarket_us 100")
     p.add_argument("--pnl-report", nargs="?", const=24.0, type=float, metavar="HOURS",
                    help="accurate profit report (read-only): per-pair LOCKED profit of "
                         "open hedged pairs from the average-cost fills ledger, venue-"
@@ -2550,6 +2577,16 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.check_flat:
         raise SystemExit(check_flat(load_settings()))
+
+    if args.record_transfer:
+        from bot.data.store import Store
+        _st = Store(load_settings().db_path)
+        _st.record_transfer(args.record_transfer[0], float(args.record_transfer[1]),
+                            source="manual")
+        print(f"recorded transfer: {args.record_transfer[0]} "
+              f"{float(args.record_transfer[1]):+.2f}")
+        _st.close()
+        raise SystemExit(0)
 
     if args.pnl_report is not None:
         raise SystemExit(pnl_report(load_settings(), hours=args.pnl_report))

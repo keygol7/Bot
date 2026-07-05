@@ -813,6 +813,32 @@ class KalshiVenue:
         resp.raise_for_status()
         return resp.json().get("settlements") or []
 
+    async def transfers(self) -> list[dict]:
+        """External cash flows (deposits + withdrawals) from /portfolio/deposits and
+        /portfolio/withdrawals — the ground truth for separating DEPOSITS from GAINS in
+        equity-based PnL. Returns [{id, ts, amount, fee}] with amount SIGNED in dollars
+        (+ = money in, − = money out) NET of the venue's deposit fee (a $20 debit-card
+        deposit with a $0.40 fee credits $19.60 to the balance)."""
+        out: list[dict] = []
+        for path, sign in (("/portfolio/deposits", 1.0), ("/portfolio/withdrawals", -1.0)):
+            await self._limiter.wait()
+            resp = await self._http().get(path, headers=self._auth_headers("GET", path))
+            resp.raise_for_status()
+            body = resp.json()
+            rows = body.get("deposits") or body.get("withdrawals") or []
+            for r in rows:
+                if str(r.get("status", "")).lower() not in ("applied", "completed", "finalized", ""):
+                    continue                     # pending/failed -> hasn't moved the balance
+                amt = float(r.get("amount_cents") or 0) / 100.0
+                fee = float(r.get("fee_cents") or 0) / 100.0
+                out.append({
+                    "id": r.get("id"),
+                    "ts": float(r.get("finalized_ts") or r.get("created_ts") or 0),
+                    "amount": sign * (amt - fee),
+                    "fee": fee,
+                })
+        return out
+
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()

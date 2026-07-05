@@ -411,11 +411,42 @@ def test_equity_snapshot_and_pnl():
     s.conn.execute("INSERT INTO equity_snapshots VALUES (?,?,?,?,?,?)",
                    (now, 55, 123, 39, 108, 325))
     s.conn.commit()
-    pnl, frm, to, ts = s.equity_pnl(hours=24.0)
-    assert pnl == 25.0 and frm == 300.0 and to == 325.0
+    pnl, frm, to, ts, xfers = s.equity_pnl(hours=24.0)
+    assert pnl == 25.0 and frm == 300.0 and to == 325.0 and xfers == 0.0
     # record_equity computes total
     s2 = Store(":memory:")
     s2.record_equity(55.0, 123.0, 39.0, 108.0)
     row = s2.conn.execute("SELECT total FROM equity_snapshots").fetchone()
     assert abs(row["total"] - 325.0) < 1e-6
     assert s2.equity_pnl() is None                # single snapshot -> no baseline yet
+
+
+def test_transfers_separate_deposits_from_gains():
+    import time as _t
+    s = Store(":memory:")
+    now = _t.time()
+    # equity went 300 -> 425 over the window... but $100 of that was a DEPOSIT
+    s.conn.execute("INSERT INTO equity_snapshots VALUES (?,?,?,?,?,?)",
+                   (now - 24*3600, 50, 100, 40, 110, 300))
+    s.conn.execute("INSERT INTO equity_snapshots VALUES (?,?,?,?,?,?)",
+                   (now, 100, 145, 60, 120, 425))
+    s.conn.commit()
+    s.record_transfer("kalshi", 100.0, source="kalshi_api", external_id="d1",
+                      ts=now - 3600)
+    pnl, frm, to, ts, xfers = s.equity_pnl(hours=24.0)
+    assert xfers == 100.0
+    assert pnl == 25.0                       # 125 delta - 100 deposit = 25 real gains
+    # withdrawal: -50 out means equity fell but trading was flat -> pnl adjusts UP
+    s.record_transfer("kalshi", -50.0, source="kalshi_api", external_id="w1",
+                      ts=now - 1800)
+    pnl2, *_ = s.equity_pnl(hours=24.0)
+    assert pnl2 == 75.0
+    # dedup by external id: re-sync must not double-count
+    assert s.record_transfer("kalshi", 100.0, source="kalshi_api", external_id="d1") is False
+    pnl3, *_, x3 = s.equity_pnl(hours=24.0)
+    assert x3 == 50.0 and pnl3 == 75.0
+    # transfers OUTSIDE the window don't affect it
+    s.record_transfer("polymarket_us", 500.0, source="manual", external_id=None,
+                      ts=now - 48*3600)
+    pnl4, *_ = s.equity_pnl(hours=24.0)
+    assert pnl4 == 75.0

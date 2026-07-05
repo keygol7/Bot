@@ -226,6 +226,19 @@ CREATE TABLE IF NOT EXISTS recycle_remnants (
     PRIMARY KEY (venue, market_id)
 );
 
+-- External transfers (deposits/withdrawals): the ground truth that separates DEPOSITS
+-- from GAINS in equity-based PnL. Kalshi rows sync from /portfolio/deposits+withdrawals
+-- (deduped by external_id); Polymarket has no API for this -> manual rows via
+-- ``--record-transfer``. amount is SIGNED dollars (+in/-out), net of venue fees.
+CREATE TABLE IF NOT EXISTS transfers (
+    ts          REAL NOT NULL,
+    venue       TEXT NOT NULL,
+    amount      REAL NOT NULL,
+    source      TEXT NOT NULL,          -- 'kalshi_api' | 'manual'
+    external_id TEXT UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_transfers_ts ON transfers(ts);
+
 -- Equity snapshots: total account value (cash + open-position cost basis, per venue)
 -- sampled periodically. The ONLY reliable PnL source — venue records don't window by
 -- time, local fills overstate cost, and Poly's settled positions age out. A "last N
@@ -400,10 +413,32 @@ class Store:
             (time.time(), kalshi_cash, poly_cash, kalshi_pos, poly_pos, total))
         self.conn.commit()
 
+    def record_transfer(self, venue: str, amount: float, *, source: str = "manual",
+                        external_id: str | None = None, ts: float | None = None) -> bool:
+        """Record an external deposit (+) / withdrawal (−). Returns False when a row
+        with the same external_id already exists (idempotent venue syncs)."""
+        try:
+            self.conn.execute(
+                "INSERT INTO transfers (ts, venue, amount, source, external_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ts if ts is not None else time.time(), venue, amount, source, external_id))
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False                              # duplicate external_id -> already known
+
+    def transfers_net(self, since_ts: float, until_ts: float | None = None) -> float:
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) s FROM transfers WHERE ts > ? AND ts <= ?",
+            (since_ts, until_ts if until_ts is not None else time.time())).fetchone()
+        return float(row["s"])
+
     def equity_pnl(self, hours: float = 24.0):
-        """(pnl, from_total, to_total, from_ts) over the window, or None if no baseline
-        snapshot that old exists yet. pnl = latest total - the oldest snapshot at/after
-        the cutoff (assumes no external deposits/withdrawals in the window)."""
+        """(trading_pnl, from_total, to_total, from_ts, net_transfers) over the window,
+        or None if no baseline snapshot exists yet. trading_pnl = equity delta MINUS the
+        net external transfers in the window — deposits are not gains, withdrawals are
+        not losses. Kalshi transfers sync from the venue API; Poly ones must be recorded
+        manually (--record-transfer), else they'll show up here as phantom pnl."""
         cutoff = time.time() - hours * 3600.0
         latest = self.conn.execute(
             "SELECT ts, total FROM equity_snapshots ORDER BY ts DESC LIMIT 1").fetchone()
@@ -415,8 +450,9 @@ class Store:
                 "SELECT ts, total FROM equity_snapshots ORDER BY ts ASC LIMIT 1").fetchone()
         if latest is None or base is None or latest["ts"] == base["ts"]:
             return None
-        return (round(latest["total"] - base["total"], 2), round(base["total"], 2),
-                round(latest["total"], 2), base["ts"])
+        xfers = self.transfers_net(base["ts"], latest["ts"])
+        return (round(latest["total"] - base["total"] - xfers, 2), round(base["total"], 2),
+                round(latest["total"], 2), base["ts"], round(xfers, 2))
 
     def entry_cost_for_pair(self, va: str, ma: str, vb: str, mb: str):
         """(yes_price, no_price) of the most-recent ACTED opportunity for this pair, or
