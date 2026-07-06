@@ -226,6 +226,16 @@ CREATE TABLE IF NOT EXISTS recycle_remnants (
     PRIMARY KEY (venue, market_id)
 );
 
+-- Kalshi series metadata (synced from /series): the data-driven semantics source for
+-- deterministic id parsing — title ("F1 Fastest Lap"), category, tags (JSON array).
+CREATE TABLE IF NOT EXISTS kalshi_series (
+    ticker    TEXT PRIMARY KEY,
+    title     TEXT,
+    category  TEXT,
+    tags      TEXT,
+    ts        REAL NOT NULL
+);
+
 -- External transfers (deposits/withdrawals): the ground truth that separates DEPOSITS
 -- from GAINS in equity-based PnL. Kalshi rows sync from /portfolio/deposits+withdrawals
 -- (deduped by external_id); Polymarket has no API for this -> manual rows via
@@ -412,6 +422,25 @@ class Store:
             "poly_pos, total) VALUES (?, ?, ?, ?, ?, ?)",
             (time.time(), kalshi_cash, poly_cash, kalshi_pos, poly_pos, total))
         self.conn.commit()
+
+    def upsert_series(self, rows) -> None:
+        """Bulk-sync Kalshi series metadata ({ticker,title,category,tags} dicts)."""
+        now = time.time()
+        self.conn.executemany(
+            "INSERT INTO kalshi_series (ticker, title, category, tags, ts) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(ticker) DO UPDATE SET "
+            "title=excluded.title, category=excluded.category, tags=excluded.tags, "
+            "ts=excluded.ts",
+            [(r.get("ticker"), r.get("title"), r.get("category"),
+              json.dumps(r.get("tags") or []), now) for r in rows if r.get("ticker")])
+        self.conn.commit()
+
+    def series_meta_map(self) -> dict:
+        """ticker -> {title, category, tags} for deterministic parsing."""
+        return {r["ticker"]: {"title": r["title"], "category": r["category"],
+                              "tags": json.loads(r["tags"] or "[]")}
+                for r in self.conn.execute(
+                    "SELECT ticker, title, category, tags FROM kalshi_series")}
 
     def record_transfer(self, venue: str, amount: float, *, source: str = "manual",
                         external_id: str | None = None, ts: float | None = None) -> bool:

@@ -813,6 +813,22 @@ class KalshiVenue:
         resp.raise_for_status()
         return resp.json().get("settlements") or []
 
+    async def series_list(self) -> list[dict]:
+        """All series metadata from /series — the data-driven source of each series'
+        semantics (title like 'F1 Fastest Lap', category, tags like ['Motorsport']).
+        Powers deterministic id parsing: a new series Kalshi launches is understood
+        from its own metadata, not from code changes."""
+        await self._limiter.wait()
+        path = "/series"
+        resp = await self._http().get(path, headers=self._auth_headers("GET", path))
+        resp.raise_for_status()
+        out = []
+        for s in resp.json().get("series") or []:
+            out.append({"ticker": s.get("ticker"), "title": s.get("title"),
+                        "category": s.get("category"),
+                        "tags": list(s.get("tags") or [])})
+        return out
+
     async def transfers(self) -> list[dict]:
         """External cash flows (deposits + withdrawals) from /portfolio/deposits and
         /portfolio/withdrawals — the ground truth for separating DEPOSITS from GAINS in
