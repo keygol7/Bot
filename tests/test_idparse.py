@@ -100,3 +100,27 @@ def test_helpers():
     assert code_aligns_tokens("brigp", {"british", "grand", "prix"})
     assert code_aligns_tokens("comdon", {"fracom", "matdon"})
     assert not code_aligns_tokens("zzz", {"british", "grand", "prix"})
+
+
+def test_ipo_undated_both_sides():
+    # both ids undated (year tokens only); outcome exact carries the join
+    assert _match("KXIPO-26-DATABRICKS", "Will Databricks IPO in 2026? - Databricks",
+                  {"title": "IPO", "tags": ["Companies"]},
+                  "ipcc-2026ipos-databricks", "Databricks IPO before 2027?")
+    assert not _match("KXIPO-26-DATABRICKS", "Will Databricks IPO in 2026? - Databricks",
+                      {"title": "IPO", "tags": ["Companies"]},
+                      "ipcc-2026ipos-stripe", "Stripe IPO before 2027?")
+
+
+def test_election_undated_kalshi_vs_dated_poly():
+    # KXGOVCA-26-SHIL: sparse middle (year only) + candidate code; poly dated Nov 3
+    assert _match("KXGOVCA-26-SHIL", "Will Steve Hilton win? - Steve Hilton",
+                  {"title": "California Governor Election", "tags": ["Politics"]},
+                  "ewc-usgub-ca-2026-11-03-shil", "California Governor Race - Steve Hilton")
+
+
+def test_nfl_division_series_title_evidence():
+    # empty middle: the series TITLE supplies event tokens (north <-> afcnorth)
+    assert _match("KXNFLAFCNORTH-26-BAL", "Will Baltimore win the AFC North? - Baltimore",
+                  {"title": "American Football Conference North Winner", "tags": ["Football"]},
+                  "tec-nfl-afcnorth-2027-01-04-w-bal", "AFC North Winner - Yes")

@@ -43,6 +43,13 @@ _METRIC_KEYWORDS = (
     ("to score first", "first_score"), ("score first", "first_score"),
     ("method of victory", "mov"), ("margin of victory", "mov"),
     ("score or assist", "soa"), ("win margin", "mov"),
+    # qualifier/award propositions are NOT the same as winning the thing itself —
+    # without these, "#1 Seed" ties "Division Winner" at the mutual-best stage
+    ("seed", "seed"), ("mvp", "mvp"), ("most valuable", "mvp"),
+    ("draft", "draft"), ("relegat", "relegation"), ("promot", "promotion"),
+    ("rookie of", "rookie"), ("coach of", "coach"), ("cy young", "cyyoung"),
+    ("ballon", "ballondor"), ("playoff", "playoffs"), ("make the playoffs", "playoffs"),
+    ("nominee", "nominee"), ("nomination", "nominee"),
     ("fastest lap", "fastlap"), ("fastlap", "fastlap"),
     ("total games", "total"), ("total", "total"),
     ("winner", "winner"), ("race", "winner"), ("champion", "winner"),
@@ -54,7 +61,7 @@ _METRIC_KEYWORDS = (
     ("inflation", "inflation_rate"), ("cpi", "inflation_rate"),
     ("gdp", "gdp_growth"), ("unemployment", "unemployment"),
     ("temperature", "temperature"), ("high temp", "temperature"),
-    ("price", "price"), ("ipo", "ipo"), ("nominee", "nominee"),
+    ("price", "price"), ("ipo", "ipo"),
     ("start", "starts"), ("mention", "unmatchable"), ("says", "unmatchable"),
 )
 # Poly single-token qualifiers seen platform-wide between the date and outcome code.
@@ -66,7 +73,47 @@ _POLY_QUALIFIER_METRIC = {
 _GENERIC_TOKENS = frozenset({
     "the", "and", "for", "will", "who", "in", "at", "of", "vs", "v", "yes", "no",
     "main", "race", "event", "upcoming", "scheduled", "esports", "gaming", "team",
+    # structural/metric words: never event IDENTITY (Dallas-high vs Midwest-high
+    # must not align on "high")
+    "high", "low", "temp", "temperature", "winner", "game", "match", "final",
+    "championship", "champion", "champ", "tournament", "series", "cup", "league",
+    "season", "week", "pro", "division",
+    # sport names are CATEGORY evidence, not event identity — "Pro Football
+    # Championship" must not event-align with "AFC South" via 'football'
+    "football", "basketball", "baseball", "hockey", "soccer", "tennis", "golf",
+    "boxing", "cricket", "volleyball",
 })
+# Category compatibility (NEGATIVE guard only): when BOTH sides resolve to a known
+# group and the groups differ -> reject; anything unknown passes (future-proof).
+# kalshi evidence = series tags; poly evidence = slug league segment.
+_CATEGORY_GROUPS = {
+    "esports": {"esports", "cs2", "dota2", "lol", "valorant", "r6", "cod", "sc2",
+                "rocketleague", "overwatch"},
+    "tennis": {"tennis", "atp", "wta", "itf", "itfme", "itfwo"},
+    "soccer": {"soccer", "football-soccer", "fwc", "ucl", "epl", "laliga", "mls",
+               "seriea", "bundesliga", "ligue1", "uel"},
+    "basketball": {"basketball", "nba", "wnba", "ncaab"},
+    "football": {"football", "nfl", "ncaaf"},
+    "baseball": {"baseball", "mlb", "kbo", "npb"},
+    "hockey": {"hockey", "nhl"},
+    "motorsport": {"motorsport", "f1", "nascar", "indycar", "motogp"},
+    "golf": {"golf", "pga", "liv"},
+    "mma": {"mma", "ufc", "boxing"},
+    "cricket": {"cricket", "t20", "ipl"},
+    "chess": {"chess"},
+    "weather": {"weather", "temp", "climate"},
+    "politics": {"politics", "elections", "usgub", "usse", "usprez", "ushouse"},
+    "economics": {"economics", "inflation", "fed", "gdp", "uscpi"},
+    "crypto": {"crypto", "bitcoin", "ethereum", "btc", "eth"},
+    "entertainment": {"entertainment", "movies", "music", "oscars", "awards"},
+}
+_TOKEN_GROUP = {t: g for g, toks in _CATEGORY_GROUPS.items() for t in toks}
+
+
+def category_conflict(a: "MarketKey", b: "MarketKey") -> bool:
+    ga = _TOKEN_GROUP.get((a.category or "").lower())
+    gb = _TOKEN_GROUP.get((b.category or "").lower())
+    return bool(ga and gb and ga != gb)
 _SUB_ORG = frozenset({"academy", "jr", "junior", "youth", "reserve", "reserves",
                       "u17", "u18", "u19", "u20", "u21", "u23", "ii", "prospects"})
 _NAME_STOP = frozenset({"de", "van", "der", "da", "la", "el", "jr", "the"})
@@ -124,7 +171,10 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
     outcome = parts[-1] if len(parts) >= 2 else None
 
     meta_title = (series_meta or {}).get("title") or ""
-    metric = metric_from_text(meta_title) if meta_title else "unknown"
+    # metric evidence: series title AND series ticker together (the ticker often
+    # carries the qualifier the title omits: KXNFL1SEED's title just says "win the
+    # conference" — 'seed' is in the ticker; keyword order handles specificity)
+    metric = metric_from_text(f"{meta_title} {series.lower()}") if meta_title else "unknown"
     if metric == "unknown":
         metric = metric_from_text(title)
     category = None
@@ -167,7 +217,13 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
             ev_tokens |= _tokens(ym.group(1))
             event_year = 2000 + int(ym.group(2))
             continue
+        if re.fullmatch(r"\d{2}", seg) and event_year is None:
+            event_year = 2000 + int(seg)
+            continue
         ev_tokens |= _tokens(seg)
+    if not ev_tokens and meta_title:
+        # sparse middle (futures/elections/IPO): the series title IS the event evidence
+        ev_tokens |= _tokens(meta_title)
 
     # outcome may itself be a threshold (KXCPIYOY-26NOV-T3.6, KXATPGTOTAL-...-47)
     if outcome:
@@ -225,26 +281,42 @@ def parse_poly(slug: str, title: str = "") -> MarketKey:
     ev_tokens: set = set()
     outcome_code = None
 
+    event_year = None
     m = _ISO_DATE.search(slug or "")
     if m:
         try:
             event_date = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except ValueError:
             pass
+    else:
+        ym = re.search(r"\b(20\d{2})", (slug or "").replace("-", " "))
+        if ym:
+            event_year = int(ym.group(1))
 
-    i = 0
+    scope_extra: set = set()
     date_idx = None
     for idx in range(len(toks) - 2):
         if (toks[idx].isdigit() and len(toks[idx]) == 4
                 and toks[idx + 1].isdigit() and toks[idx + 2].isdigit()):
             date_idx = idx
             break
-    pre = toks[:date_idx] if date_idx is not None else toks
-    post = toks[date_idx + 3:] if date_idx is not None else []
+    if date_idx is not None:
+        pre, post = toks[:date_idx], toks[date_idx + 3:]
+    else:
+        # undated slug (ipcc-2026ipos-databricks): the trailing-outcome convention
+        # still holds — last token is the outcome, the rest is event identity
+        pre, post = toks[:-1], toks[-1:]
 
     # family + league prefixes are grouping evidence, then event identity tokens
     if pre:
-        ev_tokens |= {t for t in pre[1:] if not t.isdigit()}  # drop the family prefix
+        for t in list(pre[1:]):
+            sm = re.match(r"^(?:(map|game|set)(\d)|(\d)(map|game|set)s?)$", t)
+            if sm:
+                kind = (sm.group(1) or sm.group(4)).replace("game", "map")
+                scope_extra.add(f"{kind}{sm.group(2) or sm.group(3)}")
+                continue
+            if not t.isdigit():
+                ev_tokens.add(t)
         if len(pre) >= 2:
             pass
     for seg in list(post):
@@ -270,6 +342,14 @@ def parse_poly(slug: str, title: str = "") -> MarketKey:
             metric = _POLY_QUALIFIER_METRIC[seg]
             post.remove(seg)
             continue
+        sm = re.match(r"^(?:(map|game|set)(\d)|(\d)(map|game|set)s?)$", seg)
+        if sm:
+            # sub-game scope in the slug (map2 / game2 / 2game): normalize map==game
+            # cross-venue (dota "game 2" is kalshi's map 2) so scopes compare equal
+            kind = (sm.group(1) or sm.group(4)).replace("game", "map")
+            scope_extra.add(f"{kind}{sm.group(2) or sm.group(3)}")
+            post.remove(seg)
+            continue
     if post:
         outcome_code = post[-1]
         ev_tokens |= set(post[:-1])
@@ -287,10 +367,11 @@ def parse_poly(slug: str, title: str = "") -> MarketKey:
             event_names = _tokens(title[:m2.start()])
         else:
             event_names = _tokens(title)
-    scope = frozenset(id_scope_tags(slug))
+    scope = frozenset(id_scope_tags(slug)) | frozenset(scope_extra)
     return MarketKey(
         venue="polymarket_us", market_id=slug, category=(toks[1] if len(toks) > 1 else None),
-        event_date=event_date, event_year=event_date.year if event_date else None,
+        event_date=event_date,
+        event_year=event_date.year if event_date else event_year,
         event_tokens=frozenset(ev_tokens) | event_names, outcome_code=outcome_code,
         outcome_names=names, metric=metric, thr_lo=thr_lo, thr_hi=thr_hi, scope=scope,
     )
@@ -387,10 +468,12 @@ def events_align(a: MarketKey, b: MarketKey) -> bool:
     else:
         ya = a.event_year or (a.event_date.year if a.event_date else None)
         yb = b.event_year or (b.event_date.year if b.event_date else None)
-        if ya and yb and ya != yb:
-            return False
+        if ya and yb and abs(ya - yb) > 1:
+            return False        # +/-1: season codes straddle new year (NFL 26 -> Jan 27)
         if not (a.event_tokens and b.event_tokens):
-            return False                     # no date AND no shared identity -> never
+            # no date and a side with no event identity (KXIPO-26-DATABRICKS has only
+            # its outcome): defer to the outcome gate — but only with year agreement
+            return bool(ya and yb)
     ea, eb = a.event_tokens, b.event_tokens
     if not ea or not eb:
         # dates matched exactly on both sides; allow when at least outcome aligns
@@ -447,6 +530,8 @@ def keys_match(a: MarketKey, b: MarketKey) -> bool:
         return False
     if a.metric == "unknown" or b.metric == "unknown" or a.metric != b.metric:
         return False
+    if category_conflict(a, b):
+        return False
     if a.scope != b.scope:
         return False
     if (a.thr_lo, a.thr_hi) != (b.thr_lo, b.thr_hi):
@@ -463,7 +548,7 @@ def keys_match(a: MarketKey, b: MarketKey) -> bool:
 
 # ---------------------------------------------------------------- join
 
-def join_pairs(kalshi_keys, poly_keys, *, undated_window_days: int = 45):
+def join_pairs(kalshi_keys, poly_keys, *, undated_window_days: int = 366):
     """Deterministic cross-venue join, fully BLOCKED so it scales to whole boards:
     poly keys are indexed by (metric, thr, date, token-3-gram) — both the first-3 and
     last-3 of every event token (kalshi pair-codes like NYSEA need the suffix gram to
@@ -485,9 +570,15 @@ def join_pairs(kalshi_keys, poly_keys, *, undated_window_days: int = 45):
     ix_dated: dict = {}
     ix_undated: dict = {}
     for pk in poly_keys:
-        if not pk.matchable or pk.metric == "unknown" or pk.event_date is None:
+        if not pk.matchable or pk.metric == "unknown":
             continue
         mt = (pk.metric, pk.thr_lo, pk.thr_hi)
+        if pk.event_date is None:
+            # undated poly (IPO-class: ipcc-2026ipos-databricks) joins only via the
+            # undated index — year agreement + outcome strength gate in keys_match
+            for g in grams(pk):
+                ix_undated.setdefault((*mt, g), []).append(pk)
+            continue
         for g in grams(pk):
             ix_dated.setdefault((*mt, pk.event_date, g), []).append(pk)
             ix_undated.setdefault((*mt, g), []).append(pk)
@@ -509,9 +600,10 @@ def join_pairs(kalshi_keys, poly_keys, *, undated_window_days: int = 45):
         else:
             for g in grams(kk):
                 for pk in ix_undated.get((*mt, g), ()):
-                    if kk.event_year and pk.event_date.year != kk.event_year:
+                    py = pk.event_date.year if pk.event_date else pk.event_year
+                    if kk.event_year and py and abs(py - kk.event_year) > 1:
                         continue
-                    if abs((pk.event_date - today).days) > undated_window_days:
+                    if pk.event_date and abs((pk.event_date - today).days) > undated_window_days:
                         continue
                     cands[id(pk)] = pk
         for pk in cands.values():
