@@ -301,6 +301,7 @@ class Settings:
     exec_recycle_pair_cooldown_secs: float = 3600.0  # rebuy guard (fee-churn loop)
     exec_recycle_max_settle_days: float = 3.0  # skip recycling far-dated undecided favorites
     exec_recycle_decided_bid: float = 0.98     # far-dated allowed only if this certain
+    exec_recycle_min_settle_hours: float = 24.0  # settling sooner than this -> ride it out
     # Structural-imbalance alert: drained + nothing recyclable for this long -> a loud
     # log.critical telling the operator the exact manual transfer to make. 0 = off.
     exec_imbalance_alert_secs: float = 900.0
@@ -504,6 +505,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         exec_recycle_pair_cooldown_secs=_env_float("EXEC_RECYCLE_PAIR_COOLDOWN_SECS", 3600.0),
         exec_recycle_max_settle_days=_env_float("EXEC_RECYCLE_MAX_SETTLE_DAYS", 3.0),
         exec_recycle_decided_bid=_env_float("EXEC_RECYCLE_DECIDED_BID", 0.98),
+        exec_recycle_min_settle_hours=_env_float("EXEC_RECYCLE_MIN_SETTLE_HOURS", 24.0),
         exec_imbalance_alert_secs=_env_float("EXEC_IMBALANCE_ALERT_SECS", 900.0),
         exec_early_exit_enabled=(env("EXEC_EARLY_EXIT_ENABLED", "false") or "false").lower() == "true",
         exec_early_exit_margin=_env_float("EXEC_EARLY_EXIT_MARGIN", 0.0),

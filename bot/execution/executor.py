@@ -138,6 +138,7 @@ class Executor:
         recycle_pair_cooldown: float = 3600.0,
         recycle_max_settle_days: float = 0.0,
         recycle_decided_bid: float = 0.98,
+        recycle_min_settle_hours: float = 0.0,
         early_exit_enabled: bool = False,
         early_exit_margin: float = 0.0,
         early_exit_cooldown: float = 300.0,
@@ -245,6 +246,10 @@ class Executor:
         # venue. Near-dated games (decided/imminent) recycle at any ITM bid. 0 = no limit.
         self.recycle_max_settle_days = recycle_max_settle_days
         self.recycle_decided_bid = recycle_decided_bid
+        # Don't recycle pairs settling WITHIN this window: they pay the full $1 in
+        # hours anyway, so an early exit only donates the give-up (1-3c/ct). The
+        # recycler's value is freeing capital locked for DAYS. 0 = off.
+        self.recycle_min_settle_hours = recycle_min_settle_hours
         # Early-profit exit: generalizes the recycler to realize a hedged pair's locked
         # profit BEFORE settlement whenever the two venues dislocate favorably (both
         # exit bids recover >= entry cost + margin). No drained-venue precondition.
@@ -869,7 +874,7 @@ class Executor:
             # not a settled outcome — don't sell it early (churn vs the rebalance gate's
             # settlement plan). Recycle it only if near-certain (>= decided bid). Near-
             # dated pairs (decided/imminent) always pass.
-            if self.recycle_max_settle_days > 0 and itm_bid < self.recycle_decided_bid:
+            if self.recycle_max_settle_days > 0 or self.recycle_min_settle_hours > 0:
                 close = q.close_time
                 if not close:
                     # close_time is None for many markets (the CA-gov class); the id
@@ -878,7 +883,15 @@ class Executor:
                     _c = pair_map.get((venue, market))
                     close = (settle_ts_from_id(market)
                              or (settle_ts_from_id(_c[1]) if _c else 0.0) or 0.0)
-                if close and (close - time.time()) > self.recycle_max_settle_days * 86400.0:
+                # Settles WITHIN the min window (or date unknown -> can't prove it
+                # doesn't): ride to settlement, never pay a give-up for hours.
+                if self.recycle_min_settle_hours > 0:
+                    if not close or (close - time.time()) < self.recycle_min_settle_hours * 3600.0:
+                        continue
+                # Far-dated pre-decision favorite: leave it (rebalance gate wants the
+                # settlement flow); recycle far-dated only when near-certain.
+                if (self.recycle_max_settle_days > 0 and itm_bid < self.recycle_decided_bid
+                        and close and (close - time.time()) > self.recycle_max_settle_days * 86400.0):
                     continue
             counter = pair_map.get((venue, market))
             cnet = self._positions.get(counter, 0.0) if counter else 0.0

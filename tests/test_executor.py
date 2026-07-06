@@ -1866,6 +1866,7 @@ def _rec_exec(venues, **kw):
     ex.recycle_max_contracts, ex.recycle_target = 50.0, 0.0
     ex.recycle_cooldown, ex.recycle_pair_cooldown = 0.0, 3600.0
     ex.recycle_max_settle_days = 0.0    # off by default; horizon test sets it
+    ex.recycle_min_settle_hours = 0.0   # ditto (dedicated test covers it)
     return ex, risk
 
 
@@ -2244,3 +2245,34 @@ def test_recycle_horizon_uses_id_date_when_close_time_missing():
     # drained venue = poly; ITM leg on poly at 0.91, undated quote, far-dated id -> SKIP
     acts = ex.plan_recycle("poly", pm, {("poly","p1"): q_itm, ("kalshi",km): q_otm})
     assert acts == []
+
+
+def test_recycle_skips_pairs_settling_within_min_hours():
+    import time as _time
+    from datetime import datetime, timezone, timedelta
+    store = Store(":memory:")
+    ex, _ = _rec_exec([FakeVenue("kalshi", []), FakeVenue("poly", [])], store=store)
+    ex.recycle_min_settle_hours = 24.0
+    ex._balances = {"kalshi": 8.0, "poly": 380.0}
+    ex._positions = {("kalshi", "K1"): 20.0, ("poly", "p1"): -20.0}
+    pm = {("kalshi", "K1"): ("poly", "p1"), ("poly", "p1"): ("kalshi", "K1")}
+    # DECIDED leg (0.99) settling in 3 hours -> pays $1 in hours, never recycle
+    near = _q("kalshi", "K1", no_ask=0.01); near.close_time = _time.time() + 3 * 3600
+    nearc = _q("poly", "p1", yes_ask=0.99); nearc.close_time = _time.time() + 3 * 3600
+    assert ex.plan_recycle("kalshi", pm, {("kalshi","K1"): near, ("poly","p1"): nearc}) == []
+    # same book settling in 2 days -> eligible
+    far = _q("kalshi", "K1", no_ask=0.01); far.close_time = _time.time() + 2 * 86400
+    farc = _q("poly", "p1", yes_ask=0.99); farc.close_time = _time.time() + 2 * 86400
+    assert len(ex.plan_recycle("kalshi", pm, {("kalshi","K1"): far, ("poly","p1"): farc})) == 1
+    # undated quote BUT the id carries a same-day date -> fail-closed skip
+    d = datetime.now(timezone.utc).strftime("%y%b%d").upper()
+    km = f"KXCS2GAME-{d}AB-CD"
+    ex._positions = {("kalshi", km): 20.0, ("poly", "p2"): -20.0}
+    pm2 = {("kalshi", km): ("poly", "p2"), ("poly", "p2"): ("kalshi", km)}
+    q1 = _q("kalshi", km, no_ask=0.01); q2 = _q("poly", "p2", yes_ask=0.99)
+    assert ex.plan_recycle("kalshi", pm2, {("kalshi",km): q1, ("poly","p2"): q2}) == []
+    # no date derivable anywhere -> can't prove it isn't settling soon -> skip
+    ex._positions = {("kalshi", "KNODATE-X"): 20.0, ("poly", "p3"): -20.0}
+    pm3 = {("kalshi", "KNODATE-X"): ("poly", "p3"), ("poly", "p3"): ("kalshi", "KNODATE-X")}
+    q3 = _q("kalshi", "KNODATE-X", no_ask=0.01); q4 = _q("poly", "p3", yes_ask=0.99)
+    assert ex.plan_recycle("kalshi", pm3, {("kalshi","KNODATE-X"): q3, ("poly","p3"): q4}) == []

@@ -760,6 +760,7 @@ async def stream(
         recycle_pair_cooldown=settings.exec_recycle_pair_cooldown_secs,
         recycle_max_settle_days=settings.exec_recycle_max_settle_days,
         recycle_decided_bid=settings.exec_recycle_decided_bid,
+        recycle_min_settle_hours=settings.exec_recycle_min_settle_hours,
         early_exit_enabled=settings.exec_early_exit_enabled,
         early_exit_margin=settings.exec_early_exit_margin,
         early_exit_cooldown=settings.exec_early_exit_cooldown_secs,
