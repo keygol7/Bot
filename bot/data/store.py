@@ -442,6 +442,29 @@ class Store:
                 for r in self.conn.execute(
                     "SELECT ticker, title, category, tags FROM kalshi_series")}
 
+    def idparse_pairs(self, *, max_age_days: float = 2.0) -> list[tuple]:
+        """Deterministic id-parse join over recently-scanned markets — the LLM-free
+        union member (mirrors canon_pairs' contract). Fail-closed parsing; the shared
+        fan-out/blacklist backstops apply in confirmed_pairs."""
+        from bot.matching.idparse import join_pairs, parse_kalshi, parse_poly
+
+        series = self.series_meta_map()
+        cutoff = time.time() - max_age_days * 86400.0
+        kk, pk = [], []
+        for r in self.conn.execute(
+                "SELECT venue, market_id, title FROM markets WHERE updated_at >= ?",
+                (cutoff,)):
+            if r["venue"] == "kalshi":
+                meta = series.get((r["market_id"] or "").split("-")[0])
+                kk.append(parse_kalshi(r["market_id"], r["title"] or "", meta))
+            elif r["venue"] == "polymarket_us":
+                pk.append(parse_poly(r["market_id"], r["title"] or ""))
+        pairs = []
+        for a, b in join_pairs(kk, pk):
+            pairs.append(("kalshi", a.market_id, "polymarket_us", b.market_id,
+                          f"kalshi:{a.market_id}|polymarket_us:{b.market_id}"))
+        return pairs
+
     def record_transfer(self, venue: str, amount: float, *, source: str = "manual",
                         external_id: str | None = None, ts: float | None = None) -> bool:
         """Record an external deposit (+) / withdrawal (−). Returns False when a row
@@ -794,7 +817,7 @@ class Store:
         drop_scope_mismatch: bool = True, safe_types_only: bool = True,
         use_fingerprint: bool = False, fingerprint_metrics: Optional[frozenset] = None,
         sweep_max_past_s: Optional[float] = None, combine_verdicts: bool = False,
-        use_canon: bool = False,
+        use_canon: bool = False, use_idparse: bool = False,
     ) -> list[tuple]:
         """Cached tradeable pairs: (venue_a, market_a, venue_b, market_b, event_key).
 
@@ -853,8 +876,11 @@ class Store:
         # on every settlement-deciding field become tradeable. Same shared fan-out +
         # blacklist backstops apply. Canon legs are kalshi-first like the sweep's.
         cp = self.canon_pairs(max_past_s=sweep_max_past_s) if use_canon else []
+        # Deterministic id-parse join (LLM-free): fourth union member; same shared
+        # fan-out + blacklist backstops as the others.
+        ip = self.idparse_pairs() if use_idparse else []
         merged: dict = {}
-        for p in (*fp, *verdict, *cp):
+        for p in (*fp, *verdict, *cp, *ip):
             merged.setdefault(self._pair_key(p[0], p[1], p[2], p[3]), p)
         pairs = list(merged.values())
         if max_fanout is not None:

@@ -178,6 +178,11 @@ class Settings:
     # deterministic join — the domain-agnostic third member of the watchlist union.
     # Only takes effect as extractions accumulate (the canon loop budgets a few per pass).
     match_use_canon: bool = True
+    # Deterministic matching (MATCH_DETERMINISTIC): discovery uses the id-parse join
+    # (bot/matching/idparse.py) and DROPS embeddings + per-pair LLM confirms entirely.
+    # The rules-verify LLM stays (safety layer). Legacy verdict/canon caches remain
+    # valid union members. Shadow-validated before enabling (bot.dryrun --match-shadow).
+    match_deterministic: bool = False
     # Max markets to pull per venue per scan (TOTAL across paginated pages). 0 = scan the
     # ENTIRE board (every available market), not just a page. Used by the streaming loop;
     # the matched/tradeable set is still bounded by Polymarket's small universe, so this
@@ -445,6 +450,9 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         ).lower() == "true",
         match_combine_verdicts=(
             env("MATCH_COMBINE_VERDICTS", "false") or "false"
+        ).lower() == "true",
+        match_deterministic=(
+            env("MATCH_DETERMINISTIC", "false") or "false"
         ).lower() == "true",
         match_use_canon=(
             env("MATCH_USE_CANON", "true") or "true"

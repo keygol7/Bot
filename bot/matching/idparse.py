@@ -38,6 +38,11 @@ from bot.matching.scope import id_scope_tags
 # This is a bounded KEYWORD map (tested), not a per-series curation: any series whose
 # title says "…Winner…" is a winner market, whatever the sport or category.
 _METRIC_KEYWORDS = (
+    ("exact", "exact_score"), ("set winner", "set_winner"),
+    ("correct score", "exact_score"), ("first to score", "first_score"),
+    ("to score first", "first_score"), ("score first", "first_score"),
+    ("method of victory", "mov"), ("margin of victory", "mov"),
+    ("score or assist", "soa"), ("win margin", "mov"),
     ("fastest lap", "fastlap"), ("fastlap", "fastlap"),
     ("total games", "total"), ("total", "total"),
     ("winner", "winner"), ("race", "winner"), ("champion", "winner"),
@@ -54,7 +59,7 @@ _METRIC_KEYWORDS = (
 )
 # Poly single-token qualifiers seen platform-wide between the date and outcome code.
 _POLY_QUALIFIER_METRIC = {
-    "w": "winner", "g": "goals", "a": "assists", "m": "winner",
+    "w": "winner", "g": "goals", "a": "assists", "ga": "ga", "m": "winner",
     "tg": "total", "fastlap": "fastlap", "cy": "winner", "dc": "winner",
     "cc": "winner", "sb": "stolen_bases", "hr": "homeruns", "ks": "strikeouts",
 }
@@ -184,7 +189,21 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
              or re.search(r"^Will (.+?) (?:win|be|set|score|record|finish|start)", title))
         if m:
             names = _tokens(m.group(1))
-    scope = frozenset(id_scope_tags(ticker))
+    scope = set(id_scope_tags(ticker))
+    # Series-level scope: kalshi encodes sub-game scopes in the SERIES name itself
+    # (KXWNBA1QWINNER, KXNBA2HWINNER, KXVALORANTMAP) — without these, quarter/map/full
+    # markets collide onto one poly market and the fan-out backstop kills them all.
+    qm = re.search(r"(\d)Q", series)
+    if qm:
+        scope.add(f"q{qm.group(1)}")
+    hm = re.search(r"(\d)H|([FS])H(?![A-Z])", series)
+    if hm and "MATCH" not in series and "GAME" not in series:
+        scope.add(f"h{hm.group(1) or hm.group(2).lower()}")
+    if "MAP" in series:
+        # map number rides the middle/outcome: KXVALORANTMAP-...GAMETS-2-TS
+        nums = [seg for seg in parts[1:-1] if re.fullmatch(r"\d", seg)]
+        scope.add(f"map{nums[-1] if nums else '?'}")
+    scope = frozenset(scope)
     return MarketKey(
         venue="kalshi", market_id=ticker, category=category,
         event_date=event_date, event_year=event_year,
@@ -233,7 +252,9 @@ def parse_poly(slug: str, title: str = "") -> MarketKey:
         if tm:
             lo = float(f"{tm.group(2)}.{tm.group(3) or 0}")
             if tm.group(1) in ("gte", "gt"):
-                thr_lo = lo
+                # count-stat convention: "over 46.5" == "47 or more" (kalshi's integer
+                # form). Normalize x.5 gt-lines up to the minimum qualifying integer.
+                thr_lo = lo + 0.5 if (tm.group(1) == "gt" and lo % 1 == 0.5) else lo
             else:
                 thr_hi = lo
             if tm.group(5):
@@ -326,24 +347,34 @@ def code_aligns_tokens(code: str, tokens) -> bool:
     """Can ``code`` be decomposed into 1-6 char pieces, each a prefix OR suffix of a
     distinct token? Handles both venue conventions deterministically:
     BRIGP -> bri(tish)+g(rand)+p(rix); COMDON -> (fra)com+(mat)don; EER -> eer(o)."""
-    toks = [t for t in tokens if len(t) >= 2]
-    if not code or not toks:
+    toks = [t for t in tokens if len(t) >= 2][:10]     # bound the search space
+    if not code or not toks or not (2 <= len(code) <= 10):
         return False
 
-    def rec(rest: str, used: frozenset) -> bool:
+    def rec(rest: str, used: frozenset, depth: int, ones: int, multi: int, big: bool) -> bool:
         if not rest:
-            return True
+            # substance requirement: one >=3 piece (nak) OR two multi-char pieces
+            # (pe+eg over petrocub/egnatia) — never a pile of initials
+            return big or multi >= 2
+        if depth >= 4:                                  # a code is <=4 abbreviation pieces
+            return False
         for n in range(min(6, len(rest)), 0, -1):
             piece = rest[:n]
+            if n == 1 and ones >= 2:
+                continue                                # at most two initials (g+p in BRIGP)
             for i, t in enumerate(toks):
                 if i in used:
                     continue
-                if t.startswith(piece) or t.endswith(piece):
-                    if rec(rest[n:], used | {i}):
-                        return True
+                if n == 1:
+                    ok = t.startswith(piece)            # 1-char = INITIAL only
+                else:
+                    ok = t.startswith(piece) or t.endswith(piece)
+                if ok and rec(rest[n:], used | {i}, depth + 1,
+                              ones + (n == 1), multi + (n >= 2), big or n >= 3):
+                    return True
         return False
 
-    return len(code) >= 2 and rec(code, frozenset())
+    return rec(code, frozenset(), 0, 0, 0, False)
 
 
 def events_align(a: MarketKey, b: MarketKey) -> bool:
@@ -372,6 +403,43 @@ def events_align(a: MarketKey, b: MarketKey) -> bool:
     return any(code_aligns_tokens(t, big) for t in small if 3 <= len(t) <= 12)
 
 
+def match_score(a: MarketKey, b: MarketKey) -> int:
+    """Evidence strength for a gated pair (0 = fails a hard gate). Used by the join
+    to pick the MUTUAL BEST counterpart instead of accepting every loose alignment —
+    the true pair (exact outcome code + strong event evidence) outscores a same-day
+    lookalike (shared 3-gram, weak containment), so over-production stops killing
+    true pairs via the fan-out backstop."""
+    if not keys_match(a, b):
+        return 0
+    score = 0
+    # date evidence
+    if a.event_date and b.event_date:
+        score += 3 if a.event_date == b.event_date else 1
+    # event-token evidence: count real hits
+    ea, eb = a.event_tokens, b.event_tokens
+    small, big = (ea, eb) if len(ea) <= len(eb) else (eb, ea)
+    hits = sum(1 for t in small if any(t == o for o in big))
+    part = sum(1 for t in small if len(t) >= 3 and any(t in o or o in t for o in big))
+    score += min(3, 2 * hits + part)
+    # outcome evidence
+    ca, cb = a.outcome_code, b.outcome_code
+    if ca and cb and ca == cb:
+        score += 3
+    else:
+        gens_a = person_codes(a.outcome_names) if a.outcome_names else set()
+        gens_b = person_codes(b.outcome_names) if b.outcome_names else set()
+        if (cb and cb in gens_a) or (ca and ca in gens_b):
+            score += 3
+        elif (a.outcome_names and b.outcome_names
+              and (a.outcome_names <= b.outcome_names or b.outcome_names <= a.outcome_names)):
+            score += 3
+        elif (cb and any(cb.endswith(g) or g.endswith(cb) for g in gens_a if len(g) >= 4))                 or (ca and any(ca.endswith(g) or g.endswith(ca) for g in gens_b if len(g) >= 4)):
+            score += 2
+        else:
+            score += 1
+    return score
+
+
 def keys_match(a: MarketKey, b: MarketKey) -> bool:
     """Deterministic same-proposition check: exact metric + threshold + scope, same
     event, same YES entity. Fails closed on unknown metric or unmatchable types."""
@@ -391,3 +459,84 @@ def keys_match(a: MarketKey, b: MarketKey) -> bool:
         # thresholds keep an outcome code on at least one side and fall through.)
         return True
     return outcome_align(a, b)
+
+
+# ---------------------------------------------------------------- join
+
+def join_pairs(kalshi_keys, poly_keys, *, undated_window_days: int = 45):
+    """Deterministic cross-venue join, fully BLOCKED so it scales to whole boards:
+    poly keys are indexed by (metric, thr, date, token-3-gram) — both the first-3 and
+    last-3 of every event token (kalshi pair-codes like NYSEA need the suffix gram to
+    meet poly's ny/sea tokens; COMDON's halves meet fracom/matdon via suffixes). A
+    kalshi key only ever meets poly keys sharing real token evidence; keys_match then
+    does the exact verification. Pure function; caller applies fan-out/blacklist."""
+    from datetime import date as _date, timedelta
+
+    def grams(key):
+        toks = list(key.event_tokens)[:12] or list(key.outcome_names)[:6]
+        out = set()
+        for t in toks:
+            if len(t) >= 3:
+                out.add(t[:3]); out.add(t[-3:])
+            elif len(t) == 2:
+                out.add(t)
+        return out
+
+    ix_dated: dict = {}
+    ix_undated: dict = {}
+    for pk in poly_keys:
+        if not pk.matchable or pk.metric == "unknown" or pk.event_date is None:
+            continue
+        mt = (pk.metric, pk.thr_lo, pk.thr_hi)
+        for g in grams(pk):
+            ix_dated.setdefault((*mt, pk.event_date, g), []).append(pk)
+            ix_undated.setdefault((*mt, g), []).append(pk)
+
+    today = _date.today()
+    out = []
+    seen = set()
+    scored: list = []
+    for kk in kalshi_keys:
+        if not kk.matchable or kk.metric == "unknown":
+            continue
+        mt = (kk.metric, kk.thr_lo, kk.thr_hi)
+        cands: dict = {}
+        if kk.event_date is not None:
+            for pd in (kk.event_date + timedelta(days=d) for d in (-1, 0, 1)):
+                for g in grams(kk):
+                    for pk in ix_dated.get((*mt, pd, g), ()):
+                        cands[id(pk)] = pk
+        else:
+            for g in grams(kk):
+                for pk in ix_undated.get((*mt, g), ()):
+                    if kk.event_year and pk.event_date.year != kk.event_year:
+                        continue
+                    if abs((pk.event_date - today).days) > undated_window_days:
+                        continue
+                    cands[id(pk)] = pk
+        for pk in cands.values():
+            sc = match_score(kk, pk)
+            if sc > 0:
+                scored.append((sc, kk, pk))
+
+    # MUTUAL BEST: each market keeps only its strongest counterpart, and only when
+    # the choice is unambiguous (a strict margin over the runner-up on both sides).
+    best_k: dict = {}
+    best_p: dict = {}
+    for sc, kk, pk in scored:
+        for side, key in ((best_k, kk.market_id), (best_p, pk.market_id)):
+            cur = side.get(key)
+            if cur is None or sc > cur[0]:
+                side[key] = (sc, kk, pk, cur[0] if cur else 0)
+            elif sc > cur[3]:
+                side[key] = (cur[0], cur[1], cur[2], sc)
+    for sc, kk, pk, second in best_k.values():
+        if sc <= second:
+            continue                                 # ambiguous on the kalshi side
+        bp = best_p.get(pk.market_id)
+        if bp and bp[1] is kk and bp[0] > bp[3]:
+            pair_id = (kk.market_id, pk.market_id)
+            if pair_id not in seen:
+                seen.add(pair_id)
+                out.append((kk, pk))
+    return out

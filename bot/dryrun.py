@@ -858,7 +858,9 @@ async def stream(
 
     # Discovery (embedding shortlist + LLM confirm) only feeds match_verdicts, which the
     # fingerprint sweep ignores — so skip the clients entirely when it's off.
-    discover = settings.stream_discovery
+    # Deterministic matching replaces the embedding+LLM discovery pass entirely
+    # (the id-parse join runs inside confirmed_pairs); rules-verify stays.
+    discover = settings.stream_discovery and not settings.match_deterministic
     complete_fn = make_complete_fn(settings.llm) if (use_llm and discover) else None
     embed_fn = None
     if use_embed and discover:
@@ -986,6 +988,7 @@ async def stream(
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
             combine_verdicts=settings.match_combine_verdicts,
+            use_idparse=settings.match_deterministic,
             use_canon=settings.match_use_canon,
         )
         return await build_watchlist(cached, res.scanned, venues, store=store,
@@ -1082,6 +1085,17 @@ async def stream(
                     ok, bad = store.settlement_consistency()
                     log.info("settlement truth: %d new check(s); track record "
                              "%d consistent / %d divergent", n, ok, bad)
+                # Series metadata sync (daily): data-driven semantics for the
+                # deterministic id-parse matcher — new Kalshi series self-describe.
+                try:
+                    row = store.conn.execute(
+                        "SELECT MAX(ts) t FROM kalshi_series").fetchone()
+                    if not row["t"] or time.time() - row["t"] > 86400:
+                        store.upsert_series(await kalshi_v.series_list())
+                        log.info("kalshi series metadata synced (%d series)",
+                                 len(store.series_meta_map()))
+                except Exception as exc:
+                    log.warning("series sync failed: %s", exc)
                 # Housekeeping: drop markets not scanned in a week (dead/settled) so the
                 # sweep + canon scans and RAM don't grow unbounded. Preserves markets
                 # referenced by a canon extraction or verdict.
@@ -1672,6 +1686,7 @@ def show_watchlist(settings: Settings, *, limit: int = 500) -> int:
                 fingerprint_metrics=settings.match_fingerprint_metrics or None,
                 sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
                 combine_verdicts=settings.match_combine_verdicts,
+            use_idparse=settings.match_deterministic,
             )
             # No wide scan needed: build_watchlist probes each cached leg directly.
             live = await build_watchlist(cached, set(), venues)
@@ -1933,6 +1948,7 @@ def inspect_matches(
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
             combine_verdicts=settings.match_combine_verdicts,
+            use_idparse=settings.match_deterministic,
         )
         if tradeable_only:
             # Exactly what the streamer will trade — audit this before going live.
@@ -2102,6 +2118,7 @@ def poly_depth_report(settings: Settings, *, top: int = 40) -> int:
         fingerprint_metrics=settings.match_fingerprint_metrics or None,
         sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
         combine_verdicts=settings.match_combine_verdicts,
+            use_idparse=settings.match_deterministic,
     )
 
     def _best_edge(qa, qb):
@@ -2171,6 +2188,105 @@ def poly_depth_report(settings: Settings, *, top: int = 40) -> int:
 
     asyncio.run(_run())
     return 0
+
+
+def match_shadow(settings: Settings) -> int:
+    """SHADOW: score the deterministic id-parse matcher against labeled history —
+    the cutover gate for retiring the LLM from discovery. Positives = LLM-confirmed
+    pairs CLEANED of known false matches (blacklist, material rules divergence,
+    settlement-divergent); negatives = LLM-rejected pairs + the blacklist."""
+    import asyncio as _asyncio
+    from collections import Counter
+
+    from bot.data.store import Store
+
+    async def run() -> int:
+        store = Store(settings.db_path)
+        if not store.series_meta_map():
+            venues = _build_venues(settings)
+            kv = next((v for v in venues if v.name == "kalshi"), None)
+            if kv is not None:
+                print("syncing kalshi series metadata...")
+                store.upsert_series(await kv.series_list())
+                await kv.aclose()
+        print(f"series metadata: {len(store.series_meta_map())} series")
+
+        from bot.data.store import drop_fanout_pairs as _dfp
+        det = _dfp(store.idparse_pairs(max_age_days=30.0), max_fanout=1)
+        det_keys = {store._pair_key(p[0], p[1], p[2], p[3]) for p in det}
+        print(f"deterministic join produced {len(det)} pairs over 30d of markets")
+
+        bl = store.blacklisted_keys()
+        divergent = set()
+        for r in store.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM settlement_checks "
+                "WHERE consistent = 0"):
+            divergent.add(store._pair_key(r["venue_a"], r["market_a"],
+                                          r["venue_b"], r["market_b"]))
+        material = store.rules_divergent_keys()
+
+        # TRUTH SET: the raw verdict cache is drenched in LLM false positives (golf
+        # fields confirmed cross-golfer, F1 cross-driver, totals across lines) that
+        # only the fan-out backstop kept from trading. Honest positives = confirms
+        # that SURVIVE fan-out, plus pairs that actually traded, plus settlement-
+        # consistent pairs; minus every known-false set.
+        from bot.data.store import drop_fanout_pairs
+        raw_confirms = [(r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], "")
+                        for r in store.conn.execute(
+                            "SELECT venue_a, market_a, venue_b, market_b "
+                            "FROM match_verdicts WHERE same_event=1")]
+        surviving = drop_fanout_pairs(raw_confirms, max_fanout=1)
+        pos_keys = {store._pair_key(p[0], p[1], p[2], p[3]) for p in surviving}
+        for r in store.conn.execute(
+                "SELECT DISTINCT buy_yes_venue a, buy_yes_market b, buy_no_venue c,"
+                " buy_no_market d FROM opportunities WHERE acted=1"):
+            pos_keys.add(store._pair_key(r["a"], r["b"], r["c"], r["d"]))
+        for r in store.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM settlement_checks "
+                "WHERE consistent=1"):
+            pos_keys.add(store._pair_key(r["venue_a"], r["market_a"],
+                                         r["venue_b"], r["market_b"]))
+        present = {r["market_id"] for r in store.conn.execute(
+            "SELECT market_id FROM markets")}
+        pos, neg = {}, {}
+        for key in pos_keys:
+            if key in bl or key in divergent or key in material:
+                continue
+            if key[1] not in present or key[3] not in present:
+                continue        # market rows pruned -> unparseable, not a fair miss
+            kalshi_mkt = key[1] if key[0] == "kalshi" else key[3]
+            pos[key] = kalshi_mkt.split("-")[0]
+        for r in store.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b, same_event "
+                "FROM match_verdicts WHERE same_event=0"):
+            key = store._pair_key(r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
+            fam = (r["market_a"] if r["venue_a"] == "kalshi" else r["market_b"]).split("-")[0]
+            neg[key] = fam
+
+        hit = Counter(); miss = Counter(); fp = Counter()
+        for key, fam in pos.items():
+            (hit if key in det_keys else miss)[fam] += 1
+        for key, fam in neg.items():
+            if key in det_keys:
+                fp[fam] += 1
+        fp_bl = sum(1 for k in det_keys if k in bl or k in divergent or k in material)
+
+        tp, fn = sum(hit.values()), sum(miss.values())
+        print(f"\nRECALL vs cleaned truth: {tp}/{tp+fn} ({tp/max(tp+fn,1)*100:.0f}%)")
+        print(f"FALSE POSITIVES vs LLM-rejected: {sum(fp.values())} | "
+              f"vs blacklist/divergent/material: {fp_bl}")
+        print("\nper-family recall (hit/miss):")
+        for fam in sorted(set(hit) | set(miss), key=lambda f: -(hit[f]+miss[f])):
+            t = hit[fam] + miss[fam]
+            print(f"  {fam:28} {hit[fam]:4}/{t:<4} ({hit[fam]/t*100:3.0f}%)")
+        if fp:
+            print("\nper-family FPs vs LLM-rejected (INSPECT — may be LLM errors):")
+            for fam, n in fp.most_common(10):
+                print(f"  {fam:28} {n}")
+        store.close()
+        return 0
+
+    return _asyncio.run(run())
 
 
 def pnl_report(settings: Settings, hours: float = 24.0) -> int:
@@ -2489,6 +2605,9 @@ def main(argv: list[str] | None = None) -> None:
                         "doesn't count it as trading gains — needed for POLY (no API); "
                         "kalshi transfers sync automatically. e.g. --record-transfer "
                         "polymarket_us 100")
+    p.add_argument("--match-shadow", action="store_true",
+                   help="score the deterministic id-parse matcher against labeled "
+                        "verdict/settlement history (read-only; the LLM-retirement gate)")
     p.add_argument("--pnl-report", nargs="?", const=24.0, type=float, metavar="HOURS",
                    help="accurate profit report (read-only): per-pair LOCKED profit of "
                         "open hedged pairs from the average-cost fills ledger, venue-"
@@ -2603,6 +2722,9 @@ def main(argv: list[str] | None = None) -> None:
               f"{float(args.record_transfer[1]):+.2f}")
         _st.close()
         raise SystemExit(0)
+
+    if args.match_shadow:
+        raise SystemExit(match_shadow(load_settings()))
 
     if args.pnl_report is not None:
         raise SystemExit(pnl_report(load_settings(), hours=args.pnl_report))
