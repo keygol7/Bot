@@ -442,6 +442,21 @@ class Store:
                 for r in self.conn.execute(
                     "SELECT ticker, title, category, tags FROM kalshi_series")}
 
+    def record_idparse_verdicts(self, pairs) -> int:
+        """Persist deterministic join results as match verdicts (INSERT-only: never
+        overwrite an existing verdict, LLM or otherwise). The watchlist, fan-out,
+        blacklist and rules-verify machinery then treat them like any confirm —
+        idparse is a verdict SOURCE, not a hot-path union member (the whole-board
+        join takes minutes and runs in a subprocess on its own cadence)."""
+        now = time.time()
+        cur = self.conn.executemany(
+            "INSERT OR IGNORE INTO match_verdicts (venue_a, market_a, venue_b, "
+            "market_b, same_event, confidence, rationale, event_key, ts) "
+            "VALUES (?, ?, ?, ?, 1, 0.99, 'idparse', ?, ?)",
+            [(p[0], p[1], p[2], p[3], p[4], now) for p in pairs])
+        self.conn.commit()
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
     def idparse_pairs(self, *, max_age_days: float = 2.0) -> list[tuple]:
         """Deterministic id-parse join over recently-scanned markets — the LLM-free
         union member (mirrors canon_pairs' contract). Fail-closed parsing; the shared

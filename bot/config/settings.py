@@ -183,6 +183,7 @@ class Settings:
     # The rules-verify LLM stays (safety layer). Legacy verdict/canon caches remain
     # valid union members. Shadow-validated before enabling (bot.dryrun --match-shadow).
     match_deterministic: bool = False
+    match_idparse_interval: float = 600.0  # seconds between deterministic join runs
     # Max markets to pull per venue per scan (TOTAL across paginated pages). 0 = scan the
     # ENTIRE board (every available market), not just a page. Used by the streaming loop;
     # the matched/tradeable set is still bounded by Polymarket's small universe, so this
@@ -454,6 +455,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         match_deterministic=(
             env("MATCH_DETERMINISTIC", "false") or "false"
         ).lower() == "true",
+        match_idparse_interval=_env_float("MATCH_IDPARSE_INTERVAL", 600.0),
         match_use_canon=(
             env("MATCH_USE_CANON", "true") or "true"
         ).lower() == "true",

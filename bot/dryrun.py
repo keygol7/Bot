@@ -988,7 +988,6 @@ async def stream(
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
             combine_verdicts=settings.match_combine_verdicts,
-            use_idparse=settings.match_deterministic,
             use_canon=settings.match_use_canon,
         )
         return await build_watchlist(cached, res.scanned, venues, store=store,
@@ -1183,6 +1182,26 @@ async def stream(
             except Exception as exc:
                 log.warning("rules verify pass failed: %s", exc)
 
+    async def idparse_sync_loop():
+        """Deterministic matching cadence: spawn `--idparse-sync` as a SUBPROCESS
+        (pure-CPU minutes; a thread would hold the GIL against the trading loop)
+        every interval. Results land in match_verdicts; the watchlist refresh picks
+        them up like any confirm."""
+        import sys as _sys
+        while True:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    _sys.executable, "-m", "bot.dryrun", "--idparse-sync",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT)
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=900)
+                for line in (out or b"").decode().splitlines():
+                    if "idparse-sync" in line:
+                        log.info("%s", line.strip())
+            except Exception as exc:
+                log.warning("idparse sync failed: %s", exc)
+            await asyncio.sleep(settings.match_idparse_interval)
+
     async def canon_extract_loop():
         # Canonicalize-then-join (bot/matching/canon.py): ONE cached LLM extraction per
         # market from its resolution rules; matching then happens as a deterministic join
@@ -1349,7 +1368,10 @@ async def stream(
     private_tasks.append(asyncio.create_task(poll_balances()))
     private_tasks.append(asyncio.create_task(settlement_truth_loop()))
     private_tasks.append(asyncio.create_task(rules_verify_loop()))
-    private_tasks.append(asyncio.create_task(canon_extract_loop()))
+    if settings.match_deterministic:
+        private_tasks.append(asyncio.create_task(idparse_sync_loop()))
+    else:
+        private_tasks.append(asyncio.create_task(canon_extract_loop()))
     private_tasks.append(asyncio.create_task(capital_recycler_loop()))
     private_tasks.append(asyncio.create_task(early_exit_loop()))
     if settings.exec_recycle_floor > 0:
@@ -1686,7 +1708,6 @@ def show_watchlist(settings: Settings, *, limit: int = 500) -> int:
                 fingerprint_metrics=settings.match_fingerprint_metrics or None,
                 sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
                 combine_verdicts=settings.match_combine_verdicts,
-            use_idparse=settings.match_deterministic,
             )
             # No wide scan needed: build_watchlist probes each cached leg directly.
             live = await build_watchlist(cached, set(), venues)
@@ -1948,7 +1969,6 @@ def inspect_matches(
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
             combine_verdicts=settings.match_combine_verdicts,
-            use_idparse=settings.match_deterministic,
         )
         if tradeable_only:
             # Exactly what the streamer will trade — audit this before going live.
@@ -2118,7 +2138,6 @@ def poly_depth_report(settings: Settings, *, top: int = 40) -> int:
         fingerprint_metrics=settings.match_fingerprint_metrics or None,
         sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
         combine_verdicts=settings.match_combine_verdicts,
-            use_idparse=settings.match_deterministic,
     )
 
     def _best_edge(qa, qb):
@@ -2188,6 +2207,38 @@ def poly_depth_report(settings: Settings, *, top: int = 40) -> int:
 
     asyncio.run(_run())
     return 0
+
+
+_time_mod = __import__('time')
+
+
+def idparse_sync(settings: Settings) -> int:
+    """Run the deterministic id-parse join once and persist results as verdicts.
+    Runs as a SUBPROCESS from the streaming loop (the whole-board join takes minutes
+    of pure CPU — a thread would fight the trading loop for the GIL)."""
+    import asyncio as _asyncio
+
+    from bot.data.store import Store, drop_fanout_pairs
+
+    async def run() -> int:
+        store = Store(settings.db_path)
+        stale = store.conn.execute("SELECT MAX(ts) t FROM kalshi_series").fetchone()
+        if not stale["t"] or _time_mod.time() - stale["t"] > 86400:
+            venues = _build_venues(settings)
+            kv = next((v for v in venues if v.name == "kalshi"), None)
+            if kv is not None:
+                store.upsert_series(await kv.series_list())
+                await kv.aclose()
+        pairs = drop_fanout_pairs(store.idparse_pairs(max_age_days=2.0), max_fanout=1)
+        bl = store.blacklisted_keys()
+        pairs = [p for p in pairs
+                 if store._pair_key(p[0], p[1], p[2], p[3]) not in bl]
+        added = store.record_idparse_verdicts(pairs)
+        print(f"idparse-sync: {len(pairs)} pairs, {added} new verdicts")
+        store.close()
+        return 0
+
+    return _asyncio.run(run())
 
 
 def match_shadow(settings: Settings) -> int:
@@ -2271,8 +2322,27 @@ def match_shadow(settings: Settings) -> int:
                 fp[fam] += 1
         fp_bl = sum(1 for k in det_keys if k in bl or k in divergent or k in material)
 
+        # UNION with the fingerprint sweep — post-cutover discovery is fp + idparse
+        # (legacy caches also persist, but they trivially cover cache-derived truth;
+        # fp+idparse is the honest number for FUTURE pairs)
+        from bot.matching.fingerprint import are_complementary, from_kalshi, from_polymarket
+        titles = {r["market_id"]: r["title"] for r in store.conn.execute(
+            "SELECT market_id, title FROM markets")}
+        fp_hit = set()
+        for key in pos:
+            ka = key[1] if key[0] == "kalshi" else key[3]
+            pb = key[3] if key[0] == "kalshi" else key[1]
+            try:
+                if are_complementary(from_kalshi(ka, titles.get(ka) or ""),
+                                     from_polymarket(pb, titles.get(pb) or "")):
+                    fp_hit.add(key)
+            except Exception:
+                pass
+        union_tp = sum(1 for k in pos if k in det_keys or k in fp_hit)
         tp, fn = sum(hit.values()), sum(miss.values())
         print(f"\nRECALL vs cleaned truth: {tp}/{tp+fn} ({tp/max(tp+fn,1)*100:.0f}%)")
+        print(f"UNION (fingerprint sweep + idparse): {union_tp}/{len(pos)} "
+              f"({union_tp/max(len(pos),1)*100:.0f}%)  [fingerprint alone: {len(fp_hit)}]")
         print(f"FALSE POSITIVES vs LLM-rejected: {sum(fp.values())} | "
               f"vs blacklist/divergent/material: {fp_bl}")
         print("\nper-family recall (hit/miss):")
@@ -2605,6 +2675,9 @@ def main(argv: list[str] | None = None) -> None:
                         "doesn't count it as trading gains — needed for POLY (no API); "
                         "kalshi transfers sync automatically. e.g. --record-transfer "
                         "polymarket_us 100")
+    p.add_argument("--idparse-sync", action="store_true",
+                   help="run the deterministic id-parse join once, persist results "
+                        "as verdicts, exit (spawned by the stream loop)")
     p.add_argument("--match-shadow", action="store_true",
                    help="score the deterministic id-parse matcher against labeled "
                         "verdict/settlement history (read-only; the LLM-retirement gate)")
@@ -2722,6 +2795,9 @@ def main(argv: list[str] | None = None) -> None:
               f"{float(args.record_transfer[1]):+.2f}")
         _st.close()
         raise SystemExit(0)
+
+    if args.idparse_sync:
+        raise SystemExit(idparse_sync(load_settings()))
 
     if args.match_shadow:
         raise SystemExit(match_shadow(load_settings()))
