@@ -46,6 +46,7 @@ _METRIC_KEYWORDS = (
     # qualifier/award propositions are NOT the same as winning the thing itself —
     # without these, "#1 Seed" ties "Division Winner" at the mutual-best stage
     ("seed", "seed"), ("mvp", "mvp"), ("most valuable", "mvp"),
+    ("county", "county"), ("popular vote", "popvote"),
     ("draft", "draft"), ("relegat", "relegation"), ("promot", "promotion"),
     ("rookie of", "rookie"), ("coach of", "coach"), ("cy young", "cyyoung"),
     ("ballon", "ballondor"), ("playoff", "playoffs"), ("make the playoffs", "playoffs"),
@@ -195,6 +196,9 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
             except ValueError:
                 pass
             residue = seg.replace(m.group(1), "")
+            # start time rides right after the date (26JUL02 0700 OSGSOS): strip it
+            # or the team pair-code tokenizes as '0700osgsos' and its grams are junk
+            residue = re.sub(r"^\d{4}", "", residue)
             ev_tokens |= _tokens(residue)
             continue
         tm = _KALSHI_THR.match(seg)
@@ -309,14 +313,10 @@ def parse_poly(slug: str, title: str = "") -> MarketKey:
 
     # family + league prefixes are grouping evidence, then event identity tokens
     if pre:
-        for t in list(pre[1:]):
-            sm = re.match(r"^(?:(map|game|set)(\d)|(\d)(map|game|set)s?)$", t)
-            if sm:
-                kind = (sm.group(1) or sm.group(4)).replace("game", "map")
-                scope_extra.add(f"{kind}{sm.group(2) or sm.group(3)}")
-                continue
-            if not t.isdigit():
-                ev_tokens.add(t)
+        # PRE-date tokens are event identity ONLY — never scope. "2game" here is the
+        # team 2Game Esports (FURA2GAME taught us); real sub-game markers (map2/
+        # game2) ride POST-date, where the loop below extracts them.
+        ev_tokens |= {t for t in pre[1:] if not t.isdigit()}
         if len(pre) >= 2:
             pass
     for seg in list(post):
