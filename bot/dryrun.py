@@ -1151,7 +1151,12 @@ async def stream(
         while True:
             try:
                 budget = 15
-                for p in list(engine._pairs.values()):
+                # blocked-with-live-edge pairs jump the queue: they are the ones
+                # costing money RIGHT NOW (the 7c ITFW dislocation of 2026-07-07)
+                blocked = getattr(engine, "_rules_blocked", {})
+                ordered = sorted(engine._pairs.values(),
+                                 key=lambda p: -blocked.get(p.key, 0.0))
+                for p in ordered:
                     if budget <= 0:
                         break
                     if store.rules_checked(p.venue_a, p.market_a, p.venue_b, p.market_b):

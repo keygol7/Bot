@@ -214,6 +214,8 @@ class StreamingEngine:
         self._ws_trust: dict = {}               # consecutive WS-vs-REST agreements
         self._feed_lag: dict = {}               # venue -> EWMA transport lag (secs)
         self._settled_leg_until: dict = {}      # pair key -> sticky settled-leg expiry
+        self._rules_blocked: dict = {}          # pair key -> last rules_pending block ts
+        self._rules_block_logged: dict = {}     # rate-limit for the block log line
         # PRE-TRADE RULES GATE: pairs may not fire until their resolution rules have
         # been LLM-compared once (rules_checked, fed by the rules loop). Closes the
         # race where a fresh pair trades minutes before verification reaches it.
@@ -588,6 +590,15 @@ class StreamingEngine:
         # else keeps the persist guard below.
         if (self.require_rules_verify and key not in self.rules_checked
                 and key not in self.verified_pairs):
+            # visible + prioritized: the rules loop verifies blocked-with-live-edge
+            # pairs FIRST (a real 7c dislocation sat silently blocked for minutes on
+            # 2026-07-07 while the loop worked the watchlist in arbitrary order)
+            self._rules_blocked[key] = self.clock()
+            now = self.clock()
+            if now - self._rules_block_logged.get(key, 0.0) > 300:
+                self._rules_block_logged[key] = now
+                log.info("STREAM %s: edge %.4f BLOCKED pending rules verification "
+                         "(prioritized for next pass)", p.event_key, edge)
             self._observe(p, edge, yq, nq, size, "rules_pending")
             return None                       # never trade ahead of the rules pass
         deep = self.hybrid_take_depth > 0 and size >= self.hybrid_take_depth
