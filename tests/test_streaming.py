@@ -1470,3 +1470,24 @@ def test_stream_build_opp_carries_settle_ts_from_id():
     assert opp.settle_ts > 0
     got = datetime.fromtimestamp(opp.settle_ts, timezone.utc).strftime("%Y-%m-%d")
     assert got == "2026-11-03"
+
+
+def test_eval_direction_depth_sweep_reprices_quotes():
+    from bot.fees import ZeroFeeModel
+    from bot.streaming.engine import StreamingEngine
+    eng = StreamingEngine.__new__(StreamingEngine)
+    eng.min_edge = 0.0
+    eng._fee = lambda v: ZeroFeeModel()
+    a = MarketQuote(venue="kalshi", market_id="K", title="",
+                    yes_ask=0.44, yes_ask_size=5, no_ask=0.60, no_ask_size=5,
+                    yes_ask_levels=((0.44, 5), (0.46, 200)),
+                    no_ask_levels=((0.60, 5),))
+    b = MarketQuote(venue="poly", market_id="P", title="",
+                    yes_ask=0.60, yes_ask_size=5, no_ask=0.50, no_ask_size=300,
+                    yes_ask_levels=((0.60, 5),),
+                    no_ask_levels=((0.50, 300),))
+    edge, yq, nq, size = eng._eval_direction(a, b)
+    assert yq.yes_ask == 0.46 and size == 205      # swept to level 2, cumulative size
+    assert abs(edge - 0.04) < 1e-9
+    # original book quotes untouched (copies were re-priced, not the shared book)
+    assert a.yes_ask == 0.44 and a.yes_ask_size == 5

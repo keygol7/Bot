@@ -106,12 +106,47 @@ def _pair_settle_ts(yes_q: MarketQuote, no_q: MarketQuote) -> float:
     return min(cands) if cands else 0.0
 
 
+def sweep_levels(yes_levels, no_levels, yes_fee: FeeModel, no_fee: FeeModel,
+                 min_edge: float = 0.0, max_levels: int = 8):
+    """Best (yes_limit, no_limit, size) sweeping both ask LADDERS: choose the limit
+    price pair maximizing conservative total profit (everything priced AT the limits;
+    real FOK fills take better levels at their own prices, so this only understates)
+    subject to the per-contract edge AT THE LIMITS clearing ``min_edge``. Falls back
+    to the top levels when nothing deeper qualifies. Returns None if even the top
+    combo is unpriced."""
+    ys = list(yes_levels or ())[:max_levels]
+    ns = list(no_levels or ())[:max_levels]
+    if not ys or not ns:
+        return None
+    best = None                    # (profit, yes_limit, no_limit, size)
+    cum_y = 0.0
+    for (py, sy) in ys:
+        cum_y += sy
+        cum_n = 0.0
+        for (pn, sn) in ns:
+            cum_n += sn
+            fee = per_contract_fee(yes_fee, py) + per_contract_fee(no_fee, pn)
+            edge = 1.0 - (py + pn) - fee
+            if edge < min_edge:
+                continue           # deeper NO levels only get worse for this py
+            size = min(cum_y, cum_n)
+            profit = size * edge
+            if best is None or profit > best[0]:
+                best = (profit, py, pn, size)
+    if best is None:
+        py, sy = ys[0]
+        pn, sn = ns[0]
+        return (py, pn, min(sy, sn))
+    return (best[1], best[2], best[3])
+
+
 def _build(
     *,
     yes_q: MarketQuote,
     yes_fee: FeeModel,
     no_q: MarketQuote,
     no_fee: FeeModel,
+    min_edge: float = 0.0,
 ) -> ArbOpportunity | None:
     """Build an opportunity for buying YES on ``yes_q`` and NO on ``no_q``.
 
@@ -123,6 +158,14 @@ def _build(
         return None
 
     max_contracts = min(yes_q.yes_ask_size, no_q.no_ask_size)
+    # Depth sweep: when either side carries a full ladder, pick the limit prices
+    # maximizing total profit across levels (FOK at the limit sweeps better levels).
+    swept = sweep_levels(
+        yes_q.yes_ask_levels or ((yes_price, yes_q.yes_ask_size),),
+        no_q.no_ask_levels or ((no_price, no_q.no_ask_size),),
+        yes_fee, no_fee, min_edge=min_edge)
+    if swept is not None:
+        yes_price, no_price, max_contracts = swept
     if max_contracts <= 0:
         return None
 
@@ -176,8 +219,8 @@ def detect_cross_venue(
     fee_b = fee_b or ZeroFeeModel()
 
     candidates = [
-        _build(yes_q=a, yes_fee=fee_a, no_q=b, no_fee=fee_b),
-        _build(yes_q=b, yes_fee=fee_b, no_q=a, no_fee=fee_a),
+        _build(yes_q=a, yes_fee=fee_a, no_q=b, no_fee=fee_b, min_edge=min_edge),
+        _build(yes_q=b, yes_fee=fee_b, no_q=a, no_fee=fee_a, min_edge=min_edge),
     ]
     opps = [o for o in candidates if o is not None and o.edge_per_contract > min_edge]
     opps.sort(key=lambda o: o.edge_per_contract, reverse=True)

@@ -57,6 +57,12 @@ class MarketQuote:
     yes_ask_size: float = 0.0
     no_ask: Optional[float] = None
     no_ask_size: float = 0.0
+    # Full ask LADDERS, best-first ((price, size), ...): present when the source
+    # parsed a real book (WS books, /book, /orderbook). None = only top-of-book known.
+    # The depth sweep uses these to take level 2+ when still profitable; consumers
+    # that only want the BBO keep using yes_ask/no_ask unchanged.
+    yes_ask_levels: Optional[tuple] = None
+    no_ask_levels: Optional[tuple] = None
     fee_rate: float = 0.0  # carried for reference; FeeModel does the real math
     timestamp: float = 0.0
     close_time: Optional[float] = None  # epoch seconds when the market resolves/closes

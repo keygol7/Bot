@@ -146,3 +146,36 @@ def test_build_settle_ts_falls_back_to_id_date():
     assert opps
     got = datetime.fromtimestamp(opps[0].settle_ts, timezone.utc).strftime("%Y-%m-%d")
     assert got == "2026-11-03"                          # from the poly leg's slug
+
+
+def test_sweep_levels_takes_deeper_profitable_levels():
+    from bot.fees import ZeroFeeModel
+    from bot.strategies.arbitrage import sweep_levels
+    z = ZeroFeeModel()
+    # top: 5ct at .44; behind: 200ct at .46 — poly NO flat 300ct at .50
+    yes = ((0.44, 5), (0.46, 200))
+    no = ((0.50, 300),)
+    py, pn, size = sweep_levels(yes, no, z, z, min_edge=0.0)
+    assert (py, pn) == (0.46, 0.50)         # limit at the deeper level
+    assert size == 205                      # cumulative across both levels
+    # if level 2 is unprofitable (.51 + .50 > 1), stay at the top
+    py, pn, size = sweep_levels(((0.44, 5), (0.51, 200)), no, z, z, min_edge=0.0)
+    assert (py, pn, size) == (0.44, 0.50, 5)
+    # min_edge gates how deep the sweep goes
+    py, pn, size = sweep_levels(yes, no, z, z, min_edge=0.05)
+    assert (py, pn, size) == (0.44, 0.50, 5)
+
+
+def test_detect_cross_venue_sweeps_ladders():
+    from bot.fees import ZeroFeeModel
+    from bot.strategies.arbitrage import detect_cross_venue
+    a = MarketQuote(venue="kalshi", market_id="K", title="k",
+                    yes_ask=0.44, yes_ask_size=5,
+                    yes_ask_levels=((0.44, 5), (0.46, 200)))
+    b = MarketQuote(venue="poly", market_id="P", title="p",
+                    no_ask=0.50, no_ask_size=300,
+                    no_ask_levels=((0.50, 300),))
+    opps = detect_cross_venue(a, b, fee_a=ZeroFeeModel(), fee_b=ZeroFeeModel())
+    assert opps and opps[0].yes_price == 0.46 and opps[0].max_contracts == 205
+    # profit maximized: 205 * .04 = 8.20 > top-only 5 * .06 = 0.30
+    assert abs(opps[0].total_profit - 8.20) < 1e-9

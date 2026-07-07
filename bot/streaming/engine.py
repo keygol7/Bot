@@ -235,19 +235,37 @@ class StreamingEngine:
         return out
 
     def _eval_direction(self, a: MarketQuote | None, b: MarketQuote | None):
-        """Best (edge, yes_quote, no_quote, size) over both arb directions, or None."""
+        """Best (edge, yes_quote, no_quote, size) over both arb directions, or None.
+
+        DEPTH SWEEP: when a quote carries a full ask ladder, pick the limit-price
+        pair maximizing total profit across levels (an FOK at the limit sweeps every
+        better level at its own price, so the estimate is conservative). The returned
+        quotes are COPIES re-priced at the chosen limits — the executor's FOK order
+        placed at these prices is exactly the sweep."""
         if a is None or b is None:
             return None
+        from dataclasses import replace as _rp
+
+        from bot.strategies.arbitrage import sweep_levels
         best = None
         for yq, nq in ((a, b), (b, a)):  # buy YES@yq + NO@nq
             if yq.yes_ask is None or nq.no_ask is None:
                 continue
+            fee_y, fee_n = self._fee(yq.venue), self._fee(nq.venue)
+            swept = sweep_levels(
+                yq.yes_ask_levels or ((yq.yes_ask, yq.yes_ask_size),),
+                nq.no_ask_levels or ((nq.no_ask, nq.no_ask_size),),
+                fee_y, fee_n, min_edge=self.min_edge)
+            if swept is None:
+                continue
+            py, pn, size = swept
+            if (py, pn) != (yq.yes_ask, nq.no_ask):
+                yq = _rp(yq, yes_ask=py, yes_ask_size=size)
+                nq = _rp(nq, no_ask=pn, no_ask_size=size)
             # Unrounded per-contract rate: fee(p, 1) cent-quantizes (error ~ the edge floor).
-            fee = (per_contract_fee(self._fee(yq.venue), yq.yes_ask)
-                   + per_contract_fee(self._fee(nq.venue), nq.no_ask))
-            edge = 1.0 - (yq.yes_ask + nq.no_ask) - fee
-            size = min(yq.yes_ask_size, nq.no_ask_size)
-            if best is None or edge > best[0]:
+            fee = per_contract_fee(fee_y, py) + per_contract_fee(fee_n, pn)
+            edge = 1.0 - (py + pn) - fee
+            if best is None or edge * size > best[0] * best[3] or (best[3] <= 0 and edge > best[0]):
                 best = (edge, yq, nq, size)
         return best
 

@@ -115,15 +115,17 @@ def normalize_orderbook(
     yes_ask = no_ask = None
     yes_ask_size = no_ask_size = 0.0
 
+    y_lv = n_lv = None
     if no_bids:
-        price, size = max(no_bids, key=lambda lvl: lvl[0])
-        yes_ask = round(1.0 - price, 4)
-        yes_ask_size = size
+        # cost to buy YES = 1 - NO bid, per level, best (highest bid) first
+        lv = sorted(no_bids, key=lambda l: -l[0])[:8]
+        y_lv = tuple((round(1.0 - p, 4), sz) for p, sz in lv)
+        yes_ask, yes_ask_size = y_lv[0]
 
     if yes_bids:
-        price, size = max(yes_bids, key=lambda lvl: lvl[0])
-        no_ask = round(1.0 - price, 4)
-        no_ask_size = size
+        lv = sorted(yes_bids, key=lambda l: -l[0])[:8]
+        n_lv = tuple((round(1.0 - p, 4), sz) for p, sz in lv)
+        no_ask, no_ask_size = n_lv[0]
 
     return MarketQuote(
         venue=VENUE,
@@ -134,6 +136,8 @@ def normalize_orderbook(
         yes_ask_size=yes_ask_size,
         no_ask=no_ask,
         no_ask_size=no_ask_size,
+        yes_ask_levels=y_lv,
+        no_ask_levels=n_lv,
     )
 
 

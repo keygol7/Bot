@@ -401,12 +401,15 @@ def normalize_book(
 
     yes_ask = no_ask = None
     yes_ask_size = no_ask_size = 0.0
+    y_lv = n_lv = None
     if offers:
-        px, qty = min(offers, key=lambda lvl: lvl[0])   # best (lowest) ask
-        yes_ask, yes_ask_size = px, qty
+        lv = sorted(offers, key=lambda l: l[0])[:8]      # best (lowest) ask first
+        y_lv = tuple(lv)
+        yes_ask, yes_ask_size = y_lv[0]
     if bids:
-        px, qty = max(bids, key=lambda lvl: lvl[0])      # best (highest) bid
-        no_ask, no_ask_size = round(1.0 - px, 6), qty
+        lv = sorted(bids, key=lambda l: -l[0])[:8]       # best (highest) bid first
+        n_lv = tuple((round(1.0 - p, 6), q) for p, q in lv)
+        no_ask, no_ask_size = n_lv[0]
 
     return MarketQuote(
         venue=VENUE,
@@ -417,6 +420,8 @@ def normalize_book(
         yes_ask_size=yes_ask_size,
         no_ask=no_ask,
         no_ask_size=no_ask_size,
+        yes_ask_levels=y_lv,
+        no_ask_levels=n_lv,
         state=market_data.get("state"),   # MARKET_STATE_OPEN / SUSPENDED / ... (for the gate)
     )
 

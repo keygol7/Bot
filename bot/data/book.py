@@ -66,6 +66,14 @@ class OrderBook:
     def to_quote(self) -> MarketQuote:
         yes_ask = self.best_yes_ask()
         no_ask = self.best_no_ask()
+        # full ladders for the depth sweep; NO synthesized from YES bids when the
+        # venue has no direct NO book (same rule as best_no_ask)
+        y_lv = tuple((l.price, l.size) for l in self.yes_asks.levels[:8]) or None
+        if self.no_asks.levels:
+            n_lv = tuple((l.price, l.size) for l in self.no_asks.levels[:8]) or None
+        else:
+            n_lv = tuple((round(1.0 - l.price, 6), l.size)
+                         for l in self.yes_bids.levels[:8]) or None
         return MarketQuote(
             venue=self.venue,
             market_id=self.market_id,
@@ -75,6 +83,8 @@ class OrderBook:
             yes_ask_size=yes_ask.size if yes_ask else 0.0,
             no_ask=no_ask.price if no_ask else None,
             no_ask_size=no_ask.size if no_ask else 0.0,
+            yes_ask_levels=y_lv,
+            no_ask_levels=n_lv,
             timestamp=self.updated_at,
         )
 
