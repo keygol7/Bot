@@ -216,6 +216,10 @@ class StreamingEngine:
         self._settled_leg_until: dict = {}      # pair key -> sticky settled-leg expiry
         self._rules_blocked: dict = {}          # pair key -> last rules_pending block ts
         self._rules_block_logged: dict = {}     # rate-limit for the block log line
+        # ONE-WAY pairs (timing-scope rules divergence): may fire ONLY with YES on
+        # this venue (the wider settlement window) — the other direction is the
+        # naked SUI-COL shape. key -> required YES venue name.
+        self.one_way_yes: dict = {}
         # PRE-TRADE RULES GATE: pairs may not fire until their resolution rules have
         # been LLM-compared once (rules_checked, fed by the rules loop). Closes the
         # race where a fresh pair trades minutes before verification reaches it.
@@ -588,6 +592,10 @@ class StreamingEngine:
         # Skip the persist wait entirely and take it in tens of ms. Gated to deep books (the
         # TAKE path; a stale top unwinds cleanly, bounded by the per-order cap). Everything
         # else keeps the persist guard below.
+        req_yes = self.one_way_yes.get(key)
+        if req_yes and yq.venue != req_yes:
+            self._observe(p, edge, yq, nq, size, "unsafe_direction_timing_scope")
+            return None       # only the windfall-shaped direction may trade
         if (self.require_rules_verify and key not in self.rules_checked
                 and key not in self.verified_pairs):
             # visible + prioritized: the rules loop verifies blocked-with-live-edge

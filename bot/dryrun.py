@@ -989,6 +989,7 @@ async def stream(
         try:
             engine.verified_pairs = store.verified_pair_keys()
             engine.rules_checked = store.rules_checked_keys()
+            engine.one_way_yes = {k: "kalshi" for k in store.timing_scope_keys()}
         except Exception as exc:
             log.warning("verified-pairs refresh failed: %s", exc)
         await refresh_balances()
@@ -1185,14 +1186,18 @@ async def stream(
                     store.record_rules_verdict(
                         "kalshi", ka, "polymarket_us", pm,
                         identical=v.identical, confidence=v.confidence,
-                        rationale=v.rationale, material=v.material)
+                        rationale=v.rationale, material=v.material,
+                        divergence=v.divergence)
                     budget -= 1
                     log.info("rules verify: %s|%s -> %s (%.2f) %s", ka, pm,
                              "IDENTICAL" if v.identical
-                             else "DIFFERENT-EVENT" if v.material else "tail-divergent",
+                             else "DIFFERENT-EVENT" if v.material
+                             else "TIMING-SCOPE (one-way)" if v.divergence == "timing_scope"
+                             else "tail-divergent",
                              v.confidence, v.rationale[:120])
                 engine.verified_pairs = store.verified_pair_keys()
                 engine.rules_checked = store.rules_checked_keys()
+                engine.one_way_yes = {k: "kalshi" for k in store.timing_scope_keys()}
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

@@ -39,14 +39,19 @@ Resolution rules B: {rules_b}
 Think adversarially: enumerate concrete scenarios where the two contracts could
 settle DIFFERENTLY, then CLASSIFY the divergence:
 
-- "different_event" | "timing_scope": the two markets are NOT about the same real-world event or the
+- "different_event": the two markets are NOT about the same real-world event or the
   same winning party — different teams (beware an org vs its ACADEMY/junior squad —
-  those are different teams), different scheduled match/date/time, different metric,
-  threshold or period. These can NEVER hedge each other.
-- "tail_scenarios": SAME event and SAME winning party, but the rules differ in edge
-  cases — cancellations, postponements, ties/draw handling, void/refund wording,
-  overtime inclusion, settlement sources. The pair hedges in the normal outcome but
-  may diverge in those tails.
+  those are different teams), a different match, a different metric, threshold or
+  period. These can NEVER hedge each other. IMPORTANT: two venues listing the SAME
+  match with slightly different start times or date formatting is normal listing
+  skew, NOT a different event — judge by teams + competition + calendar day.
+- "timing_scope": SAME event and SAME winning party, but the SETTLEMENT WINDOW
+  differs — one market counts extra time / overtime / penalty shootouts while the
+  other settles on regulation only, or one covers a longer game period. These
+  diverge whenever the deciding action happens in the non-shared window.
+- "tail_scenarios": SAME event and SAME winning party, but the rules differ only in
+  rare edge cases — cancellations, postponements, void/refund wording, settlement
+  sources. The pair hedges in the normal outcome.
 - "none": you cannot construct any scenario where A's YES and B's YES settle
   differently.
 
@@ -55,7 +60,7 @@ at low confidence, never "none".
 
 Respond with ONLY a JSON object:
 {{"divergent_scenario": "<the scenario, or 'none found'>",
-  "divergence": "different_event"|"tail_scenarios"|"none",
+  "divergence": "different_event"|"timing_scope"|"tail_scenarios"|"none",
   "identical": <true|false>, "confidence": <0.0-1.0>, "rationale": "<one sentence>"}}
 """
 
@@ -69,6 +74,9 @@ class RulesVerdict:
     # the watchlist. False = tail-scenario divergence (same event, differing void/tie
     # wording) or identical — stays tradeable (just no fat-edge privilege when divergent).
     material: bool = False
+    # raw divergence category ("different_event"|"timing_scope"|"tail_scenarios"|"none");
+    # timing_scope pairs trade ONE-WAY (YES on the wider-window venue) instead of dropping
+    divergence: str = ""
 
 
 def confirm_rules(complete: CompleteFn, *, venue_a: str, title_a: str, rules_a: str,
@@ -93,7 +101,7 @@ def confirm_rules(complete: CompleteFn, *, venue_a: str, title_a: str, rules_a: 
             identical=bool(obj.get("identical") is True),
             confidence=float(obj.get("confidence") or 0.0),
             rationale=str(obj.get("rationale") or "")[:400],
-            material=(str(obj.get("divergence") or "") in
-                      ("different_event", "timing_scope")))
+            material=(str(obj.get("divergence") or "") == "different_event"),
+            divergence=str(obj.get("divergence") or ""))
     except (ValueError, TypeError) as exc:
         return RulesVerdict(False, 0.0, f"bad json: {exc}")

@@ -303,6 +303,9 @@ class Store:
         # 0 = tail-scenario/identical, NULL = legacy row from the pre-classification prompt —
         # rules_checked() treats NULL as unchecked so old verdicts re-verify organically.
         _rv_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(rules_verdicts)")}
+        if "divergence" not in _rv_cols:
+            self.conn.execute("ALTER TABLE rules_verdicts ADD COLUMN divergence TEXT")
+            _rv_cols.add("divergence")
         if "material" not in _rv_cols:
             self.conn.execute("ALTER TABLE rules_verdicts ADD COLUMN material INTEGER")
         # pnl.event_key: pair attribution for every booking. Without it, per-pair booked
@@ -725,13 +728,13 @@ class Store:
 
     def record_rules_verdict(self, va: str, ma: str, vb: str, mb: str, *,
                              identical: bool, confidence: float, rationale: str,
-                             material: bool = False) -> None:
+                             material: bool = False, divergence: str = "") -> None:
         self.conn.execute(
             "INSERT OR REPLACE INTO rules_verdicts "
             "(venue_a, market_a, venue_b, market_b, identical, confidence, rationale,"
-            " material, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " material, divergence, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (va, ma, vb, mb, 1 if identical else 0, confidence, rationale,
-             1 if material else 0, time.time()))
+             1 if material else 0, divergence, time.time()))
         self.conn.commit()
 
     def rules_checked(self, va: str, ma: str, vb: str, mb: str) -> bool:
@@ -750,22 +753,35 @@ class Store:
         cost a naked leg when the legs settled independently). Dropped from the
         watchlist like blacklisted pairs."""
         # material=1 ("different event") drops outright. TIMING-SCOPE divergences
-        # (extra time / overtime / shootout inclusion) were designed as tradeable
-        # "tail scenarios" — until 2026-07-07, when a knockout game went 0-0 through
-        # regulation and a Kalshi full-game FTTS leg went NAKED against a poly
-        # regulation-only leg (the LLM had flagged the exact divergence 5 days
-        # earlier: 191 goal/assist pairs carried the same flag). In knockout soccer
-        # that branch is ~10-25%, not a tail. Timing-scope rationales now drop too.
+        # (one venue counts extra time, the other regulation only — the 2026-07-07
+        # SUI-COL naked FTTS class) do NOT drop: they route to ONE-WAY trading via
+        # timing_scope_keys() — YES on the wider-window venue makes the mismatch a
+        # windfall (an ET goal pays BOTH legs), never a naked hole.
+        return {
+            self._pair_key(r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
+            for r in self.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts "
+                "WHERE identical = 0 AND material = 1 AND confidence >= ?",
+                (min_confidence,))
+        }
+
+    def timing_scope_keys(self, min_confidence: float = 0.9) -> set:
+        """Pairs whose rules diverge ONLY in the settlement window (extra time /
+        overtime / shootout inclusion). Tradeable ONE-WAY: hold YES on the venue with
+        the WIDER window (kalshi full-game) + NO on the narrower (poly regulation) —
+        action inside the non-shared window then pays BOTH legs. The reverse
+        direction is the naked SUI-COL shape and is refused by the engine."""
         rows = self.conn.execute(
-            "SELECT venue_a, market_a, venue_b, market_b, material, rationale "
-            "FROM rules_verdicts WHERE identical = 0 AND confidence >= ?",
-            (min_confidence,))
+            "SELECT venue_a, market_a, venue_b, market_b, material, rationale, "
+            "COALESCE(divergence,'') dv FROM rules_verdicts "
+            "WHERE identical = 0 AND confidence >= ?", (min_confidence,))
         timing = ("extra time", "overtime", "penalty shootout", "shootout",
                   "90 minutes", "regulation")
         out = set()
         for r in rows:
             rat = (r["rationale"] or "").lower()
-            if r["material"] == 1 or any(t in rat for t in timing):
+            if r["dv"] == "timing_scope" or (
+                    r["material"] != 1 and any(t in rat for t in timing)):
                 out.add(self._pair_key(r["venue_a"], r["market_a"],
                                        r["venue_b"], r["market_b"]))
         return out

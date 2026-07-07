@@ -1650,3 +1650,58 @@ def test_reconcile_dust_remnant_does_not_halt():
     asyncio.run(eng.reconcile_positions(snaps))
     asyncio.run(eng.reconcile_positions(snaps))
     assert not fe.risk.is_killed                     # $0.05 of dust: no halt
+
+
+def test_one_way_pair_fires_only_safe_direction():
+    # timing-scope pair: YES must sit on the wider-window venue (kalshi). The edge
+    # here favors YES on POLY -> refused; flipping the books so kalshi is the YES
+    # side -> fires.
+    import time as _time
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, max_ws_quote_age=5.0,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    pair = ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")
+    eng.one_way_yes = {pair.key: "kalshi"}
+    now = _time.time()
+    # direction: YES poly (0.40) + NO kalshi (0.55) -> UNSAFE (yes on poly)
+    ka = q("kalshi", "K1", yes_ask=0.62, ya=100, no_ask=0.55, na=100); ka.timestamp = now
+    pa = q("poly", "P1", yes_ask=0.40, ya=100, no_ask=0.65, na=60); pa.timestamp = now
+    asyncio.run(eng.on_quote(ka)); asyncio.run(eng.on_quote(pa))
+    assert fe.calls == []
+    # flip the books: YES kalshi (0.40) + NO poly (0.55) -> SAFE -> fires
+    eng2 = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, max_ws_quote_age=5.0,
+    )
+    eng2.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    eng2.one_way_yes = {pair.key: "kalshi"}
+    ka2 = q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100); ka2.timestamp = now
+    pa2 = q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60); pa2.timestamp = now
+    asyncio.run(eng2.on_quote(ka2)); asyncio.run(eng2.on_quote(pa2))
+    assert len(fe.calls) == 1
+
+
+def test_timing_scope_keys_from_legacy_rationale_and_new_column():
+    from bot.data.store import Store
+    st = Store(":memory:")
+    # legacy row: material=0, rationale mentions extra time
+    st.record_rules_verdict("kalshi", "KA", "polymarket_us", "PA",
+                            identical=False, confidence=1.0,
+                            rationale="Market A includes extra time while B does not")
+    # new row: explicit divergence category
+    st.record_rules_verdict("kalshi", "KB", "polymarket_us", "PB",
+                            identical=False, confidence=1.0,
+                            rationale="settlement window differs", divergence="timing_scope")
+    # different_event stays a hard drop, NOT one-way
+    st.record_rules_verdict("kalshi", "KC", "polymarket_us", "PC",
+                            identical=False, confidence=1.0,
+                            rationale="different teams", material=True,
+                            divergence="different_event")
+    keys = st.timing_scope_keys()
+    assert len(keys) == 2
+    assert st._pair_key("kalshi", "KC", "polymarket_us", "PC") in st.rules_divergent_keys()
+    assert st._pair_key("kalshi", "KA", "polymarket_us", "PA") not in st.rules_divergent_keys()
+    st.close()
