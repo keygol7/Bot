@@ -1634,3 +1634,19 @@ def test_rules_gate_blocks_unchecked_pairs():
     eng._last_acted.clear()
     asyncio.run(eng.on_quote(ka)); asyncio.run(eng.on_quote(pa))
     assert len(fe.calls) == 1                      # checked -> trades
+
+
+def test_reconcile_dust_remnant_does_not_halt():
+    # a worthless leftover (bid ~1c on 5 contracts = $0.05) must not trip the kill
+    # switch; the fail-closed path (unreadable book -> still naked) is covered by
+    # test_reconcile_ignores_recycle_remnant's genuine-naked case.
+    eng, fe = _settled_engine(
+        open_states={"kalshi": True, "poly": True},
+        depth_states={"kalshi": "MARKET_STATE_OPEN", "poly": "MARKET_STATE_OPEN"})
+    async def penny_depth(venue, mid):
+        return q(venue, mid, yes_ask=0.99, ya=1, no_ask=0.99, na=1)   # bids = 0.01
+    eng.depth_fetch = penny_depth
+    snaps = [_snap("kalshi", []), _snap("poly", [("P1", 5)])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed                     # $0.05 of dust: no halt

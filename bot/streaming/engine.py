@@ -975,6 +975,40 @@ class StreamingEngine:
                 kept.append((p, qa, qb))
             imbalanced = kept
 
+        # DUST exemption: a held-long remnant is worth qty x its best bid — when that
+        # is ~zero (no bid / pennies), there is nothing left to protect: the cost is
+        # sunk and a long can't lose more. Halting the whole bot over a worthless
+        # leftover (2026-07-07: $0-bid ET-scope remnants halt-looped for 30 min while
+        # the game finished) protects nothing and costs the entire slate.
+        if imbalanced and self.depth_fetch is not None:
+            kept = []
+            for p, qa, qb in imbalanced:
+                sv, sm = ((p.venue_a, p.market_a) if qa > qb
+                          else (p.venue_b, p.market_b))
+                qty = abs(qa - qb)
+                try:
+                    q = await self.depth_fetch(sv, sm)
+                except Exception:
+                    q = None
+                bid = None
+                if q is not None:
+                    # held side unknown here; take the HIGHER side bid (conservative:
+                    # overstates value, understates the exemption)
+                    asks = (getattr(q, "yes_ask", None), getattr(q, "no_ask", None))
+                    bids = [1.0 - a for a in asks if a is not None]
+                    bid = max(bids) if bids else None
+                if bid is None:
+                    kept.append((p, qa, qb))    # unreadable book: NOT provably dust
+                    continue
+                value = qty * bid
+                if value <= 1.0:
+                    log.info("RECONCILE: %s imbalance (Δ%g) is DUST (mark value $%.2f, "
+                             "bid %s) — cost sunk, nothing to protect; settling out",
+                             p.event_key, qty, value, f"{bid:.2f}" if bid else "none")
+                    continue
+                kept.append((p, qa, qb))
+            imbalanced = kept
+
         if not imbalanced:
             self._imbalanced_prev = set()
             return []
