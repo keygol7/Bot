@@ -124,3 +124,17 @@ def test_nfl_division_series_title_evidence():
     assert _match("KXNFLAFCNORTH-26-BAL", "Will Baltimore win the AFC North? - Baltimore",
                   {"title": "American Football Conference North Winner", "tags": ["Football"]},
                   "tec-nfl-afcnorth-2027-01-04-w-bal", "AFC North Winner - Yes")
+
+
+def test_f5_scope_separates_from_full_game():
+    # The 2026-07-07 live incident: poly F5 slugs matched kalshi FULL-game markets.
+    full_k = ("KXMLBGAME-26JUL071835CHCBAL-BAL", "Chicago vs Baltimore Winner? - Baltimore",
+              {"title": "MLB Game", "tags": ["Baseball"]})
+    f5_k = ("KXMLBF5-26JUL071835CHCBAL-BAL", "First 5 Innings Winner? - Baltimore",
+            {"title": "First 5 Innings Winner", "tags": ["Baseball"]})
+    f5_p = ("atc-mlb-chc-bal-2026-07-07-f5-bal", "CHC vs BAL First 5 Innings - Baltimore")
+    full_p = ("atc-mlb-chc-bal-2026-07-07-bal", "CHC vs BAL - Baltimore")
+    assert not _match(*full_k, *f5_p)      # the incident pair: must NEVER match
+    assert not _match(*f5_k, *full_p)      # inverse mismatch
+    assert _match(*f5_k, *f5_p)            # legit F5 <-> F5 arb
+    assert _match(*full_k, *full_p)        # legit full <-> full

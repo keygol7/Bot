@@ -46,7 +46,7 @@ _METRIC_KEYWORDS = (
     # qualifier/award propositions are NOT the same as winning the thing itself —
     # without these, "#1 Seed" ties "Division Winner" at the mutual-best stage
     ("seed", "seed"), ("mvp", "mvp"), ("most valuable", "mvp"),
-    ("county", "county"), ("popular vote", "popvote"),
+    ("county", "county"), ("popular vote", "popvote"), ("spread", "spread"),
     ("draft", "draft"), ("relegat", "relegation"), ("promot", "promotion"),
     ("rookie of", "rookie"), ("coach of", "coach"), ("cy young", "cyyoung"),
     ("ballon", "ballondor"), ("playoff", "playoffs"), ("make the playoffs", "playoffs"),
@@ -256,6 +256,9 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
     qm = re.search(r"(\d)Q", series)
     if qm:
         scope.add(f"q{qm.group(1)}")
+    fm = re.search(r"F(\d)(?![A-Z0-9]*GP)", series)   # KXMLBF5* (not F1GP etc.)
+    if fm and "F1" not in series:
+        scope.add(f"f{fm.group(1)}")
     hm = re.search(r"(\d)H|([FS])H(?![A-Z])", series)
     if hm and "MATCH" not in series and "GAME" not in series:
         scope.add(f"h{hm.group(1) or hm.group(2).lower()}")
@@ -340,6 +343,13 @@ def parse_poly(slug: str, title: str = "") -> MarketKey:
             continue
         if seg in _POLY_QUALIFIER_METRIC:
             metric = _POLY_QUALIFIER_METRIC[seg]
+            post.remove(seg)
+            continue
+        fm = re.match(r"^f(\d)$", seg)
+        if fm:
+            # partial-game scope: f5 = first 5 innings (the F5-vs-full-game false
+            # match traded live on 2026-07-07; cost $3.04 to flatten)
+            scope_extra.add(f"f{fm.group(1)}")
             post.remove(seg)
             continue
         sm = re.match(r"^(?:(map|game|set)(\d)|(\d)(map|game|set)s?)$", seg)
