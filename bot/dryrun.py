@@ -854,6 +854,8 @@ async def stream(
         edge_persist_secs=settings.stream_edge_persist_secs,
         sync_window_secs=settings.stream_sync_window_secs,
         prime_concurrency=settings.stream_prime_concurrency,
+        ws_trust_min=settings.stream_ws_trust_min,
+        ws_trust_eps=settings.stream_ws_trust_eps,
     )
 
     # Discovery (embedding shortlist + LLM confirm) only feeds match_verdicts, which the

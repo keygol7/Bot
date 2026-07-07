@@ -1524,3 +1524,57 @@ def test_confirm_reject_escalates_backoff_and_reseeds():
     assert eng.livebook.get("poly", "P1").no_ask == 0.50
     # and REST-seeded quotes are timestampless -> can never enable the fast path
     assert (eng.livebook.get("kalshi", "K1").timestamp or 0) == 0
+
+
+def test_ws_trust_ladder_earns_skip_and_resets_on_lie():
+    # Three straight confirms where REST agrees with the WS claim earn the pair a
+    # trusted fast-fire (no REST round-trip); a lying book cannot climb the ladder.
+    import time as _time
+
+    class MakerFake(FakeExec):
+        async def execute_maker(self, opp):
+            self.calls.append(opp)
+            return f"executed {opp.event_key}"
+
+    fe = MakerFake()
+    fetched = []
+    honest = {"v": True}
+    t = [0.0]
+
+    async def depth_fetch(venue, mid):
+        fetched.append((venue, mid))
+        if honest["v"]:   # same books the WS shows -> agreement
+            return (q(venue, mid, yes_ask=0.40, ya=100, no_ask=0.65, na=100)
+                    if venue == "kalshi" else
+                    q(venue, mid, yes_ask=0.62, ya=100, no_ask=0.55, na=60))
+        return q(venue, mid, yes_ask=0.99, ya=1, no_ask=0.99, na=1)  # liar: no edge
+
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: t[0], depth_fetch=depth_fetch,
+        max_ws_quote_age=5.0, maker_mode=True, ws_trust_min=3,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    def tick():
+        t[0] += 200.0                                 # clear the cooldown each tick
+        ka = q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)
+        ka.timestamp = _time.time()
+        pa = q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)
+        pa.timestamp = _time.time()
+        asyncio.run(eng.on_quote(ka))
+        asyncio.run(eng.on_quote(pa))
+
+    for _ in range(3):
+        tick()
+    assert max(eng._ws_trust.values()) >= 3           # ladder climbed on honest confirms
+    n_confirmed = len(fetched)
+    assert n_confirmed > 0
+    tick()                                            # trusted -> fires with NO REST call
+    assert len(fetched) == n_confirmed
+    assert len(fe.calls) == 4
+    # a lying book can never climb: reset and confirm against the liar
+    honest["v"] = False
+    eng._ws_trust = {k: 0 for k in eng._ws_trust}
+    tick()
+    assert max(eng._ws_trust.values()) == 0

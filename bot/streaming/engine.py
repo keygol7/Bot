@@ -91,6 +91,8 @@ class StreamingEngine:
         edge_persist_secs: float = 0.0,
         sync_window_secs: float = 0.0,
         prime_concurrency: int = 8,
+        ws_trust_min: int = 3,
+        ws_trust_eps: float = 0.01,
     ) -> None:
         self.executor = executor
         self.fee_models = fee_models or {}
@@ -200,6 +202,15 @@ class StreamingEngine:
         self._backoff_base = 60.0               # first penalty after a failed attempt
         self._backoff_cap = 1800.0              # max 30 min between retries
         self._confirm_fails: dict = {}          # consecutive confirm-rejections per pair
+        # WS-TRUST LADDER: a pair earns trust each time the REST confirm AGREES with
+        # what its WS books claimed (rest edge >= ws edge - eps: the book was honest,
+        # whatever the edge size). After ws_trust_min consecutive agreements, a fresh
+        # WS edge fires WITHOUT the ~35ms REST round-trip. Trust resets to zero on any
+        # lying confirm (rest edge short by > eps) and on any failed/unwound execution
+        # (the FOK legs bound the residual risk while trust is provisional). 0 = off.
+        self.ws_trust_min = ws_trust_min
+        self.ws_trust_eps = ws_trust_eps
+        self._ws_trust: dict = {}               # consecutive WS-vs-REST agreements
         self._preview_backoff = 60.0            # pause a pair whose hedge can't fill (preview)
         # Latest known market state per (venue, market_id): from Polymarket's marketData
         # `state` (carried on the quote) and Kalshi's lifecycle channel. Used to skip
@@ -573,13 +584,27 @@ class StreamingEngine:
         # and thin/sizeless books still REST-confirm first (resting on a phantom edge is
         # wasteful, and a maker can't unwind as cleanly as a FOK take).
         ws_fresh = self._ws_book_fresh(yq, nq)
+        # WS-TRUST LADDER: this pair's WS books have agreed with the REST truth
+        # ws_trust_min times straight — fire on the fresh book without the REST
+        # round-trip. FOK legs bound the downside; any lie or failed execution
+        # resets trust and the pair goes back to confirming.
+        trusted = (self.ws_trust_min > 0 and ws_fresh and size >= 1
+                   and self._ws_trust.get(key, 0) >= self.ws_trust_min)
         fast_take = sync_fast_take or (self.maker_mode and ws_fresh and deep)
-        if self.depth_fetch is not None and not fast_take and (self.maker_mode or not ws_fresh):
+        if (self.depth_fetch is not None and not fast_take and not trusted
+                and (self.maker_mode or not ws_fresh)):
+            ws_claim = edge
             log.info("STREAM %s: price edge %.4f -> confirming real depth", p.event_key, edge)
             ev = await self._confirm_depth(p)
             if ev is None:
                 return None
             edge, yq, nq, size = ev
+            # feed the ladder: honest book (rest within eps of the WS claim) climbs;
+            # a lying book resets to zero
+            if edge >= ws_claim - self.ws_trust_eps:
+                self._ws_trust[key] = self._ws_trust.get(key, 0) + 1
+            else:
+                self._ws_trust[key] = 0
             if edge <= self.min_edge or size < 1:
                 # ESCALATING BACKOFF: a pair whose WS book keeps disagreeing with the
                 # REST truth is a chronic liar, not a fresh opportunity — re-confirming
@@ -600,7 +625,9 @@ class StreamingEngine:
             log.info("STREAM %s: edge %.4f from fresh WS book (sz %g) -> fast executing "
                      "(%s)", p.event_key, edge, size,
                      "SYNC sub-100ms TAKE" if sync_fast_take
-                     else "deep TAKE, no REST confirm" if fast_take else "fresh WS")
+                     else "deep TAKE, no REST confirm" if fast_take
+                     else f"TRUSTED WS x{self._ws_trust.get(key, 0)}" if trusted
+                     else "fresh WS")
         # State guard: never fire into a non-OPEN market (halted/suspended/pre-open/
         # closing-auction/settled) — it would reject or settle against us.
         if not (self._quote_open(yq) and self._quote_open(nq)):
@@ -738,6 +765,7 @@ class StreamingEngine:
             return
         n = self._fail_counts.get(key, 0) + 1
         self._fail_counts[key] = n
+        self._ws_trust.pop(key, None)           # a failed fire revokes WS trust too
         delay = min(self._backoff_base * (2 ** (n - 1)), self._backoff_cap)
         self._backoff_until[key] = self.clock() + delay
         log.info("STREAM backing off %s for %.0fs after failed attempt #%d (%s)",
