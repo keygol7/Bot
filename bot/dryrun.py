@@ -864,7 +864,12 @@ async def stream(
     # Deterministic matching replaces the embedding+LLM discovery pass entirely
     # (the id-parse join runs inside confirmed_pairs); rules-verify stays.
     discover = settings.stream_discovery and not settings.match_deterministic
+    # DISCOVERY's LLM is off in deterministic mode — but the RULES-VERIFY loop is a
+    # standing safety layer and needs its own handle regardless (tying it to
+    # ``discover`` silently disabled all rules verification at the deterministic
+    # cutover: zero verdicts for 40h, straight into the FTTS ET-scope incident).
     complete_fn = make_complete_fn(settings.llm) if (use_llm and discover) else None
+    rules_complete_fn = make_complete_fn(settings.llm) if use_llm else None
     embed_fn = None
     if use_embed and discover:
         from bot.matching.embed_cache import CachingEmbedFn
@@ -1146,7 +1151,9 @@ async def stream(
         from bot.matching.rules_match import confirm_rules
         kalshi_v = next((v for v in venues if v.name == "kalshi"), None)
         poly_v = next((v for v in venues if v.name == "polymarket_us"), None)
-        if kalshi_v is None or poly_v is None or store is None or complete_fn is None:
+        if kalshi_v is None or poly_v is None or store is None or rules_complete_fn is None:
+            log.warning("rules-verify loop NOT RUNNING (no LLM handle) — the pre-trade "
+                        "rules gate would block all new pairs; check LLM config")
             return
         while True:
             try:
@@ -1172,7 +1179,7 @@ async def stream(
                         (ka, pm)).fetchall()
                     titles = {r["market_id"]: r["title"] for r in row}
                     v = await asyncio.to_thread(
-                        confirm_rules, complete_fn,
+                        confirm_rules, rules_complete_fn,
                         venue_a="kalshi", title_a=titles.get(ka, ka), rules_a=rules_k,
                         venue_b="polymarket_us", title_b=titles.get(pm, pm), rules_b=rules_p)
                     store.record_rules_verdict(
