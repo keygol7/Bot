@@ -39,7 +39,7 @@ Resolution rules B: {rules_b}
 Think adversarially: enumerate concrete scenarios where the two contracts could
 settle DIFFERENTLY, then CLASSIFY the divergence:
 
-- "different_event": the two markets are NOT about the same real-world event or the
+- "different_event" | "timing_scope": the two markets are NOT about the same real-world event or the
   same winning party — different teams (beware an org vs its ACADEMY/junior squad —
   those are different teams), different scheduled match/date/time, different metric,
   threshold or period. These can NEVER hedge each other.
@@ -93,6 +93,7 @@ def confirm_rules(complete: CompleteFn, *, venue_a: str, title_a: str, rules_a: 
             identical=bool(obj.get("identical") is True),
             confidence=float(obj.get("confidence") or 0.0),
             rationale=str(obj.get("rationale") or "")[:400],
-            material=(str(obj.get("divergence") or "") == "different_event"))
+            material=(str(obj.get("divergence") or "") in
+                      ("different_event", "timing_scope")))
     except (ValueError, TypeError) as exc:
         return RulesVerdict(False, 0.0, f"bad json: {exc}")

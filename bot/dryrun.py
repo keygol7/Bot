@@ -856,6 +856,7 @@ async def stream(
         prime_concurrency=settings.stream_prime_concurrency,
         ws_trust_min=settings.stream_ws_trust_min,
         ws_trust_eps=settings.stream_ws_trust_eps,
+        require_rules_verify=settings.stream_require_rules_verify,
     )
 
     # Discovery (embedding shortlist + LLM confirm) only feeds match_verdicts, which the
@@ -982,6 +983,7 @@ async def stream(
         # verified consistent) to the fast path: these may fire fat edges history-free.
         try:
             engine.verified_pairs = store.verified_pair_keys()
+            engine.rules_checked = store.rules_checked_keys()
         except Exception as exc:
             log.warning("verified-pairs refresh failed: %s", exc)
         await refresh_balances()
@@ -1147,9 +1149,8 @@ async def stream(
         if kalshi_v is None or poly_v is None or store is None or complete_fn is None:
             return
         while True:
-            await asyncio.sleep(300)
             try:
-                budget = 10
+                budget = 15
                 for p in list(engine._pairs.values()):
                     if budget <= 0:
                         break
@@ -1179,10 +1180,12 @@ async def stream(
                              else "DIFFERENT-EVENT" if v.material else "tail-divergent",
                              v.confidence, v.rationale[:120])
                 engine.verified_pairs = store.verified_pair_keys()
+                engine.rules_checked = store.rules_checked_keys()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.warning("rules verify pass failed: %s", exc)
+            await asyncio.sleep(120)
 
     async def idparse_sync_loop():
         """Deterministic matching cadence: spawn `--idparse-sync` as a SUBPROCESS

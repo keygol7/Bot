@@ -93,6 +93,7 @@ class StreamingEngine:
         prime_concurrency: int = 8,
         ws_trust_min: int = 3,
         ws_trust_eps: float = 0.01,
+        require_rules_verify: bool = False,
     ) -> None:
         self.executor = executor
         self.fee_models = fee_models or {}
@@ -212,6 +213,11 @@ class StreamingEngine:
         self.ws_trust_eps = ws_trust_eps
         self._ws_trust: dict = {}               # consecutive WS-vs-REST agreements
         self._feed_lag: dict = {}               # venue -> EWMA transport lag (secs)
+        # PRE-TRADE RULES GATE: pairs may not fire until their resolution rules have
+        # been LLM-compared once (rules_checked, fed by the rules loop). Closes the
+        # race where a fresh pair trades minutes before verification reaches it.
+        self.require_rules_verify = require_rules_verify
+        self.rules_checked: set = set()
         self._preview_backoff = 60.0            # pause a pair whose hedge can't fill (preview)
         # Latest known market state per (venue, market_id): from Polymarket's marketData
         # `state` (carried on the quote) and Kalshi's lifecycle channel. Used to skip
@@ -579,6 +585,10 @@ class StreamingEngine:
         # Skip the persist wait entirely and take it in tens of ms. Gated to deep books (the
         # TAKE path; a stale top unwinds cleanly, bounded by the per-order cap). Everything
         # else keeps the persist guard below.
+        if (self.require_rules_verify and key not in self.rules_checked
+                and key not in self.verified_pairs):
+            self._observe(p, edge, yq, nq, size, "rules_pending")
+            return None                       # never trade ahead of the rules pass
         deep = self.hybrid_take_depth > 0 and size >= self.hybrid_take_depth
         sync_fast_take = self.maker_mode and deep and self._ws_synced(yq, nq)
         # Persistence filter: a cross-feed timing artifact (one venue's WS leading the other

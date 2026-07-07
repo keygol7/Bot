@@ -184,6 +184,7 @@ class Settings:
     # valid union members. Shadow-validated before enabling (bot.dryrun --match-shadow).
     match_deterministic: bool = False
     match_idparse_interval: float = 600.0  # seconds between deterministic join runs
+    stream_require_rules_verify: bool = True  # pairs may not TRADE before a rules-LLM pass
     stream_ws_trust_min: int = 3      # consecutive honest confirms before WS fires unconfirmed (0=off)
     stream_ws_trust_eps: float = 0.01  # rest edge may lag the WS claim by this and stay "honest"
     # Max markets to pull per venue per scan (TOTAL across paginated pages). 0 = scan the
@@ -458,6 +459,9 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
             env("MATCH_DETERMINISTIC", "false") or "false"
         ).lower() == "true",
         match_idparse_interval=_env_float("MATCH_IDPARSE_INTERVAL", 600.0),
+        stream_require_rules_verify=(
+            env("STREAM_REQUIRE_RULES_VERIFY", "true") or "true"
+        ).lower() == "true",
         stream_ws_trust_min=int(_env_float("STREAM_WS_TRUST_MIN", 3)),
         stream_ws_trust_eps=_env_float("STREAM_WS_TRUST_EPS", 0.01),
         match_use_canon=(

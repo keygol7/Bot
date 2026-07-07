@@ -749,12 +749,37 @@ class Store:
         proof: the BESTIA-Academy-vs-BESTIA pair was flagged divergent at 1.0 and later
         cost a naked leg when the legs settled independently). Dropped from the
         watchlist like blacklisted pairs."""
+        # material=1 ("different event") drops outright. TIMING-SCOPE divergences
+        # (extra time / overtime / shootout inclusion) were designed as tradeable
+        # "tail scenarios" — until 2026-07-07, when a knockout game went 0-0 through
+        # regulation and a Kalshi full-game FTTS leg went NAKED against a poly
+        # regulation-only leg (the LLM had flagged the exact divergence 5 days
+        # earlier: 191 goal/assist pairs carried the same flag). In knockout soccer
+        # that branch is ~10-25%, not a tail. Timing-scope rationales now drop too.
+        rows = self.conn.execute(
+            "SELECT venue_a, market_a, venue_b, market_b, material, rationale "
+            "FROM rules_verdicts WHERE identical = 0 AND confidence >= ?",
+            (min_confidence,))
+        timing = ("extra time", "overtime", "penalty shootout", "shootout",
+                  "90 minutes", "regulation")
+        out = set()
+        for r in rows:
+            rat = (r["rationale"] or "").lower()
+            if r["material"] == 1 or any(t in rat for t in timing):
+                out.add(self._pair_key(r["venue_a"], r["market_a"],
+                                       r["venue_b"], r["market_b"]))
+        return out
+
+    def rules_checked_keys(self) -> set:
+        """Pairs with ANY rules verdict (either outcome) — the pre-trade rules gate:
+        a pair may not TRADE until its resolution rules have been compared once. The
+        2026-07-07 FTTS incident traded 4 minutes after the pair first appeared,
+        before the rules loop reached it — the same divergence the LLM had flagged on
+        sibling pairs days earlier."""
         return {
             self._pair_key(r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
             for r in self.conn.execute(
-                "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts "
-                "WHERE identical = 0 AND material = 1 AND confidence >= ?",
-                (min_confidence,))
+                "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts")
         }
 
     def verified_pair_keys(self) -> set:

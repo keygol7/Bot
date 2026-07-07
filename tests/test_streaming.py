@@ -1609,3 +1609,28 @@ def test_kalshi_parse_ticker_carries_exchange_ts():
         "yes_bid_size_fp": "10", "yes_ask_size_fp": "12", "ts_ms": 1783440160211}}
     quote = parse_ticker(msg)
     assert abs(quote.exchange_ts - 1783440160.211) < 1e-6
+
+
+def test_rules_gate_blocks_unchecked_pairs():
+    # A pair with NO rules verdict may not trade (the FTTS incident traded 4 minutes
+    # after appearing, before the rules loop reached it); a checked pair fires.
+    import time as _time
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0,
+        max_ws_quote_age=5.0, require_rules_verify=True,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    now = _time.time()
+    ka = q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100); ka.timestamp = now
+    pa = q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60); pa.timestamp = now
+    asyncio.run(eng.on_quote(ka)); asyncio.run(eng.on_quote(pa))
+    assert fe.calls == []                          # unchecked -> blocked
+    eng.rules_checked = {eng._pairs[next(iter(eng._pairs))].key} if hasattr(eng, "_pairs") else set()
+    # simpler: mark via the pair's own key
+    for p in [ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")]:
+        eng.rules_checked = {p.key}
+    eng._last_acted.clear()
+    asyncio.run(eng.on_quote(ka)); asyncio.run(eng.on_quote(pa))
+    assert len(fe.calls) == 1                      # checked -> trades
