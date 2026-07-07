@@ -45,6 +45,9 @@ settle DIFFERENTLY, then CLASSIFY the divergence:
   period. These can NEVER hedge each other. IMPORTANT: two venues listing the SAME
   match with slightly different start times or date formatting is normal listing
   skew, NOT a different event — judge by teams + competition + calendar day.
+  Likewise a SURNAME on one venue matching a FULLER form of the same name on the
+  other ("Lee" vs "Ha Eum Lee", "Sabalenka" vs "A. Sabalenka") is the SAME person
+  unless the rules identify a genuinely different player in the same match.
 - "timing_scope": SAME event and SAME winning party, but the SETTLEMENT WINDOW
   differs — one market counts extra time / overtime / penalty shootouts while the
   other settles on regulation only, or one covers a longer game period. These
