@@ -34,7 +34,7 @@ from bot.execution.orders import OrderResult, OrderStatus
 from bot.execution.risk import RiskManager
 from bot.fees import FeeModel, ZeroFeeModel, per_contract_fee
 from bot.models import Side
-from bot.strategies.arbitrage import ArbOpportunity
+from bot.strategies.arbitrage import ArbOpportunity, usable_depth
 from bot.venues.base import RawMarket
 
 log = logging.getLogger("bot.executor")
@@ -586,7 +586,7 @@ class Executor:
                 return abs(pos.quantity)
         return 0.0
 
-    async def _hedge_fillable(self, venue, leg, size) -> float:
+    async def _hedge_fillable(self, venue, leg, size, ceiling: float | None = None) -> float:
         """How many contracts the hedge (taker) leg would actually fill at its limit, read
         from the REAL order book — re-fetched live right before we commit leg 1. A book that
         thinned or moved since the depth-confirm then caps the trade (or skips it) instead of
@@ -608,6 +608,16 @@ class Executor:
         depth = q.yes_ask_size if side is Side.YES else q.no_ask_size
         if ask is None or not depth:
             return 0.0                               # no resting offer -> can't hedge
+        # LADDER depth within the price band: the hedge IOC sweeps every level priced
+        # <= its limit, so count the cumulative size there — top-of-book alone calls a
+        # 1-at-top/300-behind book unhedgeable. ``ceiling`` (when the caller knows the
+        # pair's breakeven band) bounds the count to levels that stay profitable.
+        levels = q.yes_ask_levels if side is Side.YES else q.no_ask_levels
+        if levels:
+            band_max = ceiling if ceiling is not None else min(0.99, ask + self.hedge_buffer)
+            band = usable_depth(levels, band_max)
+            if band > depth:
+                depth = band
         # The buy side's resting top-of-book depth. We don't gate on the stale leg limit
         # here: the taker leg fires FOK (a book that moved past the limit kills cleanly ->
         # unwind), and the maker leg REPRICES the hedge to the live ask on fill — so the
@@ -1315,7 +1325,8 @@ class Executor:
                 and hedge_ws_size * self.hedge_depth_fraction >= 2 * size):
             fillable = float(size)
         else:
-            fillable = await self._hedge_fillable(second_venue, second, size)
+            fillable = await self._hedge_fillable(second_venue, second, size,
+                                                  ceiling=second[3])
         if fillable < size - 1e-9:
             capped = int(fillable + 1e-9)
             if capped < 1:
@@ -1667,24 +1678,46 @@ class Executor:
         # to hedge a fill. So guard/size on the taker leg's own depth, not min(both legs).
         yes_leg = (opp.buy_yes_venue, opp.buy_yes_market, Side.YES, opp.yes_price)
         no_leg = (opp.buy_no_venue, opp.buy_no_market, Side.NO, opp.no_price)
-        if self.maker_dynamic and opp.yes_size > 0 and opp.no_size > 0:
+        # HEDGE depth is the taker leg's LADDER depth inside the profit ceiling, not its
+        # top level: the hedge is an IOC that sweeps every level priced <= the ceiling
+        # (1 - maker price - floor - fees), so 1-at-top with 300 behind at +1 tick hedges
+        # 301 profitably. This was the "thin hedge book" skip class (~540/day) — books
+        # deep enough to hedge, judged only by their top. Falls back to top size when
+        # the opp carries no ladders (REST-era callers, tests).
+        floor0 = self.min_lock_edge if self.min_lock_edge is not None else self.risk.limits.min_edge
+
+        def _band(levels, top_size, own_px, other_px, own_venue, other_venue):
+            if not levels:
+                return top_size
+            fees_ct = (per_contract_fee(self._fee(other_venue), other_px)
+                       + per_contract_fee(self._fee(own_venue), own_px))
+            ceiling = min(0.99, max(0.01, round(1.0 - other_px - floor0 - fees_ct, 4)))
+            return usable_depth(levels, ceiling)
+
+        yes_band = _band(opp.yes_levels, opp.yes_size, opp.yes_price, opp.no_price,
+                         opp.buy_yes_venue, opp.buy_no_venue)
+        no_band = _band(opp.no_levels, opp.no_size, opp.no_price, opp.yes_price,
+                        opp.buy_no_venue, opp.buy_yes_venue)
+        if self.maker_dynamic and yes_band > 0 and no_band > 0:
             # Rest the maker on the THIN leg (the bottleneck); TAKE the deep leg (it fills
-            # reliably). hedge_depth is the taker leg's own size — what actually binds.
-            if opp.yes_size <= opp.no_size:
-                maker, taker, hedge_depth = yes_leg, no_leg, opp.no_size
+            # reliably). hedge_depth is the taker leg's usable band — what actually binds.
+            if yes_band <= no_band:
+                maker, taker, hedge_depth = yes_leg, no_leg, no_band
             else:
-                maker, taker, hedge_depth = no_leg, yes_leg, opp.yes_size
+                maker, taker, hedge_depth = no_leg, yes_leg, yes_band
         elif opp.buy_no_venue == self.first_venue:
-            maker, taker, hedge_depth = no_leg, yes_leg, (opp.yes_size or opp.max_contracts)
+            maker, taker, hedge_depth = no_leg, yes_leg, (yes_band or opp.max_contracts)
         elif opp.buy_yes_venue == self.first_venue:
-            maker, taker, hedge_depth = yes_leg, no_leg, (opp.no_size or opp.max_contracts)
+            maker, taker, hedge_depth = yes_leg, no_leg, (no_band or opp.max_contracts)
         else:
             return await self.execute(opp)   # neither leg on the maker venue -> taker path
 
         if self.min_leg_depth > 0 and hedge_depth < self.min_leg_depth:
+            top = opp.yes_size if taker[2] is Side.YES else opp.no_size
             return ExecutionReport(
                 ExecStatus.SKIPPED,
-                f"thin hedge book: depth {hedge_depth:g} < min {self.min_leg_depth:g}")
+                f"thin hedge book: band depth {hedge_depth:g} (top {top:g}) "
+                f"< min {self.min_leg_depth:g}")
 
         size, caps = self._max_size(opp, depth_override=hedge_depth)
         if size < 1:
@@ -1721,7 +1754,12 @@ class Executor:
         # SIZE DOWN to its real top-of-book depth; skip entirely if it can't fill at all
         # (else the post-fill hedge KILLs at the cap and forces an unwind). The taker path
         # does the same before committing leg 1. A fetch failure -> 0 (skip, never arm blind).
-        fillable = await self._hedge_fillable(taker_venue, taker, size)
+        maker_px_planned = max(0.01, round(maker[3] - self.maker_improvement, 4))
+        hedge_fees_ct = (per_contract_fee(maker_fee_fn, maker_px_planned)
+                         + per_contract_fee(self._fee(taker[0]), taker[3]))
+        hedge_ceiling = min(0.99, max(0.01, round(
+            1.0 - maker_px_planned - floor - hedge_fees_ct, 4)))
+        fillable = await self._hedge_fillable(taker_venue, taker, size, ceiling=hedge_ceiling)
         if fillable < 1:
             return ExecutionReport(
                 ExecStatus.SKIPPED,
@@ -1849,7 +1887,15 @@ class Executor:
                 "maker FORCED-LOSS hedge on %s: maker filled %s@%.3f, taker ask now %.3f "
                 "(combined %.3f > 1) — hedging to bound the loss; raise EXEC_MAKER_ARM_CUSHION",
                 opp.event_key, maker[2].value, maker_cost, taker_px, maker_cost + taker_px)
-        taker_limit = min(0.99, round(taker_px + self.hedge_buffer, 4))
+        # Reach to the PROFIT ceiling, not just top-ask + buffer: the pre-arm gate
+        # counted ladder depth up to the ceiling, so the IOC limit must reach it or the
+        # counted depth isn't takeable. IOC fills at actual level prices (never pays the
+        # limit unless the book is there), and the drift guard above already bounded the
+        # forced-loss case.
+        fees_ct_fire = (per_contract_fee(maker_fee_fn, maker_cost)
+                        + per_contract_fee(self._fee(taker[0]), taker_px))
+        fire_ceiling = max(0.01, round(1.0 - maker_cost - floor - fees_ct_fire, 4))
+        taker_limit = min(0.99, max(round(taker_px + self.hedge_buffer, 4), fire_ceiling))
         attempt = 0
         hedged = 0.0                 # contracts of the hedge confirmed filled so far
         hedge_notional = 0.0         # sum(filled_i * price_i) -> blended hedge avg price

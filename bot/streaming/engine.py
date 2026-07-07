@@ -451,6 +451,8 @@ class StreamingEngine:
             fee_per_pair=max(0.0, 1.0 - gross - edge), edge_per_contract=edge,
             max_contracts=size, total_fees=0.0, total_profit=edge * size, notional=gross * size,
             yes_size=yq.yes_ask_size, no_size=nq.no_ask_size,
+            yes_levels=getattr(yq, "yes_ask_levels", None),
+            no_levels=getattr(nq, "no_ask_levels", None),
             # Settlement horizon (close_time, falling back to the id-parsed date). The
             # fast path is where ALL live fires happen — omitting this left settle_ts=0
             # and the horizon gate silently OFF for streaming trades (the CA-gov pair

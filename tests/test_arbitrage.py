@@ -179,3 +179,12 @@ def test_detect_cross_venue_sweeps_ladders():
     assert opps and opps[0].yes_price == 0.46 and opps[0].max_contracts == 205
     # profit maximized: 205 * .04 = 8.20 > top-only 5 * .06 = 0.30
     assert abs(opps[0].total_profit - 8.20) < 1e-9
+
+
+def test_usable_depth_counts_band_only():
+    from bot.strategies.arbitrage import usable_depth
+    lv = ((0.50, 1), (0.51, 300), (0.55, 500))
+    assert usable_depth(lv, 0.51) == 301          # sweeps top + next tick
+    assert usable_depth(lv, 0.50) == 1            # top only
+    assert usable_depth(lv, 0.60) == 801          # whole ladder
+    assert usable_depth(None, 0.60) == 0.0

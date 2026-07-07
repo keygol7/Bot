@@ -80,6 +80,9 @@ class ArbOpportunity:
                                # the horizon gate + early-exit prioritization.
     fresh_ts: float = 0.0      # wall-clock ts of the OLDEST leg quote backing this opp
                                # (both legs WS-fresh); 0 = unknown/stale -> re-read books
+    yes_levels: tuple | None = None   # YES leg's ask LADDER ((price, size), best-first)
+    no_levels: tuple | None = None    # NO leg's ask ladder — hedge depth is measured
+                                      # against the ladder within the profit ceiling
 
     @property
     def is_single_venue(self) -> bool:
@@ -140,6 +143,19 @@ def sweep_levels(yes_levels, no_levels, yes_fee: FeeModel, no_fee: FeeModel,
     return (best[1], best[2], best[3])
 
 
+def usable_depth(levels, max_price: float) -> float:
+    """Cumulative size across ladder levels priced <= ``max_price`` — the depth an
+    IOC/FOK at that limit can actually take. The correct measure of HEDGE depth:
+    a book showing 1 contract at top with 300 behind it at +1 tick hedges 301 as
+    long as the deeper levels stay inside the pair's profit ceiling."""
+    total = 0.0
+    for price, size in (levels or ()):
+        if price > max_price + 1e-9:
+            break                      # best-first ordering: everything past is worse
+        total += size
+    return total
+
+
 def _build(
     *,
     yes_q: MarketQuote,
@@ -198,6 +214,8 @@ def _build(
         total_profit=total_profit,
         notional=gross_cost * max_contracts,
         settle_ts=_pair_settle_ts(yes_q, no_q),
+        yes_size=yes_q.yes_ask_size, no_size=no_q.no_ask_size,
+        yes_levels=yes_q.yes_ask_levels, no_levels=no_q.no_ask_levels,
     )
 
 

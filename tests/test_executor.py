@@ -2286,3 +2286,30 @@ def test_confirmer_avg_converts_no_side():
     assert Executor.confirmer_avg(Side.NO, 0.28) == 0.72
     assert Executor.confirmer_avg(Side.YES, 0.28) == 0.28
     assert Executor.confirmer_avg(Side.NO, None) is None
+
+
+def test_maker_thin_top_deep_ladder_passes_hedge_gate():
+    # 1 contract at top with 300 behind it at +1 tick, all inside the profit ceiling:
+    # the old top-size gate skipped this as "thin hedge book"; band depth hedges it.
+    from dataclasses import replace as _rp
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 5, 0.40)])
+    ex, risk = make_maker_exec([kalshi, poly],
+                               FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.45)}))
+    ex.min_leg_depth = 10                            # top size 1 would fail this gate
+    o = opp(yv="poly", nv="kalshi", max_contracts=5, yes_price=0.40, no_price=0.55)
+    o = _rp(o, yes_size=1.0, no_size=50.0,
+            yes_levels=((0.40, 1), (0.41, 300)), no_levels=((0.55, 50),))
+    report = asyncio.run(ex.execute_maker(o))
+    assert report.status is ExecStatus.SUCCESS       # band 301 clears min 10
+
+    # same book WITHOUT the ladder: the top-size fallback must still skip it
+    kalshi2 = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
+    poly2 = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 5, 0.40)])
+    ex2, _ = make_maker_exec([kalshi2, poly2],
+                             FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.45)}))
+    ex2.min_leg_depth = 10
+    o2 = _rp(opp(yv="poly", nv="kalshi", max_contracts=5, yes_price=0.40, no_price=0.55),
+             yes_size=1.0, no_size=50.0)
+    report2 = asyncio.run(ex2.execute_maker(o2))
+    assert report2.status is ExecStatus.SKIPPED and "thin hedge" in report2.reason
