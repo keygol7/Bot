@@ -1200,6 +1200,28 @@ async def stream(
                         confirm_rules, rules_complete_fn,
                         venue_a="kalshi", title_a=titles.get(ka, ka), rules_a=rules_k,
                         venue_b="polymarket_us", title_b=titles.get(pm, pm), rules_b=rules_p)
+                    # ID-EVIDENCE OVERRIDE: prompt-patching the local model's
+                    # pedantry has not converged (different_event -> timing_scope ->
+                    # absence-as-difference). When the deterministic ids STRONGLY
+                    # match (teams+date+metric+outcome), a different_event verdict
+                    # about metadata is overruled to tail-divergent at write time —
+                    # the same cross-examination the offline audits ran, made online.
+                    if v.material:
+                        try:
+                            from bot.matching.idparse import (keys_match, parse_kalshi,
+                                                              parse_poly)
+                            meta = store.series_meta_map().get(ka.split("-")[0])
+                            if keys_match(
+                                    parse_kalshi(ka, titles0.get(ka, "") or "", meta),
+                                    parse_poly(pm, titles0.get(pm, "") or "")):
+                                log.info("rules verify: ID-OVERRIDE %s|%s — deterministic "
+                                         "ids match; downgrading different_event to tail",
+                                         ka, pm)
+                                v.material = False
+                                v.divergence = "tail_scenarios"
+                                v.rationale = "[id-override: ids match] " + v.rationale
+                        except Exception:
+                            pass
                     store.record_rules_verdict(
                         "kalshi", ka, "polymarket_us", pm,
                         identical=v.identical, confidence=v.confidence,

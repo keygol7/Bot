@@ -48,6 +48,9 @@ settle DIFFERENTLY, then CLASSIFY the divergence:
   Likewise a SURNAME on one venue matching a FULLER form of the same name on the
   other ("Lee" vs "Ha Eum Lee", "Sabalenka" vs "A. Sabalenka") is the SAME person
   unless the rules identify a genuinely different player in the same match.
+  When one side has no published rules (title only), the ABSENCE of a detail
+  (tournament name, round, year) is NOT a difference — only a POSITIVE
+  contradiction (a different named player/team/tournament) is.
 - "timing_scope": SAME event and SAME winning party, but the SETTLEMENT WINDOW
   differs — one market counts extra time / overtime / penalty shootouts while the
   other settles on regulation only, or one covers a longer game period. These
