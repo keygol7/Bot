@@ -199,6 +199,7 @@ class StreamingEngine:
         self._backoff_until: dict[tuple, float] = {}
         self._backoff_base = 60.0               # first penalty after a failed attempt
         self._backoff_cap = 1800.0              # max 30 min between retries
+        self._confirm_fails: dict = {}          # consecutive confirm-rejections per pair
         self._preview_backoff = 60.0            # pause a pair whose hedge can't fill (preview)
         # Latest known market state per (venue, market_id): from Polymarket's marketData
         # `state` (carried on the quote) and Kalshi's lifecycle channel. Used to skip
@@ -356,6 +357,14 @@ class StreamingEngine:
         except Exception as exc:
             log.warning("depth fetch failed for %s: %s", p.event_key, exc)
             return None
+        # RESEED the live book with the REST truth: a stale/phantom WS book otherwise
+        # keeps re-triggering this same confirm every cooldown until the venue happens
+        # to tick (the single largest source of REST volume — 12.6k confirms/48h, 91%
+        # rejecting). REST quotes carry no timestamp, so they can never qualify for
+        # the fresh-WS fast path; the next real WS tick overwrites them.
+        for q in (da, db):
+            if q is not None:
+                self.livebook.update(q)
         ev = self._eval_direction(da, db)
         if ev is None and not quiet:
             # A leg had no usable two-sided quote (illiquid / one-sided book). Show
@@ -572,10 +581,19 @@ class StreamingEngine:
                 return None
             edge, yq, nq, size = ev
             if edge <= self.min_edge or size < 1:
-                log.info("STREAM edge gone after depth check on %s (edge %.4f sz %g)",
-                         p.event_key, edge, size)
+                # ESCALATING BACKOFF: a pair whose WS book keeps disagreeing with the
+                # REST truth is a chronic liar, not a fresh opportunity — re-confirming
+                # it every cooldown burns the rate budget the trade path needs. Same
+                # exponential machinery as failed executions; reset on a pass.
+                n = self._confirm_fails.get(key, 0) + 1
+                self._confirm_fails[key] = n
+                delay = min(self._backoff_base * (2 ** (n - 1)), self._backoff_cap)
+                self._backoff_until[key] = self.clock() + delay
+                log.info("STREAM edge gone after depth check on %s (edge %.4f sz %g) — "
+                         "backoff %.0fs (miss #%d)", p.event_key, edge, size, delay, n)
                 self._observe(p, edge, yq, nq, size, "edge_gone_after_depth")
                 return None
+            self._confirm_fails.pop(key, None)     # WS agreed with REST — full cadence
         elif size < 1:
             return None
         else:

@@ -428,9 +428,10 @@ def test_log_edge_snapshot_ranks_by_confirmed_depth_excludes_one_sided(caplog):
     with caplog.at_level(logging.INFO, logger="bot.streaming"):
         asyncio.run(eng.log_edge_snapshot())
     text = caplog.text
-    # Both pairs quote two-sided on WS (the honest denominator), but only the genuinely
-    # two-sided REAL book is tradeable — shown with its real (non-zero) confirmed size.
-    assert "2/2 pairs two-sided on WS, 1 tradeable" in text
+    # The confirm RESEEDS the live book with REST truth: the phantom pair's one-sided
+    # real book replaces its lying WS quote, so the denominator honestly reads 1/2
+    # (pre-reseed it read 2/2 and the stale book kept re-triggering confirms).
+    assert "1/2 pairs two-sided on WS, 1 tradeable" in text
     assert "sz=500" in text          # min(K_real 500, P_real 800) from the confirmed book
     assert "sz=0" not in text        # the empty/sentinel pair is gone, not shown at size 0
 
@@ -1491,3 +1492,35 @@ def test_eval_direction_depth_sweep_reprices_quotes():
     assert abs(edge - 0.04) < 1e-9
     # original book quotes untouched (copies were re-priced, not the shared book)
     assert a.yes_ask == 0.44 and a.yes_ask_size == 5
+
+
+def test_confirm_reject_escalates_backoff_and_reseeds():
+    import asyncio
+    from bot.models import MarketQuote
+    from bot.streaming.engine import StreamingEngine, ConfirmedPair, LiveBook
+    from bot.fees import ZeroFeeModel
+
+    eng = StreamingEngine.__new__(StreamingEngine)
+    eng.min_edge = 0.005
+    eng._fee = lambda v: ZeroFeeModel()
+    eng.livebook = LiveBook()
+    eng._backoff_base = 30.0
+    eng._backoff_cap = 1800.0
+    eng._confirm_fails = {}
+    eng._backoff_until = {}
+    eng.clock = lambda: 1000.0
+    p = ConfirmedPair("ek", "kalshi", "K1", "poly", "P1")
+    # REST truth: NO edge (sum 1.02) — the WS book was lying
+    rest_k = MarketQuote(venue="kalshi", market_id="K1", title="",
+                         yes_ask=0.52, yes_ask_size=50, no_ask=0.50, no_ask_size=50)
+    rest_p = MarketQuote(venue="poly", market_id="P1", title="",
+                         yes_ask=0.52, yes_ask_size=50, no_ask=0.50, no_ask_size=50)
+    async def fake_fetch(venue, market):
+        return rest_k if venue == "kalshi" else rest_p
+    eng.depth_fetch = fake_fetch
+    ev = asyncio.run(eng._confirm_depth(p, quiet=True))
+    # reseed: livebook now carries the REST truth
+    assert eng.livebook.get("kalshi", "K1").yes_ask == 0.52
+    assert eng.livebook.get("poly", "P1").no_ask == 0.50
+    # and REST-seeded quotes are timestampless -> can never enable the fast path
+    assert (eng.livebook.get("kalshi", "K1").timestamp or 0) == 0
