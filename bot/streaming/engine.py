@@ -211,6 +211,7 @@ class StreamingEngine:
         self.ws_trust_min = ws_trust_min
         self.ws_trust_eps = ws_trust_eps
         self._ws_trust: dict = {}               # consecutive WS-vs-REST agreements
+        self._feed_lag: dict = {}               # venue -> EWMA transport lag (secs)
         self._preview_backoff = 60.0            # pause a pair whose hedge can't fill (preview)
         # Latest known market state per (venue, market_id): from Polymarket's marketData
         # `state` (carried on the quote) and Kalshi's lifecycle channel. Used to skip
@@ -309,6 +310,19 @@ class StreamingEngine:
         state = getattr(q, "state", None) or self._market_state.get((q.venue, q.market_id))
         return state is None or state == self._OPEN_STATE
 
+    def note_feed_lag(self, q) -> None:
+        """Rolling per-venue transport lag (arrival − exchange time). Diagnostic only —
+        surfaces one venue's feed falling behind (reconnect storms, venue degradation)."""
+        ex = getattr(q, "exchange_ts", None)
+        ts = getattr(q, "timestamp", 0.0) or 0.0
+        if not ex or ts <= 0:
+            return
+        lag = max(0.0, ts - ex)
+        if lag > 60.0:
+            return                                   # initial snapshot of a quiet book, not transport
+        prev = self._feed_lag.get(q.venue, lag)
+        self._feed_lag[q.venue] = 0.9 * prev + 0.1 * lag
+
     def _ws_book_fresh(self, yq, nq) -> bool:
         """True when BOTH crossing legs have a recent, sized WS quote — so the live
         book is trustworthy enough to fire on without a REST depth re-fetch. Only
@@ -342,7 +356,15 @@ class StreamingEngine:
         now = time.time()
         if now - ts_y > w or now - ts_n > w:        # both legs must be VERY recent
             return False
-        return abs(ts_y - ts_n) <= w                 # and synced with each other (no lead)
+        # EVENT-TIME sync: when both venues stamp their books with exchange time
+        # (kalshi ts_ms, poly transactTime), compare when the books actually CHANGED
+        # at the exchanges — immune to transport jitter, which arrival times conflate
+        # with real repricing lag. Falls back to arrival when either side lacks it.
+        ex_y = getattr(yq, "exchange_ts", None)
+        ex_n = getattr(nq, "exchange_ts", None)
+        if ex_y and ex_n:
+            return abs(ex_y - ex_n) <= w             # both repriced together at source
+        return abs(ts_y - ts_n) <= w                 # arrival-time approximation
 
     async def _confirm_depth(self, p: ConfirmedPair, *, quiet: bool = False):
         """Re-fetch real order-book depth for both legs and recompute the best
@@ -790,6 +812,7 @@ class StreamingEngine:
         re-firing the same pair on every tick.
         """
         self.livebook.update(q)
+        self.note_feed_lag(q)
         if getattr(q, "state", None):
             self._market_state[(q.venue, q.market_id)] = q.state
         report = None
@@ -1172,8 +1195,11 @@ class StreamingEngine:
         rows.sort(key=lambda r: r[0], reverse=True)
         shown = rows[:top]
         note = "" if len(priced) <= cap else f"; depth-checked top {cap}"
-        log.info("edge snapshot: %d/%d pairs two-sided on WS, %d tradeable, top %d%s:",
-                 len(priced), len(self._pairs), len(rows), len(shown), note)
+        lag = " | feed lag " + " ".join(
+            f"{v}={l*1000:.0f}ms" for v, l in sorted(self._feed_lag.items())) \
+            if self._feed_lag else ""
+        log.info("edge snapshot: %d/%d pairs two-sided on WS, %d tradeable, top %d%s%s:",
+                 len(priced), len(self._pairs), len(rows), len(shown), note, lag)
         for edge, yq, nq, size in shown:
             log.info("  %s yes=%.2f + %s no=%.2f = %.2f | edge=%+.3f sz=%g",
                      yq.venue, yq.yes_ask, nq.venue, nq.no_ask,

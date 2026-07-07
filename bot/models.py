@@ -57,6 +57,11 @@ class MarketQuote:
     yes_ask_size: float = 0.0
     no_ask: Optional[float] = None
     no_ask_size: float = 0.0
+    # EXCHANGE event time (epoch seconds): when the venue's matching engine last
+    # changed this book (kalshi ts_ms; poly transactTime), vs ``timestamp`` = local
+    # arrival. Event-time lets the sync window compare books by when they CHANGED,
+    # immune to transport jitter. None when the source doesn't carry it.
+    exchange_ts: Optional[float] = None
     # Full ask LADDERS, best-first ((price, size), ...): present when the source
     # parsed a real book (WS books, /book, /orderbook). None = only top-of-book known.
     # The depth sweep uses these to take level 2+ when still profitable; consumers

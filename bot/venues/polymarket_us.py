@@ -92,6 +92,14 @@ def parse_market_data(message: dict[str, Any]) -> MarketQuote | None:
         return None
     q = normalize_book(slug, "", md)
     q.timestamp = time.time()   # stamp WS arrival so the engine can gate on freshness
+    tt = md.get("transactTime")
+    if tt:
+        try:
+            # nanosecond ISO (2026-07-07T16:04:36.637955962Z): trim to micros
+            iso = re.sub(r"\.(\d{6})\d*", r".\1", str(tt)).replace("Z", "+00:00")
+            q.exchange_ts = datetime.fromisoformat(iso).timestamp()
+        except (ValueError, TypeError):
+            pass
     return q
 
 

@@ -1578,3 +1578,34 @@ def test_ws_trust_ladder_earns_skip_and_resets_on_lie():
     eng._ws_trust = {k: 0 for k in eng._ws_trust}
     tick()
     assert max(eng._ws_trust.values()) == 0
+
+
+def test_ws_synced_uses_exchange_time_over_arrival():
+    import time as _time
+    from bot.streaming.engine import StreamingEngine
+    eng = StreamingEngine.__new__(StreamingEngine)
+    eng.sync_window_secs = 0.1
+    now = _time.time()
+    # arrival times 80ms apart (inside window) but EXCHANGE times 5s apart:
+    # one venue repriced, the other book is old news delivered late -> NOT synced
+    a = q("kalshi", "K1", yes_ask=0.40, ya=50, no_ask=0.62, na=50)
+    b = q("poly", "P1", yes_ask=0.62, ya=50, no_ask=0.55, na=50)
+    a.timestamp = now; b.timestamp = now - 0.08
+    a.exchange_ts = now - 0.01; b.exchange_ts = now - 5.0
+    assert not eng._ws_synced(a, b)
+    # exchange times 50ms apart -> genuinely simultaneous repricing -> synced,
+    # even with arrival skew near the window edge (transport jitter)
+    b.exchange_ts = now - 0.06
+    assert eng._ws_synced(a, b)
+    # missing exchange ts on one side falls back to arrival comparison
+    b.exchange_ts = None
+    assert eng._ws_synced(a, b)
+
+
+def test_kalshi_parse_ticker_carries_exchange_ts():
+    from bot.venues.kalshi import parse_ticker
+    msg = {"type": "ticker", "msg": {
+        "market_ticker": "KXT-1", "yes_bid_dollars": "0.40", "yes_ask_dollars": "0.42",
+        "yes_bid_size_fp": "10", "yes_ask_size_fp": "12", "ts_ms": 1783440160211}}
+    quote = parse_ticker(msg)
+    assert abs(quote.exchange_ts - 1783440160.211) < 1e-6

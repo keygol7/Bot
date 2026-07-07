@@ -179,6 +179,8 @@ def parse_ticker(message: dict[str, Any]) -> MarketQuote | None:
         no_ask=round(1.0 - yes_bid, 4) if yes_bid is not None else None,
         no_ask_size=_sz(m.get("yes_bid_size_fp")),
         timestamp=time.time(),
+        exchange_ts=(float(m["ts_ms"]) / 1000.0 if m.get("ts_ms")
+                     else float(m["ts"]) if m.get("ts") else None),
     )
 
 
