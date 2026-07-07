@@ -1691,10 +1691,17 @@ def test_timing_scope_keys_from_legacy_rationale_and_new_column():
     st.record_rules_verdict("kalshi", "KA", "polymarket_us", "PA",
                             identical=False, confidence=1.0,
                             rationale="Market A includes extra time while B does not")
-    # new row: explicit divergence category
+    # new row: explicit category — but the belt+suspenders guard also requires
+    # window language in the rationale (the category was briefly misused for
+    # listing-time skew, which must not restrict anything)
     st.record_rules_verdict("kalshi", "KB", "polymarket_us", "PB",
                             identical=False, confidence=1.0,
-                            rationale="settlement window differs", divergence="timing_scope")
+                            rationale="A counts extra time while B settles on regulation",
+                            divergence="timing_scope")
+    # timing_scope WITHOUT window language (listing-skew misuse) -> not restricted
+    st.record_rules_verdict("kalshi", "KD", "polymarket_us", "PD",
+                            identical=False, confidence=1.0,
+                            rationale="different resolution times", divergence="timing_scope")
     # different_event stays a hard drop, NOT one-way
     st.record_rules_verdict("kalshi", "KC", "polymarket_us", "PC",
                             identical=False, confidence=1.0,

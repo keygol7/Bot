@@ -52,6 +52,9 @@ settle DIFFERENTLY, then CLASSIFY the divergence:
   differs — one market counts extra time / overtime / penalty shootouts while the
   other settles on regulation only, or one covers a longer game period. These
   diverge whenever the deciding action happens in the non-shared window.
+  timing_scope is ONLY about which GAME PERIODS count toward settlement. Different
+  listed start times, timezones, or "resolution times" are NOT timing_scope — they
+  are listing skew ("none" or "tail_scenarios" if genuinely ambiguous).
 - "tail_scenarios": SAME event and SAME winning party, but the rules differ only in
   rare edge cases — cancellations, postponements, void/refund wording, settlement
   sources. The pair hedges in the normal outcome.

@@ -780,8 +780,12 @@ class Store:
         out = set()
         for r in rows:
             rat = (r["rationale"] or "").lower()
-            if r["dv"] == "timing_scope" or (
-                    r["material"] != 1 and any(t in rat for t in timing)):
+            # belt + suspenders: even an explicit timing_scope verdict only
+            # restricts when the rationale describes a settlement WINDOW — the
+            # model briefly used the new category for listing-time skew
+            # ("different resolution times"), which must not restrict anything
+            if any(t in rat for t in timing) and (
+                    r["dv"] == "timing_scope" or r["material"] != 1):
                 out.add(self._pair_key(r["venue_a"], r["market_a"],
                                        r["venue_b"], r["market_b"]))
         return out
