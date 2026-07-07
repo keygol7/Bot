@@ -790,6 +790,26 @@ class Store:
                                        r["venue_b"], r["market_b"]))
         return out
 
+    def rules_unverified_cached(self, limit: int = 20) -> list[tuple]:
+        """Confirmed pairs (verdict cache) with NO rules verdict whose markets are
+        both still listed — the PRE-verification queue. Verifying only the live
+        watchlist meant thin pairs arrived on game day (books fattening) exactly
+        when they were still unverified, and the pre-trade gate blocked their first
+        — often best — edges."""
+        cutoff = time.time() - 2 * 86400
+        return [
+            (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
+            for r in self.conn.execute(
+                """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b
+                   FROM match_verdicts v
+                   JOIN markets ma ON ma.market_id = v.market_a AND ma.updated_at >= :c
+                   JOIN markets mb ON mb.market_id = v.market_b AND mb.updated_at >= :c
+                   LEFT JOIN rules_verdicts r
+                     ON r.market_a = v.market_a AND r.market_b = v.market_b
+                   WHERE v.same_event = 1 AND r.market_a IS NULL
+                   LIMIT :l""", {"c": cutoff, "l": limit})
+        ]
+
     def rules_checked_keys(self) -> set:
         """Pairs with ANY rules verdict (either outcome) — the pre-trade rules gate:
         a pair may not TRADE until its resolution rules have been compared once. The

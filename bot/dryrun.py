@@ -1158,12 +1158,17 @@ async def stream(
             return
         while True:
             try:
-                budget = 15
+                budget = 20
                 # blocked-with-live-edge pairs jump the queue: they are the ones
-                # costing money RIGHT NOW (the 7c ITFW dislocation of 2026-07-07)
+                # costing money RIGHT NOW (the 7c ITFW dislocation of 2026-07-07).
+                # After the watchlist, PRE-verify cached pairs whose books haven't
+                # fattened yet — so game-day arrivals are already checked.
                 blocked = getattr(engine, "_rules_blocked", {})
-                ordered = sorted(engine._pairs.values(),
-                                 key=lambda p: -blocked.get(p.key, 0.0))
+                ordered = list(sorted(engine._pairs.values(),
+                                      key=lambda p: -blocked.get(p.key, 0.0)))
+                from bot.streaming.engine import ConfirmedPair as _CP
+                for (va, ma, vb, mb) in store.rules_unverified_cached(limit=budget):
+                    ordered.append(_CP(f"{va}:{ma}|{vb}:{mb}", va, ma, vb, mb))
                 for p in ordered:
                     if budget <= 0:
                         break
@@ -1173,8 +1178,20 @@ async def stream(
                     pm = p.market_a if p.venue_a == "polymarket_us" else p.market_b
                     rules_k = await kalshi_v.market_rules(ka)
                     rules_p = await poly_v.market_rules(pm)
-                    if not rules_k or not rules_p:
-                        continue                      # poly desc arrives with the next scan
+                    row0 = store.conn.execute(
+                        "SELECT venue, market_id, title FROM markets WHERE market_id IN (?, ?)",
+                        (ka, pm)).fetchall()
+                    titles0 = {r["market_id"]: r["title"] for r in row0}
+                    # A venue with NO published rules must not park the pair
+                    # unverifiable forever (small poly markets never get a
+                    # description — the gate froze real edges on exactly those).
+                    # The TITLE carries the proposition; verify against it, labeled.
+                    if not rules_p:
+                        rules_p = ("[This venue published no resolution rules. "
+                                   f"The market title is:] {titles0.get(pm, pm)}")
+                    if not rules_k:
+                        rules_k = ("[This venue published no resolution rules. "
+                                   f"The market title is:] {titles0.get(ka, ka)}")
                     row = store.conn.execute(
                         "SELECT venue, market_id, title FROM markets WHERE market_id IN (?, ?)",
                         (ka, pm)).fetchall()
