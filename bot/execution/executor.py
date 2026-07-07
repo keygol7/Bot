@@ -423,6 +423,17 @@ class Executor:
     def _fee(self, venue: str) -> FeeModel:
         return self.fee_models.get(venue, ZeroFeeModel())
 
+    @staticmethod
+    def confirmer_avg(side, avg):
+        """Convert a raw private-WS fill average into the ORDER-side price. Both
+        venues' fill events quote the YES side; for a NO order the order-side cost is
+        1 - yes_avg. Booking the raw value recorded phantom prices on kalshi NO maker
+        fills (a NO resting at 0.72 reported 0.28 -> +$4.20 booked on a +$0.37 pair;
+        the settlement audit of 2026-07-07 caught it)."""
+        if avg is None:
+            return None
+        return round(1.0 - avg, 4) if side is Side.NO else avg
+
     async def _place(self, venue, market_id, side, action, price, contracts, tif) -> OrderResult:
         """Place an order, converting any raised exception into an ERROR result so a
         venue error never crashes the loop (it routes to the halt path instead)."""
@@ -450,7 +461,7 @@ class Executor:
                     # Confirmer price is raw venue convention (Polymarket = YES-side);
                     # prefer the per-venue-converted price from place_order.
                     if avg is not None and result.avg_price is None:
-                        result.avg_price = avg
+                        result.avg_price = self.confirmer_avg(side, avg)
             except Exception as exc:  # confirmer failure -> keep REST result
                 log.warning("fill confirm failed for %s: %s", result.order_id, exc)
         # Empirical fill-reliability: a FOK BUY that FILLED proves the market's depth is real;
@@ -1810,7 +1821,8 @@ class Executor:
         maker_leg = OrderResult(
             venue=m.venue, market_id=maker[1], side=maker[2], action="buy",
             requested=filled, filled=filled,
-            avg_price=avg if avg is not None else maker[3],
+            avg_price=(self.confirmer_avg(maker[2], avg)
+                       if avg is not None else maker[3]),
             order_id=m.order_id, status=OrderStatus.FILLED)
         # Re-fetch the hedge venue's LIVE book and cross the current ask: the maker may
         # have rested for seconds, so the opp's price is stale — a stale limit misses

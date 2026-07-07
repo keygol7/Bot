@@ -619,7 +619,7 @@ def test_execute_maker_fills_then_hedges_locks_arb():
     # fills -> locked arb. No unwind, thin-edge friendly.
     kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
     poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 5, 0.40)])
-    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55)}))
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.45)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.40, no_price=0.55)))
     assert report.status is ExecStatus.SUCCESS
@@ -644,7 +644,7 @@ def test_maker_fee_credit_arms_thin_arb_that_taker_fee_would_skip():
         ex = Executor({"kalshi": kalshi, "poly": poly}, risk,
                       fee_models={"kalshi": KalshiFeeModel(0.07), "poly": ZeroFeeModel()},
                       max_order_contracts=0, min_lock_edge=0.005,
-                      fill_confirmer=FakeConfirmer({"kalshi": (OrderStatus.FILLED, 40, 0.49)}),
+                      fill_confirmer=FakeConfirmer({"kalshi": (OrderStatus.FILLED, 40, 0.51)}),
                       maker_timeout=0.01)
         return ex
     o = opp(yv="poly", nv="kalshi", max_contracts=40, yes_price=0.49, no_price=0.49)
@@ -662,7 +662,7 @@ def test_execute_maker_hedge_reprices_off_live_book():
     moved = MarketQuote(venue="poly", market_id="K1", title="", yes_ask=0.50, no_ask=0.50)
     kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
     poly = QuotingVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 5, 0.50)], moved)
-    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55)}))
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.45)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.40, no_price=0.55)))
     assert report.status is ExecStatus.SUCCESS
@@ -793,7 +793,7 @@ def test_maker_depth_guards_on_hedge_leg_not_min():
     ex = Executor({v.name: v for v in [kalshi, poly]}, risk,
                   fee_models={v.name: ZeroFeeModel() for v in [kalshi, poly]},
                   max_order_contracts=0, min_leg_depth=10,
-                  fill_confirmer=FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.54)}),
+                  fill_confirmer=FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.46)}),
                   maker_timeout=0.01)
     o = opp(yv="poly", nv="kalshi", max_contracts=5, yes_price=0.40, no_price=0.55)
     o.yes_size, o.no_size = 200, 5            # hedge (poly YES) deep, maker (kalshi NO) thin
@@ -842,7 +842,7 @@ def test_execute_maker_fat_edge_above_cushion_arms():
     risk = RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9, max_total_exposure=1e12))
     ex = Executor({v.name: v for v in [kalshi, poly]}, risk,
                   fee_models={v.name: ZeroFeeModel() for v in [kalshi, poly]},
-                  max_order_contracts=0, fill_confirmer=FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.50)}),
+                  max_order_contracts=0, fill_confirmer=FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.5)}),
                   maker_timeout=0.01, maker_arm_cushion=0.05)
     # edge 0.10 (0.40 + 0.50) >= floor 0.01 + cushion 0.05 -> arms and locks.
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
@@ -871,7 +871,7 @@ def test_execute_maker_hedge_fails_unwinds_maker():
         res("poly", Side.YES, OrderStatus.KILLED, 0, None),     # initial hedge: no fill
         res("poly", Side.YES, OrderStatus.KILLED, 0, None),     # re-cross: still no fill
     ])
-    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55)}))
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.45)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.40, no_price=0.55)))
     assert report.status is ExecStatus.UNWOUND and not risk.is_killed
@@ -891,7 +891,7 @@ def test_execute_maker_partial_hedge_recrosses_then_settles():
     ], quote)
     ex, risk = make_maker_exec(
         [kalshi, poly],
-        FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55), "poly": (OrderStatus.PARTIAL, 3, 0.40)}))
+        FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.45), "poly": (OrderStatus.PARTIAL, 3, 0.40)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.40, no_price=0.55)))
     assert report.status is ExecStatus.SUCCESS and not risk.is_killed
@@ -915,7 +915,7 @@ def test_execute_maker_partial_hedge_settles_matched_unwinds_excess():
     ], MarketQuote(venue="poly", market_id="P1", title="", yes_ask=0.40, no_ask=0.40))
     ex, risk = make_maker_exec(
         [kalshi, poly],
-        FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55), "poly": (OrderStatus.PARTIAL, 3, 0.40)}))
+        FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.45), "poly": (OrderStatus.PARTIAL, 3, 0.40)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.40, no_price=0.55)))
     # Locked 3 (+0.15) and unwound the naked 2 (~-0.04) -> never halts, never naked.
@@ -1007,7 +1007,7 @@ def test_execute_maker_sizes_down_to_hedge_fillable():
     # hedges) instead of arming 5 and unwinding the unhedgeable 2.
     kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
     poly = PreviewVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 3, 0.40)], preview_filled=3)
-    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 3, 0.55)}))
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 3, 0.45)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.40, no_price=0.55)))
     assert report.status is ExecStatus.SUCCESS
@@ -1062,7 +1062,7 @@ def test_execute_maker_hedge_error_flat_unwinds():
         res("poly", Side.YES, OrderStatus.ERROR, 0, None),
         res("poly", Side.YES, OrderStatus.ERROR, 0, None),    # retry also errors -> unwind
     ], [])
-    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55)}))
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.45)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.40, no_price=0.55)))
     assert report.status is ExecStatus.UNWOUND and not risk.is_killed
@@ -1077,7 +1077,7 @@ def test_execute_maker_hedge_error_retries_then_settles():
         res("poly", Side.YES, OrderStatus.ERROR, 0, None),     # transient hedge error
         res("poly", Side.YES, OrderStatus.FILLED, 5, 0.40),    # retry fills
     ], [])
-    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55)}))
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.45)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.40, no_price=0.55)))
     assert report.status is ExecStatus.SUCCESS and not risk.is_killed
@@ -1091,7 +1091,7 @@ def test_execute_maker_hedge_error_present_settles():
     kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
     poly = SnapshotVenue("poly", [res("poly", Side.YES, OrderStatus.ERROR, 0, None)],
                          [VenuePosition("K1", 5, 0)])
-    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55)}))
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.45)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.40, no_price=0.55)))
     assert report.status is ExecStatus.SUCCESS and not risk.is_killed
@@ -1121,7 +1121,7 @@ def test_maker_dynamic_rests_on_thin_leg():
 def test_execute_maker_rejected_when_would_cross():
     kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.REJECTED, 0, None)])
     poly = FakeVenue("poly", [])
-    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.55)}))
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 5, 0.45)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5)))
     assert report.status is ExecStatus.SKIPPED and "cross" in report.reason
     assert poly.calls == []
@@ -2276,3 +2276,13 @@ def test_recycle_skips_pairs_settling_within_min_hours():
     pm3 = {("kalshi", "KNODATE-X"): ("poly", "p3"), ("poly", "p3"): ("kalshi", "KNODATE-X")}
     q3 = _q("kalshi", "KNODATE-X", no_ask=0.01); q4 = _q("poly", "p3", yes_ask=0.99)
     assert ex.plan_recycle("kalshi", pm3, {("kalshi","KNODATE-X"): q3, ("poly","p3"): q4}) == []
+
+
+def test_confirmer_avg_converts_no_side():
+    from bot.execution.executor import Executor
+    from bot.models import Side
+    # both venues' private fill events quote YES-side prices: a NO order's cost is
+    # the complement (the 2026-07-07 audit found NO makers booked at 1-actual)
+    assert Executor.confirmer_avg(Side.NO, 0.28) == 0.72
+    assert Executor.confirmer_avg(Side.YES, 0.28) == 0.28
+    assert Executor.confirmer_avg(Side.NO, None) is None
