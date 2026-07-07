@@ -213,6 +213,7 @@ class StreamingEngine:
         self.ws_trust_eps = ws_trust_eps
         self._ws_trust: dict = {}               # consecutive WS-vs-REST agreements
         self._feed_lag: dict = {}               # venue -> EWMA transport lag (secs)
+        self._settled_leg_until: dict = {}      # pair key -> sticky settled-leg expiry
         # PRE-TRADE RULES GATE: pairs may not fire until their resolution rules have
         # been LLM-compared once (rules_checked, fed by the rules loop). Closes the
         # race where a fresh pair trades minutes before verification reaches it.
@@ -966,8 +967,16 @@ class StreamingEngine:
         # stranded hedge (those halt at execution time). Checked only on imbalance (rare).
         if imbalanced:
             kept = []
+            now = self.clock()
             for p, qa, qb in imbalanced:
+                # STICKY: a settled leg cannot un-settle. The check reads venue APIs
+                # that intermittently fail; without the cache a read blip flips the
+                # classification back to "naked", two blips in a row trip the kill
+                # switch (2026-07-07: halt-looped on a settled ARG-EGY leg for 15min).
+                if now < self._settled_leg_until.get(p.key, 0.0):
+                    continue
                 if await self._pair_leg_settled(p, qa, qb):
+                    self._settled_leg_until[p.key] = now + 1800.0
                     log.info("RECONCILE: %s imbalanced (%s=%g vs %s=%g) but a leg has SETTLED "
                              "— realized arb awaiting the other venue, not naked",
                              p.event_key, p.venue_a, qa, p.venue_b, qb)
