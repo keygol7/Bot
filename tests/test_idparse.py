@@ -138,3 +138,68 @@ def test_f5_scope_separates_from_full_game():
     assert not _match(*f5_k, *full_p)      # inverse mismatch
     assert _match(*f5_k, *f5_p)            # legit F5 <-> F5 arb
     assert _match(*full_k, *full_p)        # legit full <-> full
+
+
+MLB = {
+    "game": {"title": "Professional Baseball Game", "tags": ["Baseball"]},
+    "f5": {"title": "First 5 Innings Winner", "tags": ["Baseball"]},
+    "total": {"title": "Pro Baseball Total Points", "tags": ["Baseball"]},
+    "f5total": {"title": "First 5 Innings Total", "tags": ["Baseball"]},
+    "f5spread": {"title": "First 5 Innings Spread", "tags": ["Baseball"]},
+    "ldr_rbi": {"title": "MLB RBIs Leader", "tags": ["Baseball"]},
+    "alcy": {"title": "Pro Baseball American League Cy Young", "tags": ["Baseball"]},
+    "drafttop": {"title": "Pro Baseball Top Pick", "tags": ["Baseball"]},
+}
+
+
+def test_mlb_totals_normalize_to_count_form():
+    # kalshi outcome digit N = "over N-0.5" = ">= N"; poly bare 10pt5 = ">= 11"
+    k = parse_kalshi("KXMLBF5TOTAL-26JUL071835CHCBAL-4",
+                     "CHC vs BAL first 5 innings runs? - Over 3.5 runs", MLB["f5total"])
+    p = parse_poly("tsc-mlb-chc-bal-2026-07-07-f5-3pt5",
+                   "Cubs vs Orioles F5: O/U 3.5 - Over")
+    assert (k.metric, k.thr_lo, set(k.scope)) == ("total", 4.0, {"f5"})
+    assert (p.metric, p.thr_lo, set(p.scope)) == ("total", 4.0, {"f5"})
+    assert keys_match(k, p)
+    # different lines never match
+    p2 = parse_poly("tsc-mlb-chc-bal-2026-07-07-f5-4pt5", "Cubs vs Orioles F5: O/U 4.5 - Over")
+    assert not keys_match(k, p2)
+
+
+def test_mlb_spread_margin_form_and_pos_fails_closed():
+    k = parse_kalshi("KXMLBF5SPREAD-26JUL071835CHCBAL-BAL2",
+                     "Baltimore wins first 5 innings by over 1.5 runs? - Baltimore -1.5",
+                     MLB["f5spread"])
+    p = parse_poly("asc-mlb-chc-bal-2026-07-07-f5-neg-1pt5",
+                   "Will the Chicago Cubs cover -1.5 (F5)")
+    # both margin>=2 form; outcome teams differ here (bal vs chc) so no match,
+    # but a same-team pair aligns
+    assert k.thr_lo == p.thr_lo == 2.0 and k.metric == p.metric == "spread"
+    p_pos = parse_poly("asc-mlb-chc-bal-2026-07-07-f5-pos-1pt5",
+                       "Will the Chicago Cubs cover +1.5 (F5)")
+    assert not p_pos.matchable          # polarity-inverted: must fail closed
+
+
+def test_mlb_leader_metric_never_crosses_props():
+    lead = parse_kalshi("KXLEADERMLBRBI-26-AJUD", "MLB RBIs Leader - Aaron Judge", MLB["ldr_rbi"])
+    p_lead = parse_poly("aachc-mlb-rbi-leader-aarjud", "MLB RBI Leader - Aaron Judge")
+    assert lead.metric == p_lead.metric == "ldr_rbi"
+    assert keys_match(lead, p_lead)
+    # a game RBI prop shares the player but NOT the metric
+    assert lead.metric != "rbi"
+
+
+def test_mlb_cy_young_qualifier():
+    k = parse_kalshi("KXMLBALCY-26-BWOO", "AL Cy Young - Bryan Woo", MLB["alcy"])
+    p = parse_poly("tec-mlb-al-2026-11-27-cy-brywoo", "AL Cy Young Award - Yes")
+    assert k.metric == p.metric == "cyyoung"
+    assert keys_match(k, p)
+
+
+def test_mlb_draft_top_scopes():
+    k = parse_kalshi("KXMLBDRAFTTOP-26-10-AGRA", "Will A. Gray go top 10? - A. Gray", MLB["drafttop"])
+    p10 = parse_poly("arankc-mlb-draft-2026-07-12-top10-andgra", "MLB Draft Top 10 - Andrew Gray")
+    p5 = parse_poly("arankc-mlb-draft-2026-07-12-top5-andgra", "MLB Draft Top 5 - Andrew Gray")
+    assert "top10" in k.scope and "top10" in p10.scope and "top5" in p5.scope
+    assert keys_match(k, p10)
+    assert not keys_match(k, p5)        # different cut lines never match

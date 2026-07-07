@@ -47,6 +47,10 @@ _METRIC_KEYWORDS = (
     # without these, "#1 Seed" ties "Division Winner" at the mutual-best stage
     ("seed", "seed"), ("mvp", "mvp"), ("most valuable", "mvp"),
     ("county", "county"), ("popular vote", "popvote"), ("spread", "spread"),
+    ("comeback", "cpoty"), ("reliever of", "reloty"), ("manager of", "moty"),
+    ("executive of", "eoty"), ("hank aaron", "haaron"),
+    ("silver slugger", "silverslugger"), ("all-star", "allstar"),
+    ("all star", "allstar"), ("extra inning", "extras"),
     ("draft", "draft"), ("relegat", "relegation"), ("promot", "promotion"),
     ("rookie of", "rookie"), ("coach of", "coach"), ("cy young", "cyyoung"),
     ("ballon", "ballondor"), ("playoff", "playoffs"), ("make the playoffs", "playoffs"),
@@ -65,10 +69,35 @@ _METRIC_KEYWORDS = (
     ("price", "price"), ("ipo", "ipo"),
     ("start", "starts"), ("mention", "unmatchable"), ("says", "unmatchable"),
 )
+# Slug FAMILY prefixes carry the market type platform-wide (tsc = total score,
+# asc = against-the-spread...). More reliable than titles; checked first.
+_POLY_FAMILY_METRIC = {
+    "tsc": "total", "asc": "spread", "aqc": "playoffs",
+    "adpc": "draft", "arankc": "draft",
+}
+_LEADER_STATS = ("bavg", "avg", "era", "ops", "war", "doubles", "triples", "steals",
+                 "saves", "runs", "wins", "hits", "hrs", "hr", "rbi", "rbis",
+                 "strikeouts", "ks")
+_LEADER_CANON = {"bavg": "avg", "hrs": "hr", "rbis": "rbi", "ks": "strikeouts"}
+
+
+def leader_metric(text: str) -> str:
+    """Season stat-LEADER markets are their own metric family (ldr_rbi != rbi), so a
+    'Judge RBI leader' future can never cross-match a 'Judge 2+ RBIs tonight' prop."""
+    t = (text or "").lower()
+    if "leader" not in t:
+        return ""
+    for stat in _LEADER_STATS:
+        if re.search(rf"\b{stat}\b", t):
+            return "ldr_" + _LEADER_CANON.get(stat, stat)
+    return "ldr_unknown"
+
+
 # Poly single-token qualifiers seen platform-wide between the date and outcome code.
 _POLY_QUALIFIER_METRIC = {
     "w": "winner", "g": "goals", "a": "assists", "ga": "ga", "m": "winner",
-    "tg": "total", "fastlap": "fastlap", "cy": "winner", "dc": "winner",
+    "tg": "total", "fastlap": "fastlap", "cy": "cyyoung", "roy": "rookie",
+    "mvp": "mvp", "dc": "winner",
     "cc": "winner", "sb": "stolen_bases", "hr": "homeruns", "ks": "strikeouts",
 }
 _GENERIC_TOKENS = frozenset({
@@ -174,8 +203,11 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
     meta_title = (series_meta or {}).get("title") or ""
     # metric evidence: series title AND series ticker together (the ticker often
     # carries the qualifier the title omits: KXNFL1SEED's title just says "win the
-    # conference" — 'seed' is in the ticker; keyword order handles specificity)
-    metric = metric_from_text(f"{meta_title} {series.lower()}") if meta_title else "unknown"
+    # conference" — 'seed' is in the ticker; keyword order handles specificity).
+    # Stat-LEADER series are their own metric family (ldr_rbi), never plain stats.
+    metric = leader_metric(f"{meta_title} {series.lower()}")
+    if not metric:
+        metric = metric_from_text(f"{meta_title} {series.lower()}") if meta_title else "unknown"
     if metric == "unknown":
         metric = metric_from_text(title)
     category = None
@@ -229,6 +261,30 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
         # sparse middle (futures/elections/IPO): the series title IS the event evidence
         ev_tokens |= _tokens(meta_title)
 
+    if metric == "spread" and outcome:
+        # spread outcomes fuse team+line: ATL2 = "Atlanta wins by over 1.5" = margin
+        # >= 2. Normalize to integer-margin form (poly neg-1pt5 normalizes the same).
+        sp = re.fullmatch(r"([A-Z]+?)(\d+)", outcome)
+        if sp:
+            outcome = sp.group(1)
+            thr_lo = float(sp.group(2))
+    if metric == "draft":
+        # KXMLBDRAFTTOP-26-10-AGRA / KXMLBDRAFTPICK-26-1-AGRA: the bare int in the
+        # middle is the pick/top-N qualifier -> scope, so top3/top5/top10 books and
+        # exact-pick books never cross-match
+        kind = "top" if "TOP" in series else "pick"
+        # the qualifier FOLLOWS the year code (KXMLBDRAFTTOP-26-10-AGRA): scan from
+        # the end, and never eat the segment already consumed as the year
+        for seg in reversed(middle):
+            if (seg.isdigit() and len(seg) <= 2 and int(seg) <= 40
+                    and (event_year is None or 2000 + int(seg) != event_year)):
+                ev_tokens.discard(seg)
+                scope_extra_k = f"{kind}{int(seg)}"
+                break
+        else:
+            scope_extra_k = None
+    else:
+        scope_extra_k = None
     # outcome may itself be a threshold (KXCPIYOY-26NOV-T3.6, KXATPGTOTAL-...-47)
     if outcome:
         tm = _KALSHI_THR.match(outcome)
@@ -259,6 +315,8 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
     fm = re.search(r"F(\d)(?![A-Z0-9]*GP)", series)   # KXMLBF5* (not F1GP etc.)
     if fm and "F1" not in series:
         scope.add(f"f{fm.group(1)}")
+    if scope_extra_k:
+        scope.add(scope_extra_k)
     hm = re.search(r"(\d)H|([FS])H(?![A-Z])", series)
     if hm and "MATCH" not in series and "GAME" not in series:
         scope.add(f"h{hm.group(1) or hm.group(2).lower()}")
@@ -301,6 +359,9 @@ def parse_poly(slug: str, title: str = "") -> MarketKey:
             event_year = int(ym.group(1))
 
     scope_extra: set = set()
+    family = toks[0] if toks else ""
+    fam_metric = _POLY_FAMILY_METRIC.get(family, "")
+    spread_sign = None
     date_idx = None
     for idx in range(len(toks) - 2):
         if (toks[idx].isdigit() and len(toks[idx]) == 4
@@ -336,9 +397,30 @@ def parse_poly(slug: str, title: str = "") -> MarketKey:
                 thr_hi = float(f"{tm.group(5)}.{tm.group(6) or 0}")
             post.remove(seg)
             continue
+        if seg in ("neg", "pos") and fam_metric == "spread":
+            spread_sign = seg
+            post.remove(seg)
+            continue
+        if seg in ("top3", "top5", "top10", "top20"):
+            scope_extra.add(seg)
+            post.remove(seg)
+            continue
+        om = re.fullmatch(r"(\d)(?:st|nd|rd|th)", seg)
+        if om:
+            scope_extra.add(f"pick{om.group(1)}")
+            post.remove(seg)
+            continue
         pm = _POLY_PT.match(seg)
         if pm:
-            thr_lo = float(f"{pm.group(1)}.{pm.group(2)}")
+            v = float(f"{pm.group(1)}.{pm.group(2)}")
+            if fam_metric == "spread":
+                # neg-1pt5 = covers -1.5 = wins by margin >= 2 (integer-margin form,
+                # matching kalshi's ATL2 normalization)
+                thr_lo = v + 0.5
+            else:
+                # bare x.5 totals ("O/U 10.5 - Over") = ">= 11" count form, matching
+                # kalshi's outcome-digit convention (-11 = over 10.5)
+                thr_lo = v + 0.5 if v % 1 == 0.5 else v
             post.remove(seg)
             continue
         if seg in _POLY_QUALIFIER_METRIC:
@@ -363,10 +445,23 @@ def parse_poly(slug: str, title: str = "") -> MarketKey:
     if post:
         outcome_code = post[-1]
         ev_tokens |= set(post[:-1])
+    lm = leader_metric(" ".join(toks) + " " + (title or ""))
+    if lm:
+        metric = lm
+    elif fam_metric:
+        metric = fam_metric                   # family prefix beats title heuristics
     if metric == "unknown":
         metric = metric_from_text(title)
     if metric == "unknown" and re.search(r" vs\.? ", (title or ""), re.IGNORECASE):
         metric = "winner"                     # h2h phrasing = winner market
+    if fam_metric == "spread":
+        if spread_sign == "neg" and date_idx is not None and date_idx >= 3:
+            outcome_code = toks[2]            # the minus line belongs to the FIRST team
+        else:
+            # pos lines are polarity-INVERTED vs any kalshi book (A +1.5 YES == B
+            # wins-by-2+ NO); the pair model can't express inversion -> fail closed
+            return MarketKey(venue="polymarket_us", market_id=slug, matchable=False,
+                             metric="spread")
 
     names = frozenset()
     event_names: frozenset = frozenset()
