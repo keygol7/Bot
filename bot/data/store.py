@@ -797,8 +797,8 @@ class Store:
         when they were still unverified, and the pre-trade gate blocked their first
         — often best — edges."""
         cutoff = time.time() - 2 * 86400
-        return [
-            (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
+        cands = [
+            (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], "")
             for r in self.conn.execute(
                 """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b
                    FROM match_verdicts v
@@ -806,9 +806,14 @@ class Store:
                    JOIN markets mb ON mb.market_id = v.market_b AND mb.updated_at >= :c
                    LEFT JOIN rules_verdicts r
                      ON r.market_a = v.market_a AND r.market_b = v.market_b
-                   WHERE v.same_event = 1 AND r.market_a IS NULL
-                   LIMIT :l""", {"c": cutoff, "l": limit})
+                   WHERE v.same_event = 1 AND r.market_a IS NULL""",
+                {"c": cutoff})
         ]
+        # Only fan-out SURVIVORS are worth LLM budget: the raw cache holds
+        # multi-outcome cross-products (one kalshi F1 team x every poly team) that
+        # can never trade — verifying them one by one was most of a 5,349 backlog.
+        survivors = drop_fanout_pairs(cands, max_fanout=1)
+        return [(p[0], p[1], p[2], p[3]) for p in survivors[:limit]]
 
     def rules_checked_keys(self) -> set:
         """Pairs with ANY rules verdict (either outcome) — the pre-trade rules gate:
