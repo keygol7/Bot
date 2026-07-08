@@ -306,6 +306,9 @@ class Store:
         if "divergence" not in _rv_cols:
             self.conn.execute("ALTER TABLE rules_verdicts ADD COLUMN divergence TEXT")
             _rv_cols.add("divergence")
+        if "stricter_side" not in _rv_cols:
+            self.conn.execute("ALTER TABLE rules_verdicts ADD COLUMN stricter_side TEXT")
+            _rv_cols.add("stricter_side")
         if "material" not in _rv_cols:
             self.conn.execute("ALTER TABLE rules_verdicts ADD COLUMN material INTEGER")
         # pnl.event_key: pair attribution for every booking. Without it, per-pair booked
@@ -728,13 +731,15 @@ class Store:
 
     def record_rules_verdict(self, va: str, ma: str, vb: str, mb: str, *,
                              identical: bool, confidence: float, rationale: str,
-                             material: bool = False, divergence: str = "") -> None:
+                             material: bool = False, divergence: str = "",
+                             stricter_side: str = "") -> None:
         self.conn.execute(
             "INSERT OR REPLACE INTO rules_verdicts "
             "(venue_a, market_a, venue_b, market_b, identical, confidence, rationale,"
-            " material, divergence, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " material, divergence, stricter_side, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (va, ma, vb, mb, 1 if identical else 0, confidence, rationale,
-             1 if material else 0, divergence, time.time()))
+             1 if material else 0, divergence, stricter_side, time.time()))
         self.conn.commit()
 
     def rules_checked(self, va: str, ma: str, vb: str, mb: str) -> bool:
@@ -814,6 +819,42 @@ class Store:
         # can never trade — verifying them one by one was most of a 5,349 backlog.
         survivors = drop_fanout_pairs(cands, max_fanout=1)
         return [(p[0], p[1], p[2], p[3]) for p in survivors[:limit]]
+
+    def pair_divergence_policies(self, min_confidence: float = 0.9) -> dict:
+        """pair key -> (policy, extra_edge_ct, one_way_yes_venue) from classified
+        rules verdicts + the severity table (bot/matching/divergence_policy). Legacy
+        free-text rationales classify via the keyword taxonomy."""
+        from bot.matching.divergence_policy import classify_rationale, policy_for
+
+        out = {}
+        for r in self.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b, rationale, material, "
+                "COALESCE(divergence,'') dv, COALESCE(stricter_side,'') ss "
+                "FROM rules_verdicts WHERE identical = 0 AND confidence >= ?",
+                (min_confidence,)):
+            dv = r["dv"] or ("different_event" if r["material"] == 1
+                             else classify_rationale(r["rationale"] or ""))
+            if r["material"] == 1:
+                dv = "different_event"
+            ka = r["market_a"] if r["venue_a"] == "kalshi" else r["market_b"]
+            pol = policy_for(dv, ka)
+            if pol.policy == "ignore":
+                continue
+            # one-way YES side = the WIDER (non-stricter) venue; A is always kalshi
+            # in loop-recorded rows; fallback kalshi (matches all audited cases)
+            yes_venue = None
+            if pol.policy == "one_way":
+                ss = r["ss"]
+                if ss == "A":
+                    yes_venue = r["venue_b"]
+                elif ss == "B":
+                    yes_venue = r["venue_a"]
+                else:
+                    yes_venue = "kalshi"
+            out[self._pair_key(r["venue_a"], r["market_a"],
+                               r["venue_b"], r["market_b"])] = (
+                pol.policy, pol.extra_edge_ct, yes_venue)
+        return out
 
     def rules_checked_keys(self) -> set:
         """Pairs with ANY rules verdict (either outcome) — the pre-trade rules gate:

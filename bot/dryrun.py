@@ -989,7 +989,11 @@ async def stream(
         try:
             engine.verified_pairs = store.verified_pair_keys()
             engine.rules_checked = store.rules_checked_keys()
-            engine.one_way_yes = {k: "kalshi" for k in store.timing_scope_keys()}
+            pol = store.pair_divergence_policies()
+            engine.one_way_yes = {k: v[2] for k, v in pol.items()
+                                  if v[0] == "one_way" and v[2]}
+            engine.pair_edge_floor = {k: v[1] for k, v in pol.items()
+                                      if v[0] == "edge_floor" and v[1] > 0}
         except Exception as exc:
             log.warning("verified-pairs refresh failed: %s", exc)
         await refresh_balances()
@@ -1226,7 +1230,7 @@ async def stream(
                         "kalshi", ka, "polymarket_us", pm,
                         identical=v.identical, confidence=v.confidence,
                         rationale=v.rationale, material=v.material,
-                        divergence=v.divergence)
+                        divergence=v.divergence, stricter_side=v.stricter_side)
                     # take effect IMMEDIATELY: pairs stayed gate-blocked for minutes
                     # after their verdict landed because the in-memory set refreshed
                     # only at pass boundaries
@@ -1241,7 +1245,11 @@ async def stream(
                              v.confidence, v.rationale[:120])
                 engine.verified_pairs = store.verified_pair_keys()
                 engine.rules_checked = store.rules_checked_keys()
-                engine.one_way_yes = {k: "kalshi" for k in store.timing_scope_keys()}
+                pol = store.pair_divergence_policies()
+                engine.one_way_yes = {k: v[2] for k, v in pol.items()
+                                      if v[0] == "one_way" and v[2]}
+                engine.pair_edge_floor = {k: v[1] for k, v in pol.items()
+                                          if v[0] == "edge_floor" and v[1] > 0}
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

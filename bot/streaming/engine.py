@@ -220,6 +220,10 @@ class StreamingEngine:
         # this venue (the wider settlement window) — the other direction is the
         # naked SUI-COL shape. key -> required YES venue name.
         self.one_way_yes: dict = {}
+        # Divergence EDGE FLOORS: pairs whose rules diverge in a class with real
+        # expected cost (tennis retirement, cricket rain...) trade only when the
+        # edge ALSO pays for that risk: requires edge >= min_edge + extra.
+        self.pair_edge_floor: dict = {}
         # PRE-TRADE RULES GATE: pairs may not fire until their resolution rules have
         # been LLM-compared once (rules_checked, fed by the rules loop). Closes the
         # race where a fresh pair trades minutes before verification reaches it.
@@ -596,6 +600,10 @@ class StreamingEngine:
         if req_yes and yq.venue != req_yes:
             self._observe(p, edge, yq, nq, size, "unsafe_direction_timing_scope")
             return None       # only the windfall-shaped direction may trade
+        extra = self.pair_edge_floor.get(key, 0.0)
+        if extra > 0 and edge < self.min_edge + extra - 1e-9:
+            self._observe(p, edge, yq, nq, size, "edge_below_divergence_floor")
+            return None       # the edge must also pay for the divergence risk
         if (self.require_rules_verify and key not in self.rules_checked
                 and key not in self.verified_pairs):
             # visible + prioritized: the rules loop verifies blocked-with-live-edge
