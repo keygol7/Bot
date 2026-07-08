@@ -1433,12 +1433,16 @@ class StreamingEngine:
         rows = [ev for ev in evs if ev is not None and ev[3] >= 1]  # ev[3] = fillable size
         rows.sort(key=lambda r: r[0], reverse=True)
         shown = rows[:top]
-        note = "" if len(priced) <= cap else f"; depth-checked top {cap}"
+        checked = min(len(priced), cap)
         lag = " | feed lag " + " ".join(
             f"{v}={l*1000:.0f}ms" for v, l in sorted(self._feed_lag.items())) \
             if self._feed_lag else ""
-        log.info("edge snapshot: %d/%d pairs two-sided on WS, %d tradeable, top %d%s%s:",
-                 len(priced), len(self._pairs), len(rows), len(shown), note, lag)
+        # "N of M depth-sampled": this line SAMPLES the top pairs by WS edge and
+        # depth-verifies just those — it is a diagnostic, not a trading limit (the
+        # fire path evaluates EVERY pair on every tick).
+        log.info("edge snapshot: %d/%d pairs two-sided on WS; depth-sampled top %d: "
+                 "%d verified two-sided, top %d%s:",
+                 len(priced), len(self._pairs), checked, len(rows), len(shown), lag)
         for edge, yq, nq, size in shown:
             log.info("  %s yes=%.2f + %s no=%.2f = %.2f | edge=%+.3f sz=%g",
                      yq.venue, yq.yes_ask, nq.venue, nq.no_ask,
