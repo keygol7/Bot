@@ -218,3 +218,21 @@ def test_cross_gender_tennis_never_matches():
     # same-gender still matches
     c = parse_poly("aec-itfme-bonwei-xyz-2026-07-08", "Bond vs Wei - Wei")
     assert keys_match(a, c)
+
+
+def test_names_fully_align_discriminates_pedantry_from_collisions():
+    from bot.matching.idparse import names_fully_align as nfa
+    # name-form pedantry: both participants align -> override the drop
+    assert nfa("Will Hephzibah Oluwadare win the Oluwadare vs Zampardo: W50 match?",
+               "Hephzibah Oluwadare vs Maddy Zampardo",
+               "aec-itfwo-hepolu-madzam-2026-07-06")
+    # single-subject futures: subject aligns by name
+    assert nfa("Will Las Vegas win the 2026 Women's Pro Basketball Championship? - Las Vegas",
+               "WNBA Champion - Las Vegas", "tec-wnba-champion-2026-10-31-w-lv")
+    # genuine collision: only one of two participants aligns -> the drop stands
+    assert not nfa("Will Diana Martynov win the Lew Yan Foon vs Martynov: match?",
+                   "Maria Lourdes Carle vs. Laura Pigossi",
+                   "aec-wta-marcar-laupig-2026-07-06")
+    # sub-org: BESTIA Academy never aligns with BESTIA (lowercase esports names too)
+    assert not nfa("Will largadosypelados win the BESTIA Academy vs. largadosypelados match?",
+                   "largadosypelados vs BESTIA", "aec-cs2-ldp-bsta-2026-07-07")

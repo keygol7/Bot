@@ -1156,6 +1156,7 @@ async def stream(
         # pass (LLM ~seconds each, run in a thread so the loop never blocks); verdicts
         # cached forever. identical=1 pairs join engine.verified_pairs (history-free
         # fat-edge firing). Off the trade path entirely.
+        from bot.matching.idparse import names_fully_align
         from bot.matching.rules_match import confirm_rules
         kalshi_v = next((v for v in venues if v.name == "kalshi"), None)
         poly_v = next((v for v in venues if v.name == "polymarket_us"), None)
@@ -1213,14 +1214,14 @@ async def stream(
                     # match (teams+date+metric+outcome), a different_event verdict
                     # about metadata is overruled to tail-divergent at write time —
                     # the same cross-examination the offline audits ran, made online.
-                    _pedantry = re.compile(
-                        r"scheduled|different (start )?times|round|year|timing details"
-                        r"|resolution time|date format|fuller|name", re.I)
-                    _positive = re.compile(
-                        r"different (player|team|opponent|individual|match|tournament"
-                        r"s? involving|gender)|entirely different|men'?s|women'?s", re.I)
-                    if v.material and _pedantry.search(v.rationale or "") \
-                            and not _positive.search(v.rationale or ""):
+                    # ID-OVERRIDE, name-level: a different_event verdict is downgraded
+                    # only when ids match AND every participant (or the single subject)
+                    # aligns BY NAME across venues — deterministic, wording-independent.
+                    # Full alignment means the "different players" claim is name-form
+                    # pedantry (Zampardo vs Maddy Zampardo); partial alignment is a
+                    # genuine collision (BONWEI: 1 of 2 aligned) and the drop stands.
+                    if v.material and names_fully_align(
+                            titles0.get(ka, "") or "", titles0.get(pm, "") or "", pm):
                         try:
                             from bot.matching.idparse import (keys_match, parse_kalshi,
                                                               parse_poly)

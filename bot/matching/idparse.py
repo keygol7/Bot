@@ -746,3 +746,59 @@ def join_pairs(kalshi_keys, poly_keys, *, undated_window_days: int = 366):
                 seen.add(pair_id)
                 out.append((kk, pk))
     return out
+
+
+# ---------------------------------------------------------------- name alignment
+
+def participants(title: str) -> list:
+    """Participant name-token-sets from an 'A vs B' title (empty when not a
+    matchup). Case-insensitive — esports team names are often lowercase."""
+    t = title or ""
+    m = re.search(r"\bthe\s+(.+?)(?::|\?|$)", t)
+    seg = m.group(1) if m else t
+    halves = re.split(r"\s+vs\.?\s+", seg, flags=re.I)
+    if len(halves) != 2:
+        return []
+    a, b = halves
+    b = re.sub(r"\s+(match|game|series|fight|map \d+)\??\s*$", "", b, flags=re.I)
+    return [_tokens(a), _tokens(b)]
+
+
+def names_fully_align(ka_title: str, poly_title: str, poly_slug: str) -> bool:
+    """True when EVERY kalshi participant (or the single subject) aligns at the
+    NAME level with the poly evidence. This is the deterministic discriminator
+    between a rules-LLM 'different players' verdict that is name-form pedantry
+    ('Zampardo' vs 'Maddy Zampardo' — both participants align -> override) and a
+    genuine id collision (BONWEI: only 'wei' of two participants aligns -> the
+    drop stands). Sub-org tokens (academy/junior/...) block alignment — BESTIA
+    Academy never aligns with BESTIA."""
+    poly_ev = _tokens(poly_title) | _tokens(poly_slug.replace("-", " "))
+    poly_codes = set(re.findall(r"[a-z0-9]+", (poly_slug or "").lower()))
+
+    def side_aligns(toks: frozenset) -> bool:
+        toks = frozenset(t for t in toks if t not in _NAME_STOP)
+        if not toks:
+            return False
+        if toks & _SUB_ORG:
+            # a sub-org name only aligns if the poly side carries the marker too
+            if not (poly_ev & _SUB_ORG):
+                return False
+        core = [t for t in toks if t not in _SUB_ORG]
+        hit = sum(1 for t in core
+                  if t in poly_ev
+                  or any(t in o or o in t for o in poly_ev if len(t) >= 4)
+                  or any(c.endswith(t[:3]) or t[:3] == c[-3:] or t[:6] in c
+                         for c in poly_codes if len(c) >= 5))
+        # at least one core token per participant must align by NAME (not 3-char code)
+        return hit >= 1 and any(t in poly_ev or any(t in o for o in poly_ev if len(t) >= 4)
+                                for t in core)
+
+    parts = participants(ka_title)
+    if len(parts) == 2:
+        return side_aligns(parts[0]) and side_aligns(parts[1])
+    # single-subject (futures/awards): the outcome name itself must align
+    m = re.search(r" - (.+?)$", ka_title or "") or \
+        re.search(r"^Will (.+?) (?:win|be|set)", ka_title or "")
+    if m:
+        return side_aligns(_tokens(m.group(1)))
+    return False
