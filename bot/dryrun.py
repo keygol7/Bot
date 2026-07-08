@@ -1227,6 +1227,11 @@ async def stream(
                         identical=v.identical, confidence=v.confidence,
                         rationale=v.rationale, material=v.material,
                         divergence=v.divergence)
+                    # take effect IMMEDIATELY: pairs stayed gate-blocked for minutes
+                    # after their verdict landed because the in-memory set refreshed
+                    # only at pass boundaries
+                    engine.rules_checked.add(
+                        store._pair_key("kalshi", ka, "polymarket_us", pm))
                     budget -= 1
                     log.info("rules verify: %s|%s -> %s (%.2f) %s", ka, pm,
                              "IDENTICAL" if v.identical
@@ -1241,7 +1246,7 @@ async def stream(
                 raise
             except Exception as exc:
                 log.warning("rules verify pass failed: %s", exc)
-            await asyncio.sleep(120)
+            await asyncio.sleep(45)
 
     async def idparse_sync_loop():
         """Deterministic matching cadence: spawn `--idparse-sync` as a SUBPROCESS
