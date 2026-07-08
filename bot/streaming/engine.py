@@ -817,6 +817,22 @@ class StreamingEngine:
         if status is ExecStatus.SUCCESS:
             self._fail_counts.pop(key, None)
             self._backoff_until.pop(key, None)
+            # SLIPPAGE feedback: the breakeven-ceiling hedge makes fills succeed even
+            # when the WS book lied about the price (the lock lands near 0 instead of
+            # the detected edge). Fill-success is then NOT evidence of book honesty —
+            # a lock realizing under half the floor revokes WS trust so the next fire
+            # on this pair goes back through the REST confirm.
+            try:
+                legs = getattr(report, "legs", None) or []
+                cts = max((l.filled or 0) for l in legs) if legs else 0
+                per_ct = (report.realized_pnl or 0.0) / cts if cts else None
+            except Exception:
+                per_ct = None
+            if per_ct is not None and per_ct < self.min_edge * 0.5:
+                if self._ws_trust.pop(key, None) is not None:
+                    log.info("STREAM %s: locked %.3f/ct << detected edge — WS book "
+                             "overstated; trust revoked (next fire re-confirms)",
+                             p.event_key, per_ct)
             return
         reason = getattr(report, "reason", "") or ""
         if status is ExecStatus.SKIPPED and "hedge unfillable" in reason:
