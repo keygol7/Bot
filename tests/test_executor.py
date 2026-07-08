@@ -2313,3 +2313,29 @@ def test_maker_thin_top_deep_ladder_passes_hedge_gate():
              yes_size=1.0, no_size=50.0)
     report2 = asyncio.run(ex2.execute_maker(o2))
     assert report2.status is ExecStatus.SKIPPED and "thin hedge" in report2.reason
+
+
+def test_suspect_leg_fires_first_and_reject_is_free():
+    # kalshi leg unproven (no reliability history), poly leg proven -> kalshi fires
+    # FIRST; its REJECT is a clean SKIP with the poly leg never touched (no unwind).
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.REJECTED, 0, None)])
+    poly = FakeVenue("poly", [])                       # must never be called
+    ex, risk = make_exec([kalshi, poly], max_order_contracts=5)
+    ex._market_rel[("poly", "P1")] = (10, 0, 0, 20.0)  # proven
+    # kalshi K1 absent from _market_rel -> unproven -> suspect
+    report = asyncio.run(ex.execute(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                        yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.SKIPPED
+    assert poly.calls == []                            # nothing to unwind
+    assert kalshi.calls and kalshi.calls[0][2] == "buy"
+
+
+def test_rejected_probe_escalates_exclusion_immediately():
+    from bot.execution.executor import Executor
+    kalshi = FakeVenue("kalshi", [])
+    poly = FakeVenue("poly", [])
+    ex, _ = make_exec([kalshi, poly])
+    ex.market_max_fails = 2
+    ex._record_market_reliability("kalshi", "K1", ok=False, attempted=1.0, rejected=True)
+    # streak jumped by 2 -> crossed max_fails on the FIRST refusal -> excluded now
+    assert ("kalshi", "K1") in ex._excluded_until

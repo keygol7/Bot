@@ -471,11 +471,13 @@ class Executor:
             ok = result.status is OrderStatus.FILLED
             self._record_market_reliability(
                 getattr(venue, "name", "?"), market_id, ok,
-                result.filled if ok else 0.0, attempted=contracts)
+                result.filled if ok else 0.0, attempted=contracts,
+                rejected=result.status is OrderStatus.REJECTED)
         return result
 
     def _record_market_reliability(self, venue: str, market_id: str, ok: bool,
-                                   fill_size: float = 0.0, attempted: float = 0.0) -> None:
+                                   fill_size: float = 0.0, attempted: float = 0.0,
+                                   rejected: bool = False) -> None:
         """Size-aware, self-healing reliability.
 
         A reject is only PHANTOM evidence when it happened at PROBE size — a reject at 20
@@ -506,7 +508,9 @@ class Executor:
                 except Exception as exc:
                     log.warning("market reliability write failed for %s: %s", market_id, exc)
             return
-        if attempted > self.probe_contracts + 1e-9:
+        if attempted > self.probe_contracts + 1e-9 and not rejected:
+            # (a REJECTED order is a venue REFUSAL — size-independent; it skips the
+            # depth-ceiling ladder and counts as a strike directly)
             # Not phantom evidence by itself — the book couldn't fill THIS size right now.
             # But the halving ladder must REMEMBER: without memory, the family base resets
             # the size after each TTL and a persistent phantom loops 20 -> 10 -> (reset) ->
@@ -530,8 +534,10 @@ class Executor:
             # as a phantom strike (streak/cooldown below).
             self._size_ceiling[key] = (float(self.probe_contracts),
                                        now + self.size_ceiling_ttl)
-        # Probe-size reject: real phantom evidence.
-        streak += 1
+        # Probe-size reject: real phantom evidence. A venue REFUSAL escalates
+        # double — market state (not-yet-open etc.) won't change within a cooldown,
+        # so re-probing every 5 min just drips unwinds.
+        streak += 2 if rejected else 1
         self._market_rel[key] = (fills, fails + 1, streak, max_fill)
         fam = self._family_rel.setdefault(_family(venue, market_id), [0, 0, 0.0])
         fam[1] += 1
@@ -1274,8 +1280,23 @@ class Executor:
         # and it's the leg the hedge-fillable pre-check below confirms can fill. (Live data:
         # Polymarket 500s the hedge buy on thin markets, so it must go first; then a 500 is a
         # free skip instead of a Kalshi unwind.)
+        # RELIABILITY-AWARE ordering first: when exactly one leg's market is suspect
+        # (active fail streak, or never proven) while the other is proven, the SUSPECT
+        # leg fires first — its reject is then a free skip instead of stranding the
+        # other leg (2026-07-07: next-day kalshi tennis markets REJECTED FOKs while
+        # quoting on WS; the static poly-first order paid an unwind per attempt).
+        def _suspect(vn: str, mk: str) -> bool:
+            fills, _fails, streak, _mx = self._market_rel.get((vn, mk), (0, 0, 0, 0.0))
+            return streak > 0 or fills == 0
+
+        yes_susp = _suspect(opp.buy_yes_venue, opp.buy_yes_market)
+        no_susp = _suspect(opp.buy_no_venue, opp.buy_no_market)
         tfv = self.take_first_venue
-        if opp.buy_no_venue == tfv and opp.buy_yes_venue != tfv:
+        if yes_susp != no_susp:
+            no_first = no_susp
+        else:
+            no_first = opp.buy_no_venue == tfv and opp.buy_yes_venue != tfv
+        if no_first:
             first_vn, first_m, first_side = opp.buy_no_venue, opp.buy_no_market, Side.NO
             second_vn, second_m, second_side = opp.buy_yes_venue, opp.buy_yes_market, Side.YES
         else:
@@ -1367,7 +1388,9 @@ class Executor:
         leg1 = await self._place(
             first_venue, first[1], first[2], "buy", first[3], size, "fill_or_kill"
         )
-        log.info("leg1 %s", leg1)
+        log.info("leg1 %s%s", leg1,
+                 f" reason={_reject_reason(leg1)}"
+                 if leg1.status is OrderStatus.REJECTED else "")
         if leg1.status is OrderStatus.ERROR:
             # An ambiguous order error (e.g. a transient network timeout) shouldn't
             # freeze the whole bot. Reconcile against the venue: if no position
@@ -1410,7 +1433,9 @@ class Executor:
         leg2 = await self._place(
             second_venue, second[1], second[2], "buy", second[3], size, "fill_or_kill"
         )
-        log.info("leg2 %s", leg2)
+        log.info("leg2 %s%s", leg2,
+                 f" reason={_reject_reason(leg2)}"
+                 if leg2.status is OrderStatus.REJECTED else "")
 
         if leg2.status is OrderStatus.FILLED and leg2.filled_fully:
             return self._settle_success(opp, size, [leg1, leg2])
