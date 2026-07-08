@@ -1581,7 +1581,10 @@ def test_hedge_buffer_on_kalshi_first_buffers_the_poly_hedge():
                   max_order_contracts=0, hedge_buffer=0.03)
     asyncio.run(ex.execute(opp(yv="poly", nv="kalshi", yes_price=0.40, no_price=0.55)))
     assert kalshi.calls[0][1] == "NO"                  # kalshi placed first
-    assert round(poly.calls[0][3] - 0.40, 4) == 0.03   # the Poly YES hedge got the buffer
+    # the hedge limit reaches the PnL-BREAKEVEN CEILING from leg1's actual fill
+    # (1 - 0.55 - fees + recross_epsilon), superseding ask+buffer when higher; a
+    # FOK fills at RESTING prices so the reach is free on an unmoved book
+    assert poly.calls[0][3] == max(0.43, ex._breakeven_ceiling("kalshi", 0.55, "poly"))
 
 
 def test_scaled_hedge_buffer_interpolates_by_depth():
@@ -2339,3 +2342,27 @@ def test_rejected_probe_escalates_exclusion_immediately():
     ex._record_market_reliability("kalshi", "K1", ok=False, attempted=1.0, rejected=True)
     # streak jumped by 2 -> crossed max_fails on the FIRST refusal -> excluded now
     assert ("kalshi", "K1") in ex._excluded_until
+
+
+def test_leg2_ceiling_fills_moved_book_instead_of_unwinding():
+    # leg1 fills at 0.40; the hedge book ticked 0.55 -> 0.57 (inside the breakeven
+    # ceiling). Old behavior: FOK at 0.55 KILLs -> recross round-trip or a -2-3c
+    # unwind. New behavior: the FOK limit already reaches the ceiling, the venue
+    # fills at the RESTING 0.57, and the pair settles SUCCESS at reduced pnl.
+    poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 2, 0.40)])
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.FILLED, 2, 0.57)])
+    ex = Executor({"kalshi": kalshi, "poly": poly},
+                  RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9,
+                                         max_total_exposure=1e12)),
+                  fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+                  max_order_contracts=0, hedge_buffer=0.0,
+                  take_first_venue="poly")
+    ex._market_rel[("poly", "P1")] = (5, 0, 0, 10.0)
+    ex._market_rel[("kalshi", "K1")] = (5, 0, 0, 10.0)
+    report = asyncio.run(ex.execute(opp(yv="poly", nv="kalshi",
+                                        yes_price=0.40, no_price=0.55)))
+    assert report.status is ExecStatus.SUCCESS
+    # kalshi FOK was placed at the ceiling (>= the moved 0.57), not the stale 0.55
+    assert kalshi.calls[0][3] >= 0.57
+    # pnl reduced but the pair locked: 10 ct * (1 - 0.40 - 0.57) = 0.30
+    assert abs(report.realized_pnl - 0.30) < 1e-9

@@ -750,6 +750,18 @@ class Executor:
             base = min(base, ceiling)
         return base
 
+    def _breakeven_ceiling(self, leg1_venue: str, p1: float, leg2_venue: str) -> float:
+        """The max hedge price at which filling still beats unwinding: PnL-breakeven
+        net of BOTH legs' fees, plus recross_epsilon. Shared by the preemptive leg-2
+        limit and the recross fallback so the two can never drift. A FOK at this
+        limit fills at the venue's RESTING prices (the whole book <= ceiling), so it
+        costs nothing when the book hasn't moved and beats a -2-3c unwind when it
+        has."""
+        fees_ct = (per_contract_fee(self._fee(leg1_venue), p1)
+                   + per_contract_fee(self._fee(leg2_venue), min(0.99, 1.0 - p1)))
+        return min(0.99, max(0.01, round(
+            (1.0 - p1) - fees_ct + self.recross_epsilon, 4)))
+
     def _leg_limits(self, opp: ArbOpportunity, first_side, second_side) -> tuple[float, float]:
         """Limit prices for the (first, second) legs that may pay worse than the quoted
         ask to fill on a moving book, but never enough to drop the locked profit below
@@ -1437,9 +1449,21 @@ class Executor:
                         "unwinding it", leg1.filled, size)
             size = leg1.filled
 
-        # ----- Leg 2: the hedge, fill-or-kill -----
+        # ----- Leg 2: the hedge, fill-or-kill AT THE BREAKEVEN CEILING -----
+        # The limit reaches to PnL-breakeven computed from leg1's ACTUAL fill: a FOK
+        # fills at resting prices, so an unmoved book gives the full edge, a book
+        # that ticked against us fills between floor and ~breakeven (strictly better
+        # than the unwind), and only a would-be-loss kills (recross backstop below).
+        p1 = leg1.avg_price if leg1.avg_price is not None else first[3]
+        ceiling2 = self._breakeven_ceiling(
+            getattr(first_venue, "name", first[0]), p1,
+            getattr(second_venue, "name", second[0]))
+        leg2_limit = max(second[3], ceiling2)
+        if leg2_limit > second[3] + 1e-9:
+            log.info("leg2 limit %.3f (detected ask %.3f + ceiling reach)",
+                     leg2_limit, second[3])
         leg2 = await self._place(
-            second_venue, second[1], second[2], "buy", second[3], size, "fill_or_kill"
+            second_venue, second[1], second[2], "buy", leg2_limit, size, "fill_or_kill"
         )
         log.info("leg2 %s%s", leg2,
                  f" reason={_reject_reason(leg2)}"
@@ -1566,14 +1590,8 @@ class Executor:
         for the unwind. One extra book read + at most one order, on the failure path only."""
         buy_px = leg1.avg_price if leg1.avg_price is not None else (
             opp.yes_price if leg1.side is Side.YES else opp.no_price)
-        # PnL-breakeven ceiling, not price-breakeven: fees are part of the trade, so a
-        # recross at price-breakeven locks -(fees) before epsilon even applies — at 20
-        # contracts that was a -$0.83 'lock' (~4.2c/ct). Net the per-contract fees out of
-        # the ceiling so the worst salvage is -epsilon/ct, full stop.
-        fees_ct = (per_contract_fee(self._fee(leg1.venue), buy_px)
-                   + per_contract_fee(self._fee(second[0]), min(0.99, 1.0 - buy_px)))
-        ceiling = min(0.99, max(0.01, round(
-            (1.0 - buy_px) - fees_ct + self.recross_epsilon, 4)))
+        # PnL-breakeven ceiling, not price-breakeven (see _breakeven_ceiling).
+        ceiling = self._breakeven_ceiling(leg1.venue, buy_px, second[0])
         ask = await self._taker_ask(second, second_venue)
         if ask is not None and ask <= ceiling + 1e-9:
             retry = await self._place(
