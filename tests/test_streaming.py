@@ -431,7 +431,7 @@ def test_log_edge_snapshot_ranks_by_confirmed_depth_excludes_one_sided(caplog):
     # The confirm RESEEDS the live book with REST truth: the phantom pair's one-sided
     # real book replaces its lying WS quote, so the denominator honestly reads 1/2
     # (pre-reseed it read 2/2 and the stale book kept re-triggering confirms).
-    assert "1/2 pairs two-sided on WS, 1 tradeable" in text
+    assert "1/2 pairs two-sided on WS; depth-sampled top 1: 1 verified two-sided" in text
     assert "sz=500" in text          # min(K_real 500, P_real 800) from the confirmed book
     assert "sz=0" not in text        # the empty/sentinel pair is gone, not shown at size 0
 
