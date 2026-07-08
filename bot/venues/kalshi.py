@@ -141,6 +141,57 @@ def normalize_orderbook(
     )
 
 
+def apply_book_message(books: dict, seqs: dict, data: dict) -> tuple:
+    """Apply one ``orderbook_snapshot``/``orderbook_delta`` WS message to the local
+    book state. Returns ``(quote_or_None, gap)`` — ``gap=True`` means a sequence
+    number was skipped and the caller must reconnect for fresh snapshots (the local
+    book can no longer be trusted). Pure: no I/O, unit-testable.
+
+    Kalshi book semantics: the book holds YES bids and NO bids (in cents); the cost
+    to buy YES crosses the best NO bid — normalize_orderbook owns that math (and the
+    8-level ladders), so WS books and REST books CANNOT drift in interpretation."""
+    typ = data.get("type")
+    m = data.get("msg") or {}
+    t = m.get("market_ticker")
+    sid, seq = data.get("sid"), data.get("seq")
+    if sid is not None and seq is not None:
+        prev = seqs.get(sid)
+        seqs[sid] = seq
+        if typ == "orderbook_delta" and prev is not None and seq != prev + 1:
+            return None, True
+    if not t:
+        return None, False
+    if typ == "orderbook_snapshot":
+        books[t] = {
+            "yes": {int(p): float(q) for p, q in (m.get("yes") or [])},
+            "no": {int(p): float(q) for p, q in (m.get("no") or [])},
+        }
+    elif typ == "orderbook_delta":
+        book = books.get(t)
+        if book is None:
+            return None, False               # delta before its snapshot — ignore
+        side = m.get("side")
+        if side not in ("yes", "no"):
+            return None, False
+        price = int(m.get("price"))
+        q = book[side].get(price, 0.0) + float(m.get("delta") or 0.0)
+        if q <= 1e-9:
+            book[side].pop(price, None)
+        else:
+            book[side][price] = q
+    else:
+        return None, False
+    book = books[t]
+    ob = {"yes": [[p, q] for p, q in book["yes"].items()],
+          "no": [[p, q] for p, q in book["no"].items()]}
+    quote = normalize_orderbook(t, "", ob)
+    ts = m.get("ts")
+    if ts:
+        ts = float(ts)
+        quote.exchange_ts = ts / 1000.0 if ts > 1e12 else ts
+    return quote, False
+
+
 def is_multivariate(ticker: str) -> bool:
     """True for Kalshi multivariate / parlay markets (ticker prefix ``KXMVE``).
 
@@ -505,8 +556,16 @@ class KalshiVenue:
                 async with websockets.connect(
                     self.cfg.ws_base, additional_headers=headers, open_timeout=10
                 ) as ws:
+                    import os
+                    channels = ["ticker"]
+                    if os.getenv("KALSHI_WS_BOOK", "true").lower() != "false":
+                        # per-event book deltas: ~200ms fresher than the conflated
+                        # ticker feed AND carries the full ladder. ticker stays
+                        # subscribed as a live fallback; the livebook keeps whichever
+                        # quote is freshest.
+                        channels.append("orderbook_delta")
                     params: dict[str, Any] = {
-                        "channels": ["ticker"],
+                        "channels": channels,
                         # Get an immediate sized top-of-book on subscribe instead of
                         # waiting for the first field change (which could be a while on a
                         # quiet market) — primes the live book over the WS itself.
@@ -516,13 +575,24 @@ class KalshiVenue:
                         params["market_tickers"] = market_ids
                     await ws.send(json.dumps({"id": 1, "cmd": "subscribe", "params": params}))
                     backoff = 1.0  # reset on a healthy connection
+                    books: dict[str, Any] = {}
+                    seqs: dict[Any, int] = {}
                     async for raw in ws:
                         data = json.loads(raw)
-                        if data.get("type") == "ticker":
+                        typ = data.get("type")
+                        if typ == "ticker":
                             quote = parse_ticker(data)
                             if quote is not None:
                                 yield quote
-                        elif data.get("type") == "error":
+                        elif typ in ("orderbook_snapshot", "orderbook_delta"):
+                            quote, gap = apply_book_message(books, seqs, data)
+                            if gap:
+                                log.warning("kalshi ws book seq gap — reconnecting "
+                                            "for fresh snapshots")
+                                break        # reconnect loop resubscribes
+                            if quote is not None:
+                                yield quote
+                        elif typ == "error":
                             log.warning("kalshi ws error: %s", data.get("msg"))
             except asyncio.CancelledError:
                 raise
