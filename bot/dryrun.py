@@ -1148,6 +1148,8 @@ async def stream(
             except Exception as exc:
                 log.warning("settlement truth pass failed: %s", exc)
 
+    rules_kick = asyncio.Event()   # set by idparse_sync_loop when new pairs land
+
     async def rules_verify_loop():
         # Rules-text verification (bot/matching/rules_match.py): compare the two markets'
         # RESOLUTION RULES via the LLM for watchlist pairs that lack a verdict. A few per
@@ -1262,7 +1264,13 @@ async def stream(
                 raise
             except Exception as exc:
                 log.warning("rules verify pass failed: %s", exc)
-            await asyncio.sleep(45)
+            # sleep 45s OR wake immediately when the idparse sync lands new pairs —
+            # shaves the first-sighting verification window for game-time arrivals
+            try:
+                await asyncio.wait_for(rules_kick.wait(), timeout=45)
+            except asyncio.TimeoutError:
+                pass
+            rules_kick.clear()
 
     async def idparse_sync_loop():
         """Deterministic matching cadence: spawn `--idparse-sync` as a SUBPROCESS
@@ -1280,6 +1288,8 @@ async def stream(
                 for line in (out or b"").decode().splitlines():
                     if "idparse-sync" in line:
                         log.info("%s", line.strip())
+                        if " 0 new verdicts" not in line:
+                            rules_kick.set()   # verify the newcomers right now
             except Exception as exc:
                 log.warning("idparse sync failed: %s", exc)
             await asyncio.sleep(settings.match_idparse_interval)
