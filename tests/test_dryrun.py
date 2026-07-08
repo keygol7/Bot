@@ -107,7 +107,8 @@ def test_kalshi_close_within_days_windows_kalshi_only():
     p_limit, p_window = seen["polymarket_us"]
     assert k_limit == 0 and k_window is not None                 # kalshi: unbounded + windowed
     assert int(before + 30 * 86400) <= k_window <= int(after + 30 * 86400)
-    assert p_limit == 5000 and p_window is None                  # poly: shared limit, NO window
+    assert p_limit == 0 and p_window is None       # poly: whole board (the CLI limit
+                                                   # truncated the flat scan at 5000), NO window
 
 
 def test_kalshi_ticker_patterns_filter_kalshi_only():
@@ -129,7 +130,7 @@ def test_kalshi_ticker_patterns_filter_kalshi_only():
         kalshi_ticker_patterns=("GAME", "MATCH", "FIGHT"),
     ))
     assert seen["kalshi"] == (0, None, ("GAME", "MATCH", "FIGHT"))   # unbounded + filtered
-    assert seen["polymarket_us"][0] == 5000 and seen["polymarket_us"][2] is None  # poly untouched
+    assert seen["polymarket_us"][0] == 0 and seen["polymarket_us"][2] is None  # poly whole-board, no patterns
 
 
 def test_max_confirms_caps_llm_calls_per_cycle():
