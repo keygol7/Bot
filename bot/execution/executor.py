@@ -1309,13 +1309,28 @@ class Executor:
             fills, _fails, streak, _mx = self._market_rel.get((vn, mk), (0, 0, 0, 0.0))
             return streak > 0 or fills == 0
 
+        def _family_fail_rate(vn: str, mk: str) -> float:
+            fam = self._family_rel.get(_family(vn, mk))
+            if not fam or (fam[0] + fam[1]) < 5:
+                return -1.0                       # not enough family evidence
+            return fam[1] / (fam[0] + fam[1])
+
         yes_susp = _suspect(opp.buy_yes_venue, opp.buy_yes_market)
         no_susp = _suspect(opp.buy_no_venue, opp.buy_no_market)
         tfv = self.take_first_venue
         if yes_susp != no_susp:
             no_first = no_susp
         else:
-            no_first = opp.buy_no_venue == tfv and opp.buy_yes_venue != tfv
+            # tie (both proven or both unproven): break by FAMILY fail rate — a
+            # brand-new overnight kalshi ITF market inherits its family's refusal
+            # history, so its first-ever attempt fires kalshi first (free skip)
+            # instead of paying an unwind to discover the refusal
+            yr = _family_fail_rate(opp.buy_yes_venue, opp.buy_yes_market)
+            nr = _family_fail_rate(opp.buy_no_venue, opp.buy_no_market)
+            if yr >= 0 and nr >= 0 and abs(yr - nr) > 0.15:
+                no_first = nr > yr
+            else:
+                no_first = opp.buy_no_venue == tfv and opp.buy_yes_venue != tfv
         if no_first:
             first_vn, first_m, first_side = opp.buy_no_venue, opp.buy_no_market, Side.NO
             second_vn, second_m, second_side = opp.buy_yes_venue, opp.buy_yes_market, Side.YES
