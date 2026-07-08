@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import logging
 import time
 from dataclasses import dataclass, field
@@ -1210,7 +1211,14 @@ async def stream(
                     # match (teams+date+metric+outcome), a different_event verdict
                     # about metadata is overruled to tail-divergent at write time —
                     # the same cross-examination the offline audits ran, made online.
-                    if v.material:
+                    _pedantry = re.compile(
+                        r"scheduled|different (start )?times|round|year|timing details"
+                        r"|resolution time|date format|fuller|name", re.I)
+                    _positive = re.compile(
+                        r"different (player|team|opponent|individual|match|tournament"
+                        r"s? involving|gender)|entirely different|men'?s|women'?s", re.I)
+                    if v.material and _pedantry.search(v.rationale or "") \
+                            and not _positive.search(v.rationale or ""):
                         try:
                             from bot.matching.idparse import (keys_match, parse_kalshi,
                                                               parse_poly)

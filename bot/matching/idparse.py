@@ -119,7 +119,10 @@ _GENERIC_TOKENS = frozenset({
 _CATEGORY_GROUPS = {
     "esports": {"esports", "cs2", "dota2", "lol", "valorant", "r6", "cod", "sc2",
                 "rocketleague", "overwatch"},
-    "tennis": {"tennis", "atp", "wta", "itf", "itfme", "itfwo"},
+    # gendered tennis circuits are DIFFERENT events even when names collide
+    # (BONWEI: men's ITF matched women's ITF via a 3-letter 'wei' collision)
+    "tennis_men": {"atp", "itfme"},
+    "tennis_women": {"wta", "itfwo", "itfw"},
     "soccer": {"soccer", "football-soccer", "fwc", "ucl", "epl", "laliga", "mls",
                "seriea", "bundesliga", "ligue1", "uel"},
     "basketball": {"basketball", "nba", "wnba", "ncaab"},
@@ -215,6 +218,12 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
         tags = series_meta.get("tags") or []
         category = (tags[0].lower() if tags else None) or (
             (series_meta.get("category") or "").lower() or None)
+    # gendered tennis series override the generic "tennis" tag so the category
+    # conflict guard can separate the circuits deterministically
+    if series.startswith(("KXWTA", "KXITFW")):
+        category = "wta"
+    elif series.startswith(("KXATP", "KXITFMATCH")):
+        category = "atp"
 
     event_date = None
     event_year = None

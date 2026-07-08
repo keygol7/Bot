@@ -203,3 +203,18 @@ def test_mlb_draft_top_scopes():
     assert "top10" in k.scope and "top10" in p10.scope and "top5" in p5.scope
     assert keys_match(k, p10)
     assert not keys_match(k, p5)        # different cut lines never match
+
+
+def test_cross_gender_tennis_never_matches():
+    # BONWEI class: men's ITF vs women's ITF matched via a 3-letter name collision
+    # ('wei'). Gendered circuits are different events regardless of id alignment.
+    a = parse_kalshi("KXITFMATCH-26JUL08BONWEI-WEI",
+                     "Will Wei win the Bond vs Wei match? - Wei",
+                     {"title": "ITF Match", "tags": ["Tennis"]})
+    b = parse_poly("aec-itfwo-sijwei-yinsun-2026-07-08",
+                   "Sijia Wei vs Yin Sun - Sijia Wei")
+    assert a.category == "atp" and b.category == "itfwo"
+    assert not keys_match(a, b)
+    # same-gender still matches
+    c = parse_poly("aec-itfme-bonwei-xyz-2026-07-08", "Bond vs Wei - Wei")
+    assert keys_match(a, c)
