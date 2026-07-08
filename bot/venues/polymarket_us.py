@@ -783,7 +783,7 @@ class PolymarketUSVenue:
                 async with websockets.connect(
                     self.cfg.ws_markets, additional_headers=headers, open_timeout=10,
                     ping_interval=20, ping_timeout=30, close_timeout=5,
-                ) as ws:
+                 compression=None) as ws:
                     chunks = (
                         [market_ids[i : i + 100] for i in range(0, len(market_ids), 100)]
                         if market_ids else [None]
@@ -834,7 +834,7 @@ class PolymarketUSVenue:
         headers = self._auth_headers("GET", path)
         async with websockets.connect(
             self.cfg.ws_markets, additional_headers=headers, open_timeout=10
-        ) as ws:
+        , compression=None) as ws:
             await ws.send(json.dumps({"subscribe": {
                 "requestId": "probe",
                 "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
@@ -872,7 +872,7 @@ class PolymarketUSVenue:
                 async with websockets.connect(
                     self.cfg.ws_private, additional_headers=headers, open_timeout=10,
                     ping_interval=20, ping_timeout=30, close_timeout=5,
-                ) as ws:
+                 compression=None) as ws:
                     await ws.send(json.dumps({"subscribe": {
                         "requestId": "ord", "subscriptionType": "SUBSCRIPTION_TYPE_ORDER"}}))
                     backoff = 1.0
