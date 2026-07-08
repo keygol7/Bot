@@ -664,6 +664,15 @@ class StreamingEngine:
                 and key not in self.verified_pairs):
             trusted = False
             fast_take = False
+        extreme = False
+        if self.min_leg_price > 0 and yq is not None and nq is not None:
+            _lo, _hi = self.min_leg_price, 1.0 - self.min_leg_price
+            extreme = not (_lo <= yq.yes_ask <= _hi and _lo <= nq.no_ask <= _hi)
+        if extreme:
+            # extreme-priced legs fire only through a REST confirm: phantom depth at
+            # $0.01/$0.99 is exactly what the WS book lies about on settling markets
+            trusted = False
+            fast_take = False
         if (self.depth_fetch is not None and not fast_take and not trusted
                 and (self.maker_mode or not ws_fresh)):
             ws_claim = edge
@@ -685,6 +694,7 @@ class StreamingEngine:
                 # the spread (executor caps the rest so a fill locks >= floor +
                 # cushion). Resting is free; a cheap "no room"/thin skip falls
                 # through to the normal backoff.
+                maker_note = ""
                 if (self.maker_mode and yq is not None and nq is not None
                         and (not self.require_rules_verify
                              or key in self.rules_checked)):
@@ -699,12 +709,15 @@ class StreamingEngine:
                             self._note_outcome(key, p, rep)
                             self._observe(p, edge, yq, nq, size, f"maker_{st.name}")
                             return rep
+                        maker_note = (f"; maker: {getattr(rep, 'reason', st)}"
+                                      if st is not None else "")
                 n = self._confirm_fails.get(key, 0) + 1
                 self._confirm_fails[key] = n
                 delay = min(self._backoff_base * (2 ** (n - 1)), self._backoff_cap)
                 self._backoff_until[key] = self.clock() + delay
                 log.info("STREAM edge gone after depth check on %s (edge %.4f sz %g) — "
-                         "backoff %.0fs (miss #%d)", p.event_key, edge, size, delay, n)
+                         "backoff %.0fs (miss #%d)%s", p.event_key, edge, size, delay,
+                         n, maker_note)
                 self._observe(p, edge, yq, nq, size, "edge_gone_after_depth")
                 return None
             self._confirm_fails.pop(key, None)     # WS agreed with REST — full cadence
@@ -728,8 +741,15 @@ class StreamingEngine:
         # Price-extreme guard: a leg at ~$0.01/$0.99 is a settling/resolved market with
         # phantom depth (no real resting volume) — its edge is an artifact. Skip it.
         if self.min_leg_price > 0:
+            # recompute on the CURRENT quotes — the REST confirm may have replaced
+            # yq/nq since the pre-confirm extremeness check
             lo, hi = self.min_leg_price, 1.0 - self.min_leg_price
-            if not (lo <= yq.yes_ask <= hi and lo <= nq.no_ask <= hi):
+            extreme = not (lo <= yq.yes_ask <= hi and lo <= nq.no_ask <= hi)
+            if extreme and key not in self.verified_pairs:
+                # phantom-depth artifact of a settling market — unless the pair's
+                # IDENTITY is certain: a verified complement at 0.02/0.95 is a real
+                # blowout edge (the lifecycle gate handles non-OPEN separately, and
+                # the forced REST confirm below proves the depth is real).
                 log.info("STREAM %s: skip — leg at price extreme (yes=%.3f no=%.3f), "
                          "likely settling", p.event_key, yq.yes_ask, nq.no_ask)
                 self._observe(p, edge, yq, nq, size, "skip_settling")
