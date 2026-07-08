@@ -450,3 +450,34 @@ def test_transfers_separate_deposits_from_gains():
                       ts=now - 48*3600)
     pnl4, *_ = s.equity_pnl(hours=24.0)
     assert pnl4 == 75.0
+
+
+def test_identity_certain_keys_grants_tail_pairs_with_full_name_alignment(tmp_path):
+    from bot.data.store import Store
+    st = Store(str(tmp_path / "t.db"))
+    now = __import__("time").time()
+    st.upsert_market("kalshi", "KXITFMATCH-26JUL08ABCDEF-ABC",
+                     "Will Alan Abcman win the Abcman vs Defsson: M25 match?", now)
+    st.upsert_market("polymarket_us", "aec-itfme-alaabc-boddef-2026-07-08",
+                     "Alan Abcman vs. Bodo Defsson - Alan Abcman", now)
+    st.record_rules_verdict("kalshi", "KXITFMATCH-26JUL08ABCDEF-ABC",
+                            "polymarket_us", "aec-itfme-alaabc-boddef-2026-07-08",
+                            identical=False, confidence=1.0,
+                            rationale="cancellation wording differs",
+                            material=False, divergence="cancellation_postponement")
+    # a material drop must NOT be granted even with aligned names
+    st.upsert_market("kalshi", "KXITFMATCH-26JUL08GHIJKL-GHI",
+                     "Will Gil Ghiman win the Ghiman vs Jklsson: M25 match?", now)
+    st.upsert_market("polymarket_us", "aec-itfme-gilghi-jkl-2026-07-08",
+                     "Gil Ghiman vs. Jklsson - Gil Ghiman", now)
+    st.record_rules_verdict("kalshi", "KXITFMATCH-26JUL08GHIJKL-GHI",
+                            "polymarket_us", "aec-itfme-gilghi-jkl-2026-07-08",
+                            identical=False, confidence=1.0,
+                            rationale="different events", material=True,
+                            divergence="different_event")
+    keys = st.identity_certain_keys()
+    assert st._pair_key("kalshi", "KXITFMATCH-26JUL08ABCDEF-ABC",
+                        "polymarket_us", "aec-itfme-alaabc-boddef-2026-07-08") in keys
+    assert st._pair_key("kalshi", "KXITFMATCH-26JUL08GHIJKL-GHI",
+                        "polymarket_us", "aec-itfme-gilghi-jkl-2026-07-08") not in keys
+    st.close()

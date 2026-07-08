@@ -653,6 +653,12 @@ class StreamingEngine:
         trusted = (self.ws_trust_min > 0 and ws_fresh and size >= 1
                    and self._ws_trust.get(key, 0) >= self.ws_trust_min)
         fast_take = sync_fast_take or (self.maker_mode and ws_fresh and deep)
+        # FAT edges never skip the REST confirm: a sudden implausible-size edge on a
+        # trusted pair is far more often a book event (quote pull, settlement leak)
+        # than a dislocation — one round-trip verifies the whole ladder first.
+        if self.max_plausible_edge > 0 and edge > self.max_plausible_edge:
+            trusted = False
+            fast_take = False
         if (self.depth_fetch is not None and not fast_take and not trusted
                 and (self.maker_mode or not ws_fresh)):
             ws_claim = edge

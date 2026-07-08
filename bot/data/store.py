@@ -890,6 +890,32 @@ class Store:
                 pol.policy, pol.extra_edge_ct, yes_venue)
         return out
 
+    def identity_certain_keys(self) -> set:
+        """Pairs whose IDENTITY is certain without price history: a tradeable rules
+        verdict (not different_event) AND full participant-name alignment across
+        venues (names_fully_align — every matchup participant or the futures subject
+        aligns by name). For such pairs a fat edge is a genuine dislocation by
+        construction — a true complement under $1 pays regardless of WHY the edge
+        exists — so they earn the verified-pair fat-fire privilege."""
+        from bot.matching.idparse import names_fully_align
+
+        titles = {r["market_id"]: r["title"] or "" for r in self.conn.execute(
+            "SELECT market_id, title FROM markets")}
+        out = set()
+        for r in self.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts "
+                "WHERE identical = 0 AND material = 0 AND confidence >= 0.9"):
+            pm = r["market_a"] if r["venue_a"] == "polymarket_us" else r["market_b"]
+            ka = r["market_a"] if r["venue_a"] == "kalshi" else r["market_b"]
+            kt, pt = titles.get(ka, ""), titles.get(pm, "")
+            try:
+                if kt and pt and names_fully_align(kt, pt, pm):
+                    out.add(self._pair_key(r["venue_a"], r["market_a"],
+                                           r["venue_b"], r["market_b"]))
+            except Exception:
+                continue
+        return out
+
     def rules_checked_keys(self) -> set:
         """Pairs with ANY rules verdict (either outcome) — the pre-trade rules gate:
         a pair may not TRADE until its resolution rules have been compared once. The
