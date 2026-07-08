@@ -772,6 +772,21 @@ class StreamingEngine:
         """Run a hybrid TAKE to completion off the quote loop, then log + book it."""
         try:
             report = await self.executor.execute(opp)
+            if (getattr(report, "status", None) is not None
+                    and str(getattr(report, "reason", "")).startswith("leg1 not filled")):
+                # The book moved in flight — but BOTH legs may have moved such that
+                # the pair still clears the floor at a different price split. One
+                # immediate re-evaluation from the live book (already updated by the
+                # in-flight WS ticks); a genuine vanished edge fails it and skips.
+                ev2 = self._eval_direction(self.livebook.get(p.venue_a, p.market_a),
+                                           self.livebook.get(p.venue_b, p.market_b))
+                if ev2 is not None and ev2[0] > self.min_edge and ev2[3] >= 1:
+                    edge2, yq2, nq2, size2 = ev2
+                    opp2 = self._build_opp(p, edge2, yq2, nq2, size2)
+                    if opp2 is not None:
+                        log.info("STREAM %s: leg1 miss — re-firing at fresh prices "
+                                 "(edge %.4f sz %g)", p.event_key, ev2[0], ev2[3])
+                        report = await self.executor.execute(opp2)
             log.info("STREAM exec %s | %s", p.event_key, report)
             status = getattr(report, "status", None)
             self._observe(p, edge, yq, nq, size,

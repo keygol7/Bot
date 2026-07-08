@@ -476,7 +476,7 @@ class Executor:
         # a KILL/REJECT/ERROR/partial proves it's phantom (the naked-leg source). Record per
         # market (not on unwinds — sells, which we only do to recover) to drive probe sizing.
         if action == "buy" and self.probe_contracts > 0:
-            ok = result.status is OrderStatus.FILLED
+            ok = (result.filled or 0) > 1e-9        # IOC partials are real fills
             self._record_market_reliability(
                 getattr(venue, "name", "?"), market_id, ok,
                 result.filled if ok else 0.0, attempted=contracts,
@@ -1419,9 +1419,14 @@ class Executor:
         """Fire leg 1 (rejection-prone) then leg 2 (hedge), then resolve the outcome:
         settle a locked arb, unwind a clean leg-2 failure, or halt on an ambiguous state.
         Split out of execute() so its balance reservation can wrap this in try/finally."""
-        # ----- Leg 1: the rejection-prone leg, fill-or-kill -----
+        # ----- Leg 1: the rejection-prone leg, IMMEDIATE-OR-CANCEL -----
+        # IOC, not FOK: an all-or-nothing leg1 killed whenever the book held less
+        # than the full size at the limit — 115 clean-skip misses/day. IOC takes
+        # whatever quantity actually rests <= limit; a partial routes through the
+        # existing hedge-the-filled-portion path, zero fill stays a free skip.
         leg1 = await self._place(
-            first_venue, first[1], first[2], "buy", first[3], size, "fill_or_kill"
+            first_venue, first[1], first[2], "buy", first[3], size,
+            "immediate_or_cancel"
         )
         log.info("leg1 %s%s", leg1,
                  f" reason={_reject_reason(leg1)}"
