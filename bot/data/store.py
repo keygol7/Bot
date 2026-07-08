@@ -820,12 +820,41 @@ class Store:
         survivors = drop_fanout_pairs(cands, max_fanout=1)
         return [(p[0], p[1], p[2], p[3]) for p in survivors[:limit]]
 
+    def divergence_branch_rates(self) -> dict:
+        """(divergence_class, sport_family) -> (hits, total) from settled pairs —
+        the empirical calibration for the severity priors. A settled pair carrying a
+        classified divergence is a completed experiment: divergent settlement = the
+        branch HIT, consistent = it missed. Computed by join (small tables), no
+        incremental state to corrupt."""
+        from bot.matching.divergence_policy import classify_rationale, sport_family
+
+        out: dict = {}
+        for r in self.conn.execute(
+                """SELECT s.consistent, rv.rationale, rv.material,
+                          COALESCE(rv.divergence,'') dv,
+                          CASE WHEN s.venue_a='kalshi' THEN s.market_a
+                               ELSE s.market_b END AS ka
+                   FROM settlement_checks s
+                   JOIN rules_verdicts rv
+                     ON (rv.market_a = s.market_a AND rv.market_b = s.market_b)
+                     OR (rv.market_a = s.market_b AND rv.market_b = s.market_a)
+                   WHERE rv.identical = 0"""):
+            dv = r["dv"] or classify_rationale(r["rationale"] or "")
+            if dv in ("", "none", "different_event"):
+                continue
+            key = (dv, sport_family(r["ka"] or ""))
+            hits, total = out.get(key, (0, 0))
+            out[key] = (hits + (0 if r["consistent"] else 1), total + 1)
+        return out
+
     def pair_divergence_policies(self, min_confidence: float = 0.9) -> dict:
         """pair key -> (policy, extra_edge_ct, one_way_yes_venue) from classified
         rules verdicts + the severity table (bot/matching/divergence_policy). Legacy
         free-text rationales classify via the keyword taxonomy."""
-        from bot.matching.divergence_policy import classify_rationale, policy_for
+        from bot.matching.divergence_policy import (classify_rationale, policy_for,
+                                                     sport_family)
 
+        rates = self.divergence_branch_rates()
         out = {}
         for r in self.conn.execute(
                 "SELECT venue_a, market_a, venue_b, market_b, rationale, material, "
@@ -837,7 +866,12 @@ class Store:
             if r["material"] == 1:
                 dv = "different_event"
             ka = r["market_a"] if r["venue_a"] == "kalshi" else r["market_b"]
-            pol = policy_for(dv, ka)
+            hits, total = rates.get((dv, sport_family(ka)), (0, 0))
+            # Laplace posterior; policy_for maxes it against the prior, so evidence
+            # can only RAISE severity (softening waits for a critical mass — the
+            # prior stays the floor by construction)
+            p_override = (hits + 1) / (total + 2) if total >= 1 else None
+            pol = policy_for(dv, ka, p_override=p_override)
             if pol.policy == "ignore":
                 continue
             # one-way YES side = the WIDER (non-stricter) venue; A is always kalshi
