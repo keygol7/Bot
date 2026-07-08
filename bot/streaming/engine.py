@@ -691,8 +691,9 @@ class StreamingEngine:
                     arm = self.min_edge + getattr(self.executor,
                                                   "maker_arm_cushion", 0.005)
                     opp_mk = self._build_opp(p, arm, yq, nq, max(size, 1))
-                    if opp_mk is not None:
-                        rep = await self.executor.execute_maker(opp_mk)
+                    mk = getattr(self.executor, "execute_maker", None)
+                    if opp_mk is not None and callable(mk):
+                        rep = await mk(opp_mk)
                         st = getattr(rep, "status", None)
                         if st is not None and st.name in ("SUCCESS", "UNWOUND", "HALTED"):
                             self._note_outcome(key, p, rep)
