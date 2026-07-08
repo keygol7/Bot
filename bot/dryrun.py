@@ -1165,6 +1165,100 @@ async def stream(
             log.warning("rules-verify loop NOT RUNNING (no LLM handle) — the pre-trade "
                         "rules gate would block all new pairs; check LLM config")
             return
+        async def verify_pair(p):
+            ka = p.market_a if p.venue_a == "kalshi" else p.market_b
+            pm = p.market_a if p.venue_a == "polymarket_us" else p.market_b
+            rules_k = await kalshi_v.market_rules(ka)
+            rules_p = await poly_v.market_rules(pm)
+            row0 = store.conn.execute(
+                "SELECT venue, market_id, title FROM markets WHERE market_id IN (?, ?)",
+                (ka, pm)).fetchall()
+            titles0 = {r["market_id"]: r["title"] for r in row0}
+            # A venue with NO published rules must not park the pair
+            # unverifiable forever (small poly markets never get a
+            # description — the gate froze real edges on exactly those).
+            # The TITLE carries the proposition; verify against it, labeled.
+            if not rules_p:
+                rules_p = ("[This venue published no resolution rules. "
+                           f"The market title is:] {titles0.get(pm, pm)}")
+            if not rules_k:
+                rules_k = ("[This venue published no resolution rules. "
+                           f"The market title is:] {titles0.get(ka, ka)}")
+            row = store.conn.execute(
+                "SELECT venue, market_id, title FROM markets WHERE market_id IN (?, ?)",
+                (ka, pm)).fetchall()
+            titles = {r["market_id"]: r["title"] for r in row}
+            v = await asyncio.to_thread(
+                confirm_rules, rules_complete_fn,
+                venue_a="kalshi", title_a=titles.get(ka, ka), rules_a=rules_k,
+                venue_b="polymarket_us", title_b=titles.get(pm, pm), rules_b=rules_p)
+            # ID-EVIDENCE OVERRIDE: prompt-patching the local model's
+            # pedantry has not converged (different_event -> timing_scope ->
+            # absence-as-difference). When the deterministic ids STRONGLY
+            # match (teams+date+metric+outcome), a different_event verdict
+            # about metadata is overruled to tail-divergent at write time —
+            # the same cross-examination the offline audits ran, made online.
+            # ID-OVERRIDE, name-level: a different_event verdict is downgraded
+            # only when ids match AND every participant (or the single subject)
+            # aligns BY NAME across venues — deterministic, wording-independent.
+            # Full alignment means the "different players" claim is name-form
+            # pedantry (Zampardo vs Maddy Zampardo); partial alignment is a
+            # genuine collision (BONWEI: 1 of 2 aligned) and the drop stands.
+            if v.material and names_fully_align(
+                    titles0.get(ka, "") or "", titles0.get(pm, "") or "", pm):
+                try:
+                    from bot.matching.idparse import (keys_match, parse_kalshi,
+                                                      parse_poly)
+                    meta = store.series_meta_map().get(ka.split("-")[0])
+                    if keys_match(
+                            parse_kalshi(ka, titles0.get(ka, "") or "", meta),
+                            parse_poly(pm, titles0.get(pm, "") or "")):
+                        log.info("rules verify: ID-OVERRIDE %s|%s — deterministic "
+                                 "ids match; downgrading different_event to tail",
+                                 ka, pm)
+                        v.material = False
+                        v.divergence = "tail_scenarios"
+                        v.rationale = "[id-override: ids match] " + v.rationale
+                except Exception:
+                    pass
+            store.record_rules_verdict(
+                "kalshi", ka, "polymarket_us", pm,
+                identical=v.identical, confidence=v.confidence,
+                rationale=v.rationale, material=v.material,
+                divergence=v.divergence, stricter_side=v.stricter_side)
+            # take effect IMMEDIATELY: pairs stayed gate-blocked for minutes
+            # after their verdict landed because the in-memory set refreshed
+            # only at pass boundaries
+            engine.rules_checked.add(
+                store._pair_key("kalshi", ka, "polymarket_us", pm))
+            log.info("rules verify: %s|%s -> %s (%.2f) %s", ka, pm,
+                     "IDENTICAL" if v.identical
+                     else "DIFFERENT-EVENT" if v.material
+                     else "TIMING-SCOPE (one-way)" if v.divergence == "timing_scope"
+                     else "tail-divergent",
+                     v.confidence, v.rationale[:120])
+
+        async def rules_fast_lane():
+            # blocked-with-live-edge pairs verified the moment they block: one LLM
+            # call of latency (~7-10s) instead of waiting for a pass slot. Errors
+            # only skip the item — the pass loop remains the backstop.
+            q = asyncio.Queue()
+            engine.rules_priority_q = q
+            while True:
+                p = await q.get()
+                try:
+                    if not store.rules_checked(p.venue_a, p.market_a,
+                                               p.venue_b, p.market_b):
+                        await verify_pair(p)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("rules fast lane failed for %s: %s", p.event_key, exc)
+                finally:
+                    engine._rules_enqueued.discard(p.key)
+
+        fast_lane_task = asyncio.ensure_future(rules_fast_lane())
+
         while True:
             try:
                 budget = 20
@@ -1183,78 +1277,8 @@ async def stream(
                         break
                     if store.rules_checked(p.venue_a, p.market_a, p.venue_b, p.market_b):
                         continue
-                    ka = p.market_a if p.venue_a == "kalshi" else p.market_b
-                    pm = p.market_a if p.venue_a == "polymarket_us" else p.market_b
-                    rules_k = await kalshi_v.market_rules(ka)
-                    rules_p = await poly_v.market_rules(pm)
-                    row0 = store.conn.execute(
-                        "SELECT venue, market_id, title FROM markets WHERE market_id IN (?, ?)",
-                        (ka, pm)).fetchall()
-                    titles0 = {r["market_id"]: r["title"] for r in row0}
-                    # A venue with NO published rules must not park the pair
-                    # unverifiable forever (small poly markets never get a
-                    # description — the gate froze real edges on exactly those).
-                    # The TITLE carries the proposition; verify against it, labeled.
-                    if not rules_p:
-                        rules_p = ("[This venue published no resolution rules. "
-                                   f"The market title is:] {titles0.get(pm, pm)}")
-                    if not rules_k:
-                        rules_k = ("[This venue published no resolution rules. "
-                                   f"The market title is:] {titles0.get(ka, ka)}")
-                    row = store.conn.execute(
-                        "SELECT venue, market_id, title FROM markets WHERE market_id IN (?, ?)",
-                        (ka, pm)).fetchall()
-                    titles = {r["market_id"]: r["title"] for r in row}
-                    v = await asyncio.to_thread(
-                        confirm_rules, rules_complete_fn,
-                        venue_a="kalshi", title_a=titles.get(ka, ka), rules_a=rules_k,
-                        venue_b="polymarket_us", title_b=titles.get(pm, pm), rules_b=rules_p)
-                    # ID-EVIDENCE OVERRIDE: prompt-patching the local model's
-                    # pedantry has not converged (different_event -> timing_scope ->
-                    # absence-as-difference). When the deterministic ids STRONGLY
-                    # match (teams+date+metric+outcome), a different_event verdict
-                    # about metadata is overruled to tail-divergent at write time —
-                    # the same cross-examination the offline audits ran, made online.
-                    # ID-OVERRIDE, name-level: a different_event verdict is downgraded
-                    # only when ids match AND every participant (or the single subject)
-                    # aligns BY NAME across venues — deterministic, wording-independent.
-                    # Full alignment means the "different players" claim is name-form
-                    # pedantry (Zampardo vs Maddy Zampardo); partial alignment is a
-                    # genuine collision (BONWEI: 1 of 2 aligned) and the drop stands.
-                    if v.material and names_fully_align(
-                            titles0.get(ka, "") or "", titles0.get(pm, "") or "", pm):
-                        try:
-                            from bot.matching.idparse import (keys_match, parse_kalshi,
-                                                              parse_poly)
-                            meta = store.series_meta_map().get(ka.split("-")[0])
-                            if keys_match(
-                                    parse_kalshi(ka, titles0.get(ka, "") or "", meta),
-                                    parse_poly(pm, titles0.get(pm, "") or "")):
-                                log.info("rules verify: ID-OVERRIDE %s|%s — deterministic "
-                                         "ids match; downgrading different_event to tail",
-                                         ka, pm)
-                                v.material = False
-                                v.divergence = "tail_scenarios"
-                                v.rationale = "[id-override: ids match] " + v.rationale
-                        except Exception:
-                            pass
-                    store.record_rules_verdict(
-                        "kalshi", ka, "polymarket_us", pm,
-                        identical=v.identical, confidence=v.confidence,
-                        rationale=v.rationale, material=v.material,
-                        divergence=v.divergence, stricter_side=v.stricter_side)
-                    # take effect IMMEDIATELY: pairs stayed gate-blocked for minutes
-                    # after their verdict landed because the in-memory set refreshed
-                    # only at pass boundaries
-                    engine.rules_checked.add(
-                        store._pair_key("kalshi", ka, "polymarket_us", pm))
+                    await verify_pair(p)
                     budget -= 1
-                    log.info("rules verify: %s|%s -> %s (%.2f) %s", ka, pm,
-                             "IDENTICAL" if v.identical
-                             else "DIFFERENT-EVENT" if v.material
-                             else "TIMING-SCOPE (one-way)" if v.divergence == "timing_scope"
-                             else "tail-divergent",
-                             v.confidence, v.rationale[:120])
                 engine.verified_pairs = (store.verified_pair_keys()
                                         | store.identity_certain_keys())
                 engine.rules_checked = store.rules_checked_keys()

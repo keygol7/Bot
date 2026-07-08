@@ -248,6 +248,11 @@ class StreamingEngine:
         self._feed_lag: dict = {}               # venue -> EWMA transport lag (secs)
         self._settled_leg_until: dict = {}      # pair key -> sticky settled-leg expiry
         self._rules_blocked: dict = {}          # pair key -> last rules_pending block ts
+        # FAST LANE: fresh blocks push the pair here; a dedicated verifier task
+        # (dryrun.rules_fast_lane) judges it within one LLM call instead of waiting
+        # for the pass-based loop (hot pairs blocked ~1000 ticks over 15 min).
+        self.rules_priority_q = None            # asyncio.Queue set by the host
+        self._rules_enqueued: set = set()
         self._rules_block_logged: dict = {}     # rate-limit for the block log line
         # ONE-WAY pairs (timing-scope rules divergence): may fire ONLY with YES on
         # this venue (the wider settlement window) — the other direction is the
@@ -670,6 +675,12 @@ class StreamingEngine:
             # pairs FIRST (a real 7c dislocation sat silently blocked for minutes on
             # 2026-07-07 while the loop worked the watchlist in arbitrary order)
             self._rules_blocked[key] = self.clock()
+            if self.rules_priority_q is not None and key not in self._rules_enqueued:
+                self._rules_enqueued.add(key)
+                try:
+                    self.rules_priority_q.put_nowait(p)
+                except Exception:
+                    self._rules_enqueued.discard(key)
             now = self.clock()
             if now - self._rules_block_logged.get(key, 0.0) > 300:
                 self._rules_block_logged[key] = now
