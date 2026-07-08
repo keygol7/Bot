@@ -41,3 +41,25 @@ def test_apply_book_message_seq_gap_demands_reconnect():
         "type": "orderbook_delta", "sid": 9, "seq": 1,
         "msg": {"market_ticker": "T2", "side": "yes", "price": 30, "delta": 10}})
     assert not gap and q is None
+
+
+def test_apply_book_message_live_fp_shape():
+    # the shape kalshi actually sends (observed 2026-07-08): string fp dollars,
+    # delta_fp, ISO-8601 ts
+    from bot.venues.kalshi import apply_book_message
+    books, seqs = {}, {}
+    q, gap = apply_book_message(books, seqs, {
+        "type": "orderbook_snapshot", "sid": 2, "seq": 1,
+        "msg": {"market_ticker": "T1",
+                "yes_dollars": [["0.5500", "100.00"]],
+                "no_dollars": [["0.4000", "30.00"]],
+                "ts": "2026-07-08T22:31:17.334187Z"}})
+    assert not gap and q.yes_ask == 0.60 and q.no_ask == 0.45
+    assert q.exchange_ts is not None and q.exchange_ts > 1.7e9
+    q, gap = apply_book_message(books, seqs, {
+        "type": "orderbook_delta", "sid": 2, "seq": 2,
+        "msg": {"market_ticker": "T1", "price_dollars": "0.4000",
+                "delta_fp": "-30.00", "side": "no",
+                "ts": "2026-07-08T22:31:18.000000Z"}})
+    assert not gap and q.yes_ask is None        # the only NO bid was removed
+    assert q.no_ask == 0.45                     # yes side untouched

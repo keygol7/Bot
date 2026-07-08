@@ -191,7 +191,7 @@ def apply_book_message(books: dict, seqs: dict, data: dict) -> tuple:
                             "ignoring this variant", sorted(m.keys()))
             return None, False
         price = int(price)
-        q = book[side].get(price, 0.0) + float(m.get("delta") or 0.0)
+        q = book[side].get(price, 0.0) + float(m.get("delta_fp") or m.get("delta") or 0.0)
         if q <= 1e-9:
             book[side].pop(price, None)
         else:
@@ -204,8 +204,16 @@ def apply_book_message(books: dict, seqs: dict, data: dict) -> tuple:
     quote = normalize_orderbook(t, "", ob)
     ts = m.get("ts")
     if ts:
-        ts = float(ts)
-        quote.exchange_ts = ts / 1000.0 if ts > 1e12 else ts
+        try:
+            ts = float(ts)
+            quote.exchange_ts = ts / 1000.0 if ts > 1e12 else ts
+        except (TypeError, ValueError):
+            try:                             # live shape: ISO-8601 with Z
+                from datetime import datetime
+                quote.exchange_ts = datetime.fromisoformat(
+                    str(ts).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
     return quote, False
 
 
