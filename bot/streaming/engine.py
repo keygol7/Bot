@@ -653,10 +653,15 @@ class StreamingEngine:
         trusted = (self.ws_trust_min > 0 and ws_fresh and size >= 1
                    and self._ws_trust.get(key, 0) >= self.ws_trust_min)
         fast_take = sync_fast_take or (self.maker_mode and ws_fresh and deep)
-        # FAT edges never skip the REST confirm: a sudden implausible-size edge on a
-        # trusted pair is far more often a book event (quote pull, settlement leak)
-        # than a dislocation — one round-trip verifies the whole ladder first.
-        if self.max_plausible_edge > 0 and edge > self.max_plausible_edge:
+        # FAT edges on IDENTITY-UNCERTAIN pairs never skip the REST confirm — for
+        # them a sudden implausible edge is usually a book event (quote pull) or a
+        # false match, and one round-trip verifies the whole ladder. VERIFIED /
+        # identity-certain pairs keep their earned fast paths at ANY edge size: a
+        # true complement under $1 pays regardless of why the edge exists, FOK legs
+        # + the ceiling hedge bound the downside, and the slippage feedback revokes
+        # trust if the book turns out to be lying.
+        if (self.max_plausible_edge > 0 and edge > self.max_plausible_edge
+                and key not in self.verified_pairs):
             trusted = False
             fast_take = False
         if (self.depth_fetch is not None and not fast_take and not trusted
