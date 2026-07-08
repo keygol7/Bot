@@ -794,6 +794,16 @@ class StreamingEngine:
         from bot.execution.orders import OrderStatus
 
         status = getattr(report, "status", None)
+        reason = str(getattr(report, "reason", "") or "")
+        if status is ExecStatus.SKIPPED and reason.startswith("horizon:"):
+            # A horizon skip is decided by the settle DATE — it will not change for
+            # weeks. Re-confirming the same real-but-long-dated edge every cooldown
+            # burned 22 REST round-trips on one CA-governor pair in an evening; park
+            # it for 6h instead (it re-evaluates when the horizon or edge changes).
+            self._backoff_until[key] = self.clock() + 6 * 3600.0
+            log.info("STREAM %s: horizon-skipped — parking 6h (%s)", p.event_key,
+                     reason[:80])
+            return
         if status is None:
             return                                # not an ExecutionReport (test stub)
         if status is ExecStatus.SUCCESS:
