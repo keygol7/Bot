@@ -141,6 +141,9 @@ def normalize_orderbook(
     )
 
 
+_BOOK_SHAPE_LOGGED = False
+
+
 def apply_book_message(books: dict, seqs: dict, data: dict) -> tuple:
     """Apply one ``orderbook_snapshot``/``orderbook_delta`` WS message to the local
     book state. Returns ``(quote_or_None, gap)`` — ``gap=True`` means a sequence
@@ -162,18 +165,32 @@ def apply_book_message(books: dict, seqs: dict, data: dict) -> tuple:
     if not t:
         return None, False
     if typ == "orderbook_snapshot":
-        books[t] = {
-            "yes": {int(p): float(q) for p, q in (m.get("yes") or [])},
-            "no": {int(p): float(q) for p, q in (m.get("no") or [])},
-        }
+        def _levels(side):
+            out = {}
+            for p, q in (m.get(side) or []):
+                out[int(p)] = float(q)
+            for p, q in (m.get(side + "_dollars") or []):
+                out[round(float(p) * 100)] = float(q)
+            return out
+        books[t] = {"yes": _levels("yes"), "no": _levels("no")}
     elif typ == "orderbook_delta":
         book = books.get(t)
         if book is None:
             return None, False               # delta before its snapshot — ignore
         side = m.get("side")
-        if side not in ("yes", "no"):
+        price = m.get("price")
+        if price is None:
+            price = m.get("price_dollars")   # fp-shape variant
+            if price is not None:
+                price = round(float(price) * 100)
+        if side not in ("yes", "no") or price is None:
+            global _BOOK_SHAPE_LOGGED
+            if not _BOOK_SHAPE_LOGGED:
+                _BOOK_SHAPE_LOGGED = True
+                log.warning("kalshi book delta in unrecognized shape (keys=%s) — "
+                            "ignoring this variant", sorted(m.keys()))
             return None, False
-        price = int(m.get("price"))
+        price = int(price)
         q = book[side].get(price, 0.0) + float(m.get("delta") or 0.0)
         if q <= 1e-9:
             book[side].pop(price, None)
@@ -585,7 +602,12 @@ class KalshiVenue:
                             if quote is not None:
                                 yield quote
                         elif typ in ("orderbook_snapshot", "orderbook_delta"):
-                            quote, gap = apply_book_message(books, seqs, data)
+                            try:
+                                quote, gap = apply_book_message(books, seqs, data)
+                            except Exception as exc:
+                                log.warning("kalshi book message failed (%s) — "
+                                            "ignoring: %.220s", exc, raw)
+                                continue
                             if gap:
                                 log.warning("kalshi ws book seq gap — reconnecting "
                                             "for fresh snapshots")
