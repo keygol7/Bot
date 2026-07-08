@@ -648,11 +648,19 @@ def test_maker_fee_credit_arms_thin_arb_that_taker_fee_would_skip():
                       maker_timeout=0.01)
         return ex
     o = opp(yv="poly", nv="kalshi", max_contracts=40, yes_price=0.49, no_price=0.49)
-    # maker fee modeled -> arms and locks
-    assert asyncio.run(build(KalshiFeeModel(0.0175)).execute_maker(o)).status is ExecStatus.SUCCESS
-    # taker fee on the rested leg (no maker model) -> the same thin arb is skipped
-    rep = asyncio.run(build(None).execute_maker(o))
-    assert rep.status is ExecStatus.SKIPPED and "maker edge" in rep.reason
+    # maker fee modeled -> arms one tick inside the ask and locks
+    ex_maker = build(KalshiFeeModel(0.0175))
+    assert asyncio.run(ex_maker.execute_maker(o)).status is ExecStatus.SUCCESS
+    px_maker_fee = [c[3] for c in ex_maker.venues["kalshi"].calls if c[2] == "buy"][0]
+    # taker fee on the rested leg (no maker model): previously SKIPPED (edge at the
+    # ASK failed the arm bar); the maker now rests at a fee-adjusted cap that locks
+    # >= floor + cushion at the actual resting price — it must arm, never above the
+    # cap (1 - 0.49 - taker_fee_ct - arm ~= 0.4825)
+    ex_taker = build(None)
+    rep = asyncio.run(ex_taker.execute_maker(o))
+    buys = [c[3] for c in ex_taker.venues["kalshi"].calls if c[2] == "buy"]
+    assert buys, f"should rest, got {rep.status}: {rep.reason}"
+    assert buys[0] <= 0.4825 + 1e-9
 
 
 def test_execute_maker_hedge_reprices_off_live_book():
@@ -817,10 +825,11 @@ def test_maker_depth_falls_back_to_min_when_sizes_unknown():
     assert kalshi.calls == []
 
 
-def test_execute_maker_thin_edge_below_cushion_skips():
-    # A sub-cushion edge must NOT arm a maker: while it rests the taker can drift against
-    # it, and the post-fill hedge is forced — a thin edge that drifts locks a guaranteed
-    # loss. The maker is never even placed.
+def test_execute_maker_thin_edge_rests_deeper_at_safe_price():
+    # A sub-cushion edge must never arm an ADVERSE-FILL maker — but a maker chooses
+    # its price: it now rests DEEPER in the spread at the price that manufactures
+    # floor + cushion against the current hedge ask (1 - 0.45 - 0.06 = 0.49), so a
+    # fill can only lock >= the cushion, never a loss.
     kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
     poly = FakeVenue("poly", [])
     risk = RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9, max_total_exposure=1e12))
@@ -828,11 +837,25 @@ def test_execute_maker_thin_edge_below_cushion_skips():
                   fee_models={v.name: ZeroFeeModel() for v in [kalshi, poly]},
                   max_order_contracts=0, fill_confirmer=FakeConfirmer({}),
                   maker_timeout=0.01, maker_arm_cushion=0.05)
-    # edge 0.02 (0.45 + 0.53) < floor 0.01 + cushion 0.05 = 0.06 -> skip, no order.
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.45, no_price=0.53)))
-    assert report.status is ExecStatus.SKIPPED and "cushion" in report.reason
-    assert kalshi.calls == []                       # never rested a maker
+    assert kalshi.calls, "the maker should rest (deeper), not skip"
+    assert kalshi.calls[0][3] <= 0.49 + 1e-9        # at/below the manufactured price
+    # no adverse-fill exposure: a fill at 0.49 + hedge at 0.45 locks the 0.06 arm
+
+def test_execute_maker_no_room_to_rest_skips():
+    # When even a 1c rest cannot clear floor + cushion (hedge ask too high), skip.
+    kalshi = FakeVenue("kalshi", [])
+    poly = FakeVenue("poly", [])
+    risk = RiskManager(RiskLimits(min_edge=0.01, max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor({v.name: v for v in [kalshi, poly]}, risk,
+                  fee_models={v.name: ZeroFeeModel() for v in [kalshi, poly]},
+                  max_order_contracts=0, fill_confirmer=FakeConfirmer({}),
+                  maker_timeout=0.01, maker_arm_cushion=0.05)
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
+                                              yes_price=0.94, no_price=0.05)))
+    assert report.status is ExecStatus.SKIPPED and "no room" in report.reason
+    assert kalshi.calls == []
 
 
 def test_execute_maker_fat_edge_above_cushion_arms():

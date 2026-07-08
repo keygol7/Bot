@@ -1811,14 +1811,19 @@ class Executor:
         else:
             return await self.execute(opp)   # neither leg on the maker venue -> taker path
 
-        if self.min_leg_depth > 0 and hedge_depth < self.min_leg_depth:
-            top = opp.yes_size if taker[2] is Side.YES else opp.no_size
-            return ExecutionReport(
-                ExecStatus.SKIPPED,
-                f"thin hedge book: band depth {hedge_depth:g} (top {top:g}) "
-                f"< min {self.min_leg_depth:g}")
-
         size, caps = self._max_size(opp, depth_override=hedge_depth)
+        if self.min_leg_depth > 0:
+            # Scale the depth bar with the size we would ACTUALLY fire: a 1-2ct
+            # probe needs ~3 of hedge depth, not the full static minimum — the
+            # static bar skipped ~260 probe-size opportunities/day on books that
+            # could hedge them 3x over. Larger fires keep the full bar.
+            need = max(3.0, min(float(self.min_leg_depth), 2.0 * max(size, 1)))
+            if hedge_depth < need:
+                top = opp.yes_size if taker[2] is Side.YES else opp.no_size
+                return ExecutionReport(
+                    ExecStatus.SKIPPED,
+                    f"thin hedge book: band depth {hedge_depth:g} (top {top:g}) "
+                    f"< min {need:g} (size {size})")
         if size < 1:
             binding = min(caps, key=caps.get)
             return ExecutionReport(
@@ -1838,22 +1843,30 @@ class Executor:
         maker_fee_fn = getattr(maker_venue, "maker_fee_model", None) or self._fee(maker[0])
         fee = maker_fee_fn.fee(maker[3], size) + self._fee(taker[0]).fee(taker[3], size)
         maker_edge = (size * (1.0 - maker[3] - taker[3]) - fee) / size
-        # Arm only when the edge clears the lock floor PLUS a drift cushion: the maker rests
-        # exposed to the taker moving against it, and the post-fill hedge is forced (we hold the
-        # maker fill), so a sub-cushion edge that drifts locks a guaranteed loss. The cushion is
-        # the maker analog of the taker path's hedge buffer.
+        # A maker CHOOSES its price: when one tick inside the ask doesn't clear the
+        # lock floor + drift cushion, rest DEEPER in the spread at the price that
+        # manufactures exactly that edge against the CURRENT hedge ask. Resting is
+        # free (post-only; the preview + forced hedge only engage on a fill), so a
+        # wide-spread pair with no taker edge is still a market-making opportunity —
+        # this converts the edge-gone class instead of skipping it.
         arm = floor + self.maker_arm_cushion
+        rest_cap = None
         if maker_edge < arm - 1e-9:
-            return ExecutionReport(
-                ExecStatus.SKIPPED,
-                f"maker edge {maker_edge:.3f} < lock {floor:.3f} + maker cushion "
-                f"{self.maker_arm_cushion:.3f} — would risk an adverse-fill loss")
+            fee_ct = fee / size
+            rest_cap = round(1.0 - taker[3] - fee_ct - arm, 4)
+            if rest_cap < 0.01:
+                return ExecutionReport(
+                    ExecStatus.SKIPPED,
+                    f"maker edge {maker_edge:.3f} < lock {floor:.3f} + maker cushion "
+                    f"{self.maker_arm_cushion:.3f} and no room to rest deeper")
 
         # Don't arm a maker we can't hedge. Re-read the taker (hedge) leg's LIVE book and
         # SIZE DOWN to its real top-of-book depth; skip entirely if it can't fill at all
         # (else the post-fill hedge KILLs at the cap and forces an unwind). The taker path
         # does the same before committing leg 1. A fetch failure -> 0 (skip, never arm blind).
         maker_px_planned = max(0.01, round(maker[3] - self.maker_improvement, 4))
+        if rest_cap is not None:
+            maker_px_planned = min(maker_px_planned, rest_cap)
         hedge_fees_ct = (per_contract_fee(maker_fee_fn, maker_px_planned)
                          + per_contract_fee(self._fee(taker[0]), taker[3]))
         hedge_ceiling = min(0.99, max(0.01, round(
@@ -1878,6 +1891,10 @@ class Executor:
         # (post-only rejects a marketable price). This also captures an extra tick of
         # edge: our cost is maker_px < the quoted ask, so the locked edge only grows.
         maker_px = max(0.01, round(maker[3] - self.maker_improvement, 4))
+        if rest_cap is not None:
+            maker_px = min(maker_px, rest_cap)
+            log.info("maker resting DEEP at %.2f (spread ask %.2f) to manufacture "
+                     "the %.3f floor edge", maker_px, maker[3], arm)
         try:
             m = await maker_venue.place_order(
                 maker[1], maker[2], "buy", maker_px, size,

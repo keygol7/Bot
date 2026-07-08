@@ -679,10 +679,25 @@ class StreamingEngine:
             else:
                 self._ws_trust[key] = 0
             if edge <= self.min_edge or size < 1:
-                # ESCALATING BACKOFF: a pair whose WS book keeps disagreeing with the
-                # REST truth is a chronic liar, not a fresh opportunity — re-confirming
-                # it every cooldown burns the rate budget the trade path needs. Same
-                # exponential machinery as failed executions; reset on a pass.
+                # CONVERT before backing off: the confirm just fetched BOTH full
+                # ladders — exactly what a maker rest needs. No taker edge does not
+                # mean no opportunity: the maker manufactures its price deeper in
+                # the spread (executor caps the rest so a fill locks >= floor +
+                # cushion). Resting is free; a cheap "no room"/thin skip falls
+                # through to the normal backoff.
+                if (self.maker_mode and yq is not None and nq is not None
+                        and (not self.require_rules_verify
+                             or key in self.rules_checked)):
+                    arm = self.min_edge + getattr(self.executor,
+                                                  "maker_arm_cushion", 0.005)
+                    opp_mk = self._build_opp(p, arm, yq, nq, max(size, 1))
+                    if opp_mk is not None:
+                        rep = await self.executor.execute_maker(opp_mk)
+                        st = getattr(rep, "status", None)
+                        if st is not None and st.name in ("SUCCESS", "UNWOUND", "HALTED"):
+                            self._note_outcome(key, p, rep)
+                            self._observe(p, edge, yq, nq, size, f"maker_{st.name}")
+                            return rep
                 n = self._confirm_fails.get(key, 0) + 1
                 self._confirm_fails[key] = n
                 delay = min(self._backoff_base * (2 ** (n - 1)), self._backoff_cap)
