@@ -2366,3 +2366,49 @@ def test_leg2_ceiling_fills_moved_book_instead_of_unwinding():
     assert kalshi.calls[0][3] >= 0.57
     # pnl reduced but the pair locked: 10 ct * (1 - 0.40 - 0.57) = 0.30
     assert abs(report.realized_pnl - 0.30) < 1e-9
+
+
+def test_taker_leg2_partial_tops_up_and_locks():
+    # The 3.85/20 incident: poly FOK partial-fills leg2. Instead of HALTing, the
+    # executor tops up the remainder at the ceiling; the book refilled -> locked.
+    poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 20, 0.46)])
+    kalshi = FakeVenue("kalshi", [
+        res("kalshi", Side.NO, OrderStatus.PARTIAL, 4, 0.52),   # leg2 partial
+        res("kalshi", Side.NO, OrderStatus.FILLED, 16, 0.47),   # top-up fills
+    ])
+    ex = Executor({"kalshi": kalshi, "poly": poly},
+                  RiskManager(RiskLimits(min_edge=0.001, max_position_per_market=1e9,
+                                         max_total_exposure=1e12)),
+                  fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+                  max_order_contracts=0, take_first_venue="poly")
+    ex._market_rel[("poly", "P1")] = (5, 0, 0, 30.0)
+    ex._market_rel[("kalshi", "K1")] = (5, 0, 0, 30.0)
+    report = asyncio.run(ex.execute(opp(yv="poly", nv="kalshi", max_contracts=20,
+                                        yes_price=0.46, no_price=0.49)))
+    assert report.status is ExecStatus.SUCCESS         # locked, not halted
+    assert len(kalshi.calls) == 2                       # partial + top-up
+    assert not ex.risk.is_killed
+
+
+def test_taker_leg2_partial_topup_fails_settles_matched_unwinds_rest():
+    # top-up also fails -> settle the hedged 4, unwind the excess 16 — flat, no halt
+    poly = FakeVenue("poly", [
+        res("poly", Side.YES, OrderStatus.FILLED, 20, 0.46),    # leg1
+        res("poly", Side.YES, OrderStatus.FILLED, 16, 0.45,     # unwind sell of excess
+            action="sell", requested=16),
+    ])
+    kalshi = FakeVenue("kalshi", [
+        res("kalshi", Side.NO, OrderStatus.PARTIAL, 4, 0.52),
+        res("kalshi", Side.NO, OrderStatus.KILLED, 0, None),    # top-up killed
+    ])
+    ex = Executor({"kalshi": kalshi, "poly": poly},
+                  RiskManager(RiskLimits(min_edge=0.001, max_position_per_market=1e9,
+                                         max_total_exposure=1e12)),
+                  fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+                  max_order_contracts=0, take_first_venue="poly")
+    ex._market_rel[("poly", "P1")] = (5, 0, 0, 30.0)
+    ex._market_rel[("kalshi", "K1")] = (5, 0, 0, 30.0)
+    report = asyncio.run(ex.execute(opp(yv="poly", nv="kalshi", max_contracts=20,
+                                        yes_price=0.46, no_price=0.49)))
+    assert report.status is ExecStatus.UNWOUND
+    assert not ex.risk.is_killed                        # flat, no manual reconcile

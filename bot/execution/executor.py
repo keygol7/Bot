@@ -1518,8 +1518,36 @@ class Executor:
                 f"leg2 ambiguous ({leg2.status.value}: {_reject_reason(leg2)}; "
                 f"partial hedge {qty:g}/{size:g}) — manual reconcile", [leg1, leg2])
 
-        # PARTIAL (or any other non-definitive state) on leg 2: a known-but-mismatched
-        # fill we can't safely auto-resolve. Halt for manual reconciliation.
+        # PARTIAL on leg 2 with a KNOWN filled quantity is NOT ambiguous — Polymarket
+        # FOKs are documented to partial-fill (the 0.62/6 and 3.85/20 incidents).
+        # Resolve instead of halting: TOP-UP the remainder once at the same ceiling
+        # limit (books often refill within ms — the 3.85/20 remainder completed
+        # manually at a BETTER price seconds later), then settle the matched portion
+        # and unwind any excess. Only a zero/unknown fill remains a manual halt.
+        filled2 = leg2.filled or 0.0
+        if filled2 > 1e-9:
+            hedged = min(float(size), filled2)
+            hedge_px = leg2.avg_price if leg2.avg_price is not None else second[3]
+            hedge_notional = hedged * hedge_px
+            need = round(size - hedged, 6)
+            if need >= 1.0:
+                topup = await self._place(second_venue, second[1], second[2], "buy",
+                                          leg2_limit, need, "immediate_or_cancel")
+                log.warning("leg2 top-up %s", topup)
+                k = topup.filled or 0.0
+                if k > 1e-9:
+                    hedge_notional += k * (topup.avg_price
+                                           if topup.avg_price is not None else leg2_limit)
+                    hedged = round(hedged + k, 6)
+            if hedged >= size - 1e-9:
+                merged = replace(leg2, status=OrderStatus.FILLED, filled=float(size),
+                                 avg_price=hedge_notional / size)
+                log.warning("leg2 PARTIAL %g/%g completed via top-up — locked",
+                            filled2, size)
+                return self._settle_success(opp, size, [leg1, merged])
+            return await self._settle_partial_hedge(
+                opp, leg1, float(size), hedged, hedge_notional, leg2,
+                reason=f"taker leg2 PARTIAL {filled2:g}/{size:g}")
         return self._halt(
             f"leg2 ambiguous ({leg2.status.value}: {_reject_reason(leg2)}) — manual reconcile",
             [leg1, leg2],
