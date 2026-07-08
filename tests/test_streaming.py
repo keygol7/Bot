@@ -1712,3 +1712,40 @@ def test_timing_scope_keys_from_legacy_rationale_and_new_column():
     assert st._pair_key("kalshi", "KC", "polymarket_us", "PC") in st.rules_divergent_keys()
     assert st._pair_key("kalshi", "KA", "polymarket_us", "PA") not in st.rules_divergent_keys()
     st.close()
+
+
+def test_livebook_asof_rewinds_event_time():
+    import dataclasses
+    from bot.streaming.engine import LiveBook
+    lb = LiveBook()
+    base = q("poly", "P1", yes_ask=0.40, ya=10)
+    for ts, ask in ((100.0, 0.40), (100.2, 0.45), (100.4, 0.50)):
+        quote = dataclasses.replace(base, yes_ask=ask)
+        quote.exchange_ts = ts
+        lb.update(quote)
+    assert lb.asof("poly", "P1", 100.25).yes_ask == 0.45   # rewound between ticks
+    assert lb.asof("poly", "P1", 100.5).yes_ask == 0.50    # latest
+    assert lb.asof("poly", "P1", 99.9) is None             # before history
+
+
+def test_aligned_edge_separates_standing_from_skew_phantom(monkeypatch):
+    import dataclasses
+    import time as _time
+    ex = FakeExec()
+    eng = make_engine(ex)
+    now = _time.time()
+    # SKEW PHANTOM: poly just moved (yes 0.40) creating an apparent edge against
+    # kalshi's 300ms-old book (no 0.55); at kalshi's event time poly was 0.47 (no
+    # edge). Rewinding poly must kill the fast-take.
+    kq = q("kalshi", "K1", no_ask=0.55, na=50); kq.exchange_ts = now - 0.30
+    kq.timestamp = now - 0.05
+    p_old = q("poly", "P1", yes_ask=0.47, ya=50); p_old.exchange_ts = now - 0.35
+    p_new = q("poly", "P1", yes_ask=0.40, ya=50); p_new.exchange_ts = now - 0.02
+    p_new.timestamp = now - 0.01
+    eng.livebook.update(p_old); eng.livebook.update(p_new)
+    assert not eng._aligned_edge_ok(p_new, kq)
+    # STANDING dislocation: poly was ALREADY 0.40 at kalshi's event time.
+    eng2 = make_engine(FakeExec())
+    p_old2 = q("poly", "P1", yes_ask=0.40, ya=50); p_old2.exchange_ts = now - 0.35
+    eng2.livebook.update(p_old2); eng2.livebook.update(p_new)
+    assert eng2._aligned_edge_ok(p_new, kq)

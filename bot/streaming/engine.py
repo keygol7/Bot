@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from collections import defaultdict, deque
 from dataclasses import dataclass
 
@@ -42,21 +43,53 @@ class ConfirmedPair:
 
 
 class LiveBook:
-    """Latest top-of-book quote per (venue, market_id), fed from WS streams."""
+    """Latest top-of-book quote per (venue, market_id), fed from WS streams.
+
+    Also keeps a short EVENT-TIME history per market (quotes stamped with
+    exchange_ts, ~2s deep) so the fast feed can be REWOUND to the slow feed's
+    timestamp: the venues' pipelines differ by ~300ms (kalshi) vs ~40ms (poly),
+    and comparing books from the same event instant separates a standing
+    dislocation from a skew artifact."""
+
+    HISTORY_SECS = 2.5
 
     def __init__(self) -> None:
         self._q: dict[tuple[str, str], MarketQuote] = {}
+        self._hist: dict[tuple[str, str], deque] = {}
 
     def update(self, q: MarketQuote) -> None:
         self._q[(q.venue, q.market_id)] = q
+        ts = getattr(q, "exchange_ts", None)
+        if ts:
+            h = self._hist.setdefault((q.venue, q.market_id), deque())
+            h.append((ts, q))
+            cutoff = ts - self.HISTORY_SECS
+            while h and h[0][0] < cutoff:
+                h.popleft()
 
     def get(self, venue: str, market_id: str) -> MarketQuote | None:
         return self._q.get((venue, market_id))
+
+    def asof(self, venue: str, market_id: str, ts: float) -> MarketQuote | None:
+        """The venue's book as it stood AT exchange time ``ts`` (latest quote with
+        exchange_ts <= ts), or None when history doesn't reach back that far."""
+        h = self._hist.get((venue, market_id))
+        if not h or h[0][0] > ts:
+            return None
+        best = None
+        for qts, q in h:
+            if qts <= ts:
+                best = q
+            else:
+                break
+        return best
 
     def prune(self, keep: set[tuple[str, str]]) -> None:
         """Drop quotes for markets no longer watched (settled pairs would pile up forever)."""
         for k in [k for k in self._q if k not in keep]:
             del self._q[k]
+        for k in [k for k in self._hist if k not in keep]:
+            del self._hist[k]
 
 
 class StreamingEngine:
@@ -356,6 +389,33 @@ class StreamingEngine:
                 return False
         return True
 
+    def _aligned_edge_ok(self, yq, nq) -> bool:
+        """Event-time ALIGNMENT: rewind the fresher feed to the slower feed's
+        exchange timestamp and re-check this direction's edge at that COMMON
+        instant. The venues' pipelines are skewed (~300ms kalshi vs ~40ms poly),
+        so the mixed 'latest of each' view can show a phantom edge whose other
+        half is still inside the slow pipeline. An edge that ALSO holds in the
+        aligned view is a STANDING dislocation — trustworthy like a synced tick.
+        Conservative by construction: history gaps or missing timestamps -> False."""
+        if not self._ws_book_fresh(yq, nq):
+            return False
+        ty = getattr(yq, "exchange_ts", None)
+        tn = getattr(nq, "exchange_ts", None)
+        if not ty or not tn:
+            return False
+        t_star = min(ty, tn)
+        if time.time() - t_star > 1.5:              # slow side too old to align against
+            return False
+        ay = yq if ty <= t_star + 1e-9 else self.livebook.asof(
+            yq.venue, yq.market_id, t_star)
+        an = nq if tn <= t_star + 1e-9 else self.livebook.asof(
+            nq.venue, nq.market_id, t_star)
+        if ay is None or an is None:
+            return False
+        ev = self._eval_direction(ay, an)
+        return (ev is not None and ev[0] > self.min_edge and ev[3] >= 1
+                and ev[1].venue == yq.venue)        # same direction as the live view
+
     def _ws_synced(self, yq, nq) -> bool:
         """True when BOTH legs ticked within a TIGHT window — each very recent AND close to
         the other in time — so the cross-feed is synchronized RIGHT NOW. That rules out the
@@ -619,6 +679,11 @@ class StreamingEngine:
             return None                       # never trade ahead of the rules pass
         deep = self.hybrid_take_depth > 0 and size >= self.hybrid_take_depth
         sync_fast_take = self.maker_mode and deep and self._ws_synced(yq, nq)
+        if not sync_fast_take and self.maker_mode and deep and self.sync_window_secs > 0:
+            if self._aligned_edge_ok(yq, nq):
+                log.info("STREAM %s: edge holds at ALIGNED event time (skew-rewound) "
+                         "-> sync take", p.event_key)
+                sync_fast_take = True
         # Persistence filter: a cross-feed timing artifact (one venue's WS leading the other
         # for a beat) flickers — it appears for ~100ms and vanishes when the lagging leg
         # catches up. A REAL venue-lag edge persists for the duration of the lag (seconds).
