@@ -55,7 +55,9 @@ def _family(venue: str, market_id: str) -> tuple[str, str]:
 
 def _reject_reason(result) -> str:
     """Human-readable why-it-failed from an OrderResult's raw payload (HTTP status +
-    venue error body), so a rejection isn't an opaque [REJECTED] in the log."""
+    venue error body). A KILL usually carries NO venue detail (FOK simply could not
+    fill at the limit — a book race), so fall back to the ORDER context we always
+    have: side/limit/size, which is what makes the log line diagnosable."""
     raw = getattr(result, "raw", None) or {}
     parts = []
     if raw.get("http_status"):
@@ -63,7 +65,13 @@ def _reject_reason(result) -> str:
     body = raw.get("body") or raw.get("error")
     if body:
         parts.append(str(body)[:200])
-    return " ".join(parts) or "no detail"
+    if not parts:
+        side = getattr(getattr(result, "side", None), "value", "?")
+        req = getattr(result, "requested", None) or 0
+        act = getattr(result, "action", "?")
+        return (f"no venue detail (FOK could not fill: {act} {side} x{req:g} "
+                f"— book race)")
+    return " ".join(parts)
 
 
 class ExecStatus(str, Enum):

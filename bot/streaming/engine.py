@@ -835,7 +835,11 @@ class StreamingEngine:
             # and let it re-rest (gated only by the cooldown) while the edge persists.
             self._fail_counts.pop(key, None)
             return
-        n = self._fail_counts.get(key, 0) + 1
+        # An UNWOUND outcome cost real money (crossed a spread to escape); it parks
+        # the pair twice as hard as a clean failure — overnight thin books were
+        # re-probing every ~30-45min for another 2-3c unwind, all night.
+        bump = 2 if status is ExecStatus.UNWOUND else 1
+        n = self._fail_counts.get(key, 0) + bump
         self._fail_counts[key] = n
         self._ws_trust.pop(key, None)           # a failed fire revokes WS trust too
         delay = min(self._backoff_base * (2 ** (n - 1)), self._backoff_cap)
