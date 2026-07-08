@@ -146,6 +146,12 @@ async def run_cycle(
         # close-time window, both with an UNBOUNDED limit. Other venues keep the shared
         # limit + global window. The pattern filter is a Kalshi-only kwarg.
         v_limit, v_kw = limit, {"max_close_ts": max_close_ts}
+        if v.name == "polymarket_us":
+            # Whole-board here too: the CLI --limit capped the FLAT scan at exactly
+            # 5000 while the feed holds more (the per-game /events path was never
+            # capped) — silent tail truncation of futures/props. The list endpoint
+            # is cheap; kalshi already scans 71k unbounded.
+            v_limit = 0
         if v.name == "kalshi":
             # Whole-board scan, ALWAYS (the list endpoint is cheap). Category
             # allowlists are gone: they required hand-curation and silently dropped
