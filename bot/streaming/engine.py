@@ -843,12 +843,13 @@ class StreamingEngine:
             fast_take = False
         if (self.depth_fetch is not None and not fast_take and not trusted
                 and (self.maker_mode or not ws_fresh)):
-            if size < 1:
+            if 0 < size < 1:
                 # DUST top-of-book: the WS sweep itself sizes below one contract
                 # (fractional crumbs at a great price) — nothing is tradeable at
                 # any price, and a REST confirm just re-learns that (145 of 327
                 # edge-gones in a 4h sample). Skip silently; a real order arriving
-                # ticks the book and re-triggers with size.
+                # ticks the book and re-triggers with size. (size == 0 means
+                # SIZELESS/unknown — those still confirm to learn real depth.)
                 return None
             ws_claim = edge
             log.info("STREAM %s: price edge %.4f -> confirming real depth", p.event_key, edge)
