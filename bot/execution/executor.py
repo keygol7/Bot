@@ -848,9 +848,8 @@ class Executor:
 
     @staticmethod
     def _rpair_key(va: str, ma: str, vb: str, mb: str) -> tuple:
-        """Order-independent flat pair key (mirrors Store._pair_key)."""
-        legs = sorted([(va, ma), (vb, mb)])
-        return legs[0] + legs[1]
+        """Order-independent pair key (mirrors Store._pair_key: sorted 2-tuples)."""
+        return tuple(sorted([(va, ma), (vb, mb)]))
 
     def _recycle_skip(self, opp) -> str | None:
         """Rebuy-churn guard: a just-recycled pair at ~0.92/0.05 sums to ~0.97 and looks

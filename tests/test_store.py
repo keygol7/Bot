@@ -186,8 +186,7 @@ def test_blacklist_excludes_confirmed_false_match():
     s.blacklist_pair("polymarket_us", "P1", "kalshi", "K1", reason="mean sum 0.68", samples=36)
     pairs = s.confirmed_pairs(safe_types_only=False)
     assert {(p[0], p[1]) for p in pairs} == {("kalshi", "K2")}   # K1/P1 gone, K2/P2 kept
-    assert ("kalshi", "K1", "polymarket_us", "P1") in s.blacklisted_keys() \
-        or ("polymarket_us", "P1", "kalshi", "K1") in s.blacklisted_keys()
+    assert s._pair_key("kalshi", "K1", "polymarket_us", "P1") in s.blacklisted_keys()
     s.close()
 
 
@@ -481,3 +480,16 @@ def test_identity_certain_keys_grants_tail_pairs_with_full_name_alignment(tmp_pa
     assert st._pair_key("kalshi", "KXITFMATCH-26JUL08GHIJKL-GHI",
                         "polymarket_us", "aec-itfme-gilghi-jkl-2026-07-08") not in keys
     st.close()
+
+
+def test_pair_key_matches_confirmedpair_key_format():
+    # THE format contract: store key sets must be directly comparable with the
+    # streaming engine's runtime keys. The old flat 4-tuple never matched — the
+    # rules gate over-blocked every non-identical pair, one-way and divergence
+    # floors were inert (2026-07-08 discovery via a user question about 5/10
+    # observation counts).
+    from bot.data.store import Store
+    from bot.streaming.engine import ConfirmedPair
+    p = ConfirmedPair("e", "kalshi", "K1", "polymarket_us", "P1")
+    assert Store._pair_key("kalshi", "K1", "polymarket_us", "P1") == p.key
+    assert Store._pair_key("polymarket_us", "P1", "kalshi", "K1") == p.key

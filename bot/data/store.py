@@ -416,9 +416,14 @@ class Store:
 
     # ---- match verdict cache ----
     @staticmethod
-    def _pair_key(va: str, ma: str, vb: str, mb: str) -> tuple[str, str, str, str]:
+    def _pair_key(va: str, ma: str, vb: str, mb: str) -> tuple:
         # Order-independent: a pair is the same regardless of argument order.
-        return tuple(sorted([(va, ma), (vb, mb)]))[0] + tuple(sorted([(va, ma), (vb, mb)]))[1]
+        # FORMAT CONTRACT: must equal streaming.ConfirmedPair.key (sorted 2-tuples).
+        # The old flat 4-tuple silently never matched the engine runtime keys —
+        # the rules gate over-blocked every non-identical pair (47k rules_pending/
+        # day), one-way and divergence floors were inert, and identity-certain
+        # privileges never applied. One format, one truth (2026-07-08).
+        return tuple(sorted([(va, ma), (vb, mb)]))
 
     def record_equity(self, kalshi_cash: float, poly_cash: float,
                       kalshi_pos: float, poly_pos: float) -> None:
@@ -549,7 +554,7 @@ class Store:
         """Persist a CONFIRMED false match so it's excluded from matching forever (the
         engine calls this when a pair's price behavior empirically proves the legs aren't
         complements). Order-independent; idempotent (keeps the latest verdict)."""
-        a, ma2, b, mb2 = self._pair_key(va, ma, vb, mb)
+        (a, ma2), (b, mb2) = self._pair_key(va, ma, vb, mb)
         self.conn.execute(
             """INSERT INTO match_blacklist
                  (venue_a, market_a, venue_b, market_b, reason, mean_sum, samples, ts)
@@ -564,7 +569,7 @@ class Store:
     def blacklisted_keys(self) -> set:
         """All confirmed false-match pairs as order-independent keys, for fast exclusion."""
         return {
-            (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
+            self._pair_key(r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
             for r in self.conn.execute(
                 "SELECT venue_a, market_a, venue_b, market_b FROM match_blacklist")
         }
@@ -936,13 +941,13 @@ class Store:
         for r in self.conn.execute(
                 "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts "
                 "WHERE identical=1"):
-            keys.add(tuple(sorted([(r["venue_a"], r["market_a"]),
-                                   (r["venue_b"], r["market_b"])])))
+            keys.add(self._pair_key(r["venue_a"], r["market_a"],
+                                    r["venue_b"], r["market_b"]))
         for r in self.conn.execute(
                 "SELECT venue_a, market_a, venue_b, market_b FROM settlement_checks "
                 "WHERE consistent=1"):
-            keys.add(tuple(sorted([(r["venue_a"], r["market_a"]),
-                                   (r["venue_b"], r["market_b"])])))
+            keys.add(self._pair_key(r["venue_a"], r["market_a"],
+                                    r["venue_b"], r["market_b"]))
         return keys
 
     # ---- embedding cache (see schema comment) ----
@@ -981,7 +986,7 @@ class Store:
         same_event: bool, confidence: float, rationale: str = "",
         event_key: Optional[str] = None,
     ) -> None:
-        a, ma2, b, mb2 = self._pair_key(va, ma, vb, mb)
+        (a, ma2), (b, mb2) = self._pair_key(va, ma, vb, mb)
         self.conn.execute(
             """INSERT INTO match_verdicts
                (venue_a, market_a, venue_b, market_b, same_event, confidence,
@@ -1209,7 +1214,7 @@ class Store:
         return n
 
     def get_verdict(self, va: str, ma: str, vb: str, mb: str) -> Optional[sqlite3.Row]:
-        a, ma2, b, mb2 = self._pair_key(va, ma, vb, mb)
+        (a, ma2), (b, mb2) = self._pair_key(va, ma, vb, mb)
         return self.conn.execute(
             """SELECT * FROM match_verdicts
                WHERE venue_a=? AND market_a=? AND venue_b=? AND market_b=?""",

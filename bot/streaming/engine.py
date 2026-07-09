@@ -1115,10 +1115,9 @@ class StreamingEngine:
                     continue                                   # hedged on the counterpart
                 p = ConfirmedPair(f"{v}:{m}|{counter[0]}:{counter[1]} (historical)",
                                   v, m, counter[0], counter[1])
-                # Blacklist keys are the store's FLAT sorted 4-tuple, not ConfirmedPair.key.
-                flat = (self.store._pair_key(v, m, counter[0], counter[1])
+                bkey = (self.store._pair_key(v, m, counter[0], counter[1])
                         if self.store is not None else None)
-                if flat in blacklisted or p.key in seen_keys:
+                if bkey in blacklisted or p.key in seen_keys:
                     continue
                 if self.clock() - self._last_acted.get(p.key, -1e9) < self._reconcile_grace:
                     continue                                   # mid-burst, not stranded
