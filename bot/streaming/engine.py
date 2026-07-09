@@ -511,6 +511,17 @@ class StreamingEngine:
         mean_sum = sum(obs) / n
         if mean_sum >= self.empirical_sum_floor:
             return                                   # behaves like a real complement — don't blacklist
+        if key in self.verified_pairs:
+            # IDENTITY-CERTAIN pairs are never blacklisted on PRICE evidence: a
+            # persistently cheap sum on a verified complement is wide/stale books
+            # or a scope divergence — the rules/divergence engine owns those
+            # (one-way, edge floors), not a permanent park. Audit 2026-07-09:
+            # 137 ids+names-aligned pairs were price-blacklisted, incl. a pair we
+            # HELD 48 locked contracts of and the FRA-MAR FTTS set.
+            log.info("STREAM %s: cheap sum %.3f over %d on an identity-certain pair "
+                     "— NOT blacklisting (divergence policy owns this)",
+                     p.event_key, mean_sum, n)
+            return
         try:
             self.store.blacklist_pair(
                 p.venue_a, p.market_a, p.venue_b, p.market_b,
