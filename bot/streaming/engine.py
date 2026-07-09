@@ -253,7 +253,8 @@ class StreamingEngine:
         # for the pass-based loop (hot pairs blocked ~1000 ticks over 15 min).
         self.rules_priority_q = None            # asyncio.Queue set by the host
         self._rules_enqueued: set = set()
-        self._rules_block_logged: dict = {}     # rate-limit for the block log line
+        self._rules_block_logged: dict = {}
+        self._fat_logged: dict = {}     # rate-limit for the block log line
         # ONE-WAY pairs (timing-scope rules divergence): may fire ONLY with YES on
         # this venue (the wider settlement window) — the other direction is the
         # naked SUI-COL shape. key -> required YES venue name.
@@ -604,9 +605,17 @@ class StreamingEngine:
             if key in self.verified_pairs:
                 # Definitional truth outranks price statistics: the pair's RESOLUTION
                 # RULES were verified identical (or it has settled consistently before),
-                # so a fat edge is a genuine dislocation — fire with no history needed.
-                log.warning("STREAM %s: FAT edge %+.3f on a RULES/SETTLEMENT-verified "
-                            "pair — firing without price history", p.event_key, edge)
+                # so a fat edge is a genuine dislocation — PROCEED with no history
+                # needed (size/staleness/depth checks below still apply; a dust book
+                # advertising +11c at 0.1 contracts dies at those, so this line says
+                # "eligible", not "fired"). Rate-limited: a snapshot flood logged it
+                # 12x/40ms.
+                now_log = self.clock()
+                if now_log - self._fat_logged.get(key, 0.0) > 60:
+                    self._fat_logged[key] = now_log
+                    log.warning("STREAM %s: FAT edge %+.3f on a verified pair — "
+                                "eligible without price history (guards still apply)",
+                                p.event_key, edge)
             elif self.empirical_min_obs <= 0:
                 log.warning("STREAM %s: edge %+.3f > %.3f and no empirical gate to verify "
                             "complementarity — skipping (likely FALSE MATCH)",
