@@ -1072,7 +1072,10 @@ class StreamingEngine:
         if getattr(q, "state", None):
             self._market_state[(q.venue, q.market_id)] = q.state
         report = None
-        for key in self._index.get((q.venue, q.market_id), ()):
+        keys = self._index.get((q.venue, q.market_id), ())
+        if len(keys) > 1:
+            keys = sorted(keys, key=lambda k: -self._local_edge(k))
+        for key in keys:
             r = await self._act_on_pair(key)
             if r is not None:
                 report = r
@@ -1335,6 +1338,16 @@ class StreamingEngine:
                 return True
         return False
 
+    def _local_edge(self, key) -> float:
+        """Current edge for a pair from livebook quotes alone — pure local math,
+        used only for PRIORITIZATION (fattest edges claim scarce capital first)."""
+        p = self._pairs.get(key)
+        if p is None:
+            return -1.0
+        ev = self._eval_direction(self.livebook.get(p.venue_a, p.market_a),
+                                  self.livebook.get(p.venue_b, p.market_b))
+        return ev[0] if ev is not None else -1.0
+
     async def prime_and_sweep(self, only_markets=None):
         """Seed the live book with a REST snapshot of watchlist markets, then
         edge-check every pair once. Closes the gap where a venue's WS (Kalshi ticker)
@@ -1369,7 +1382,16 @@ class StreamingEngine:
                 self.livebook.update(q)
                 primed += 1
         log.info("primed live book with %d/%d market snapshots", primed, len(items))
-        for key in list(self._pairs):
+        # FATTEST FIRST: capital is the binding constraint — when several standing
+        # edges exist at once, allocation order decides which get funded. Rank by
+        # the local livebook edge (no I/O) and act descending; skip pairs showing
+        # no local edge at all (they have nothing to fire — also makes the sweep
+        # ~10x cheaper than blind-evaluating every pair).
+        ranked = sorted(((self._local_edge(k), k) for k in list(self._pairs)),
+                        key=lambda t: -t[0])
+        for edge_hint, key in ranked:
+            if edge_hint <= 0:
+                break
             await self._act_on_pair(key)
             # YIELD between pairs: this sweep runs right after (re)subscribe, and
             # 400+ back-to-back ladder evals starved the fresh sockets' pong reads —

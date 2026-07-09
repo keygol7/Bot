@@ -1792,3 +1792,24 @@ def test_resubscribe_streams_before_prime_completes():
     aio.run(main())
     assert consumed, "consumers never started while prime was blocked"
     assert blocked.is_set(), "background prime never ran"
+
+
+def test_sweep_fires_fattest_edge_first():
+    # Two standing edges after a prime: the 5c pair must claim capital before the
+    # 1c pair — allocation order is edge-descending, not dict order.
+    import asyncio as aio
+    ex = FakeExec()
+    eng = make_engine(ex, cooldown=0.0)
+    eng.set_pairs([ConfirmedPair("THIN", "kalshi", "K1", "poly", "P1"),
+                   ConfirmedPair("FAT", "kalshi", "K2", "poly", "P2")])
+    # thin: 0.44+0.55 -> 1c ; fat: 0.40+0.55 -> 5c
+    for quote in (q("poly", "P1", yes_ask=0.44, ya=50), q("kalshi", "K1", no_ask=0.55, na=50),
+                  q("poly", "P2", yes_ask=0.40, ya=50), q("kalshi", "K2", no_ask=0.55, na=50)):
+        eng.livebook.update(quote)
+    async def _no_fetch(venue, market):
+        return None
+    eng.depth_fetch = _no_fetch
+    aio.run(eng.prime_and_sweep())
+    assert len(ex.calls) == 2
+    assert ex.calls[0].event_key.endswith("K2|poly:P2"), \
+        f"fat edge must fire first, got {[c.event_key for c in ex.calls]}"
