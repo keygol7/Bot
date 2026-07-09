@@ -373,8 +373,12 @@ class StreamingEngine:
         if not ex or ts <= 0:
             return
         lag = max(0.0, ts - ex)
-        if lag > 60.0:
-            return                                   # initial snapshot of a quiet book, not transport
+        if lag > 5.0:
+            # snapshot/quiet-book message (ts = last CHANGE, arrival = now) — not
+            # transport. Real pipeline lag measures well under 1s on both venues
+            # (sampled min 6ms kalshi / 39ms poly); 24s "lags" were poisoning the
+            # EWMA the operator reads.
+            return
         prev = self._feed_lag.get(q.venue, lag)
         self._feed_lag[q.venue] = 0.9 * prev + 0.1 * lag
 
