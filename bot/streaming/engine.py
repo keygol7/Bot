@@ -1219,6 +1219,25 @@ class StreamingEngine:
                 kept.append((p, qa, qb))
             imbalanced = kept
 
+        # BLACKLISTED-pair remnants: a false match we flattened may leave one
+        # bid-less leg (KXUCL-27-INT: 15ct/$1.05 cost, empty futures book — even a
+        # 1c IOC found no buyer). The pair can never re-trade (blacklist), the cost
+        # is sunk, a long can't lose more — halting the slate protects nothing.
+        if imbalanced and self.store is not None:
+            try:
+                bl = self.store.blacklisted_keys()
+            except Exception:
+                bl = set()
+            kept = []
+            for p, qa, qb in imbalanced:
+                if p.key in bl:
+                    log.warning("RECONCILE: unbalanced remnant on BLACKLISTED pair %s "
+                                "(%g vs %g) — sunk long on a dead pair, not naked risk",
+                                p.event_key, qa, qb)
+                    continue
+                kept.append((p, qa, qb))
+            imbalanced = kept
+
         # DUST exemption: a held-long remnant is worth qty x its best bid — when that
         # is ~zero (no bid / pennies), there is nothing left to protect: the cost is
         # sunk and a long can't lose more. Halting the whole bot over a worthless
