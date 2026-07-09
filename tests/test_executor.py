@@ -704,16 +704,37 @@ def test_maker_reconciles_underreported_confirmer_fill():
 
 
 def test_maker_halts_when_confirmer_zero_and_venue_unreadable():
-    # Confirmer says 0 AND the venue order can't be read -> ambiguous. Fail closed (HALT),
-    # never guess 0 and leak a possibly-naked fill, never hedge a fill that may not exist.
+    # Confirmer says 0 AND the venue order can't be read while the venue is HEALTHY
+    # -> genuinely ambiguous. Fail closed (HALT + kill), never guess 0, never hedge
+    # a fill that may not exist.
     kalshi = OrderFillVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)],
                             fill_qty=None)
+    async def _healthy(limit=1):
+        return [object()]
+    kalshi.list_markets = _healthy                 # venue-wide probe says HEALTHY
     poly = FakeVenue("poly", [])
     ex, risk = make_maker_exec([kalshi, poly],
                                FakeConfirmer({"kalshi": (OrderStatus.KILLED, 0, None)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=20)))
     assert report.status is ExecStatus.HALTED and risk.is_killed
     assert poly.calls == []                                       # never hedged a guessed fill
+
+
+def test_maker_fill_unreadable_during_outage_parks_no_kill():
+    # Same ambiguity but the venue is DOWN venue-wide (portfolio API flapping,
+    # 2026-07-09): park a recovery task instead of killing the whole bot.
+    kalshi = OrderFillVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)],
+                            fill_qty=None)   # no list_markets -> probe says DOWN
+    poly = FakeVenue("poly", [])
+    ex, risk = make_maker_exec([kalshi, poly],
+                               FakeConfirmer({"kalshi": (OrderStatus.KILLED, 0, None)}))
+    report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=20)))
+    assert report.status is ExecStatus.HALTED
+    assert not risk.is_killed                     # recovery parked, bot keeps running
+    assert "recovery parked" in report.reason
+    assert "kalshi" in ex.venue_down
+    for t in ex._recovery_tasks:
+        t.cancel()
 
 
 def test_maker_venue_confirms_truly_unfilled_is_clean_skip():

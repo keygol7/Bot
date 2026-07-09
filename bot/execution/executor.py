@@ -2051,8 +2051,53 @@ class Executor:
                                 "hedging the true fill (would have leaked naked)", filled, true_qty)
                 filled = max(filled, true_qty)
             elif filled <= 1e-9:
-                # Confirmer says unfilled AND the venue (which supports the read) couldn't be
-                # reached -> ambiguous. Fail closed: halt rather than guess 0 and leak naked.
+                # Confirmer says unfilled AND the venue read failed. If the venue's
+                # account plane is DOWN venue-wide (kalshi portfolio API flapping,
+                # 2026-07-09 — two kill-switch halts in one morning), park a
+                # recovery instead of halting: retry the read until the venue
+                # answers; 0 -> clean, >0 -> hedge the true fill.
+                if await self._venue_down(maker_venue):
+                    log.critical("maker fill read: venue %s account plane DOWN — "
+                                 "parking fill-state recovery (no kill switch)",
+                                 maker[0])
+                    self.venue_down.add(getattr(maker_venue, "name", maker[0]))
+
+                    async def _fill_recover():
+                        for _ in range(240):
+                            await asyncio.sleep(60.0)
+                            try:
+                                tq = await _read()
+                            except Exception:
+                                tq = None
+                            if tq is not None:
+                                self.venue_down.discard(
+                                    getattr(maker_venue, "name", maker[0]))
+                                if tq <= 1e-9:
+                                    log.warning("parked fill-state recovery: %s "
+                                                "confirmed UNFILLED — clean", maker[1])
+                                    return
+                                log.warning("parked fill-state recovery: %s shows %g "
+                                            "filled — completing hedge", maker[1], tq)
+                                try:
+                                    rep = await self._complete_hedge_after_leg1_error(
+                                        opp, tq, (maker[0], maker[1], maker[2], maker_px),
+                                        (taker[0], taker[1], taker[2], taker[3]),
+                                        maker_venue, taker_venue, m)
+                                    log.warning("fill-state recovery hedge: %s %s",
+                                                rep.status, rep.reason)
+                                except Exception as exc:
+                                    self.risk.trip_kill_switch(
+                                        f"fill-state recovery failed: {exc}")
+                                return
+                        self.risk.trip_kill_switch(
+                            "maker venue never recovered for fill-state read")
+
+                    self._recovery_tasks.append(asyncio.ensure_future(_fill_recover()))
+                    return ExecutionReport(
+                        ExecStatus.HALTED,
+                        "maker fill state unreadable + venue down — recovery parked "
+                        "(no kill switch)", [m])
+                # venue healthy, read still failed -> genuinely ambiguous: fail closed
                 return self._halt(
                     "maker fill state unreadable after cancel (confirmer 0, venue read "
                     "failed) — manual reconcile", [m])
