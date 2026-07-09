@@ -326,6 +326,12 @@ class Executor:
         # a 1-2c edge fills into an adverse move and the forced hedge locks a loss. Mirrors
         # hedge_buffer on the taker path, but for the maker's drift-while-resting risk.
         self.maker_arm_cushion = maker_arm_cushion
+        # ADVERSE-SELECTION calibration: per-(venue, family) EWMA of post-fill
+        # hedge slip (planned hedge px vs achieved; ceiling shortfall when killed).
+        # A resting maker is filled precisely when the market sweeps its price —
+        # the family's observed slip is the true cost of being picked off there,
+        # and it joins the ARM bar so hostile books price themselves out.
+        self._maker_slip: dict = {}
         # While a maker rests, poll the taker leg every this-many seconds; if it drifts so
         # the hedge could no longer lock the floor, CANCEL the maker before it fills into
         # the adverse move. This is what makes arming THIN edges safe (the cushion is the
@@ -801,6 +807,17 @@ class Executor:
         if now < until:
             base = min(base, ceiling)
         return base
+
+    def _family_slip(self, venue_name: str, market_id: str) -> float:
+        return self._maker_slip.get(_family(venue_name, market_id), 0.0)
+
+    def _note_maker_slip(self, venue_name: str, market_id: str, slip: float) -> None:
+        """EWMA (alpha .25) of hedge slip observed after maker fills, floored at 0."""
+        fam = _family(venue_name, market_id)
+        prev = self._maker_slip.get(fam, 0.0)
+        ew = 0.75 * prev + 0.25 * max(0.0, slip)
+        self._maker_slip[fam] = ew
+        log.info("maker slip %s/%s: %+0.3f -> ewma %.3f", fam[0], fam[1], slip, ew)
 
     def _breakeven_ceiling(self, leg1_venue: str, p1: float, leg2_venue: str) -> float:
         """The max hedge price at which filling still beats unwinding: PnL-breakeven
@@ -1946,7 +1963,8 @@ class Executor:
         # free (post-only; the preview + forced hedge only engage on a fill), so a
         # wide-spread pair with no taker edge is still a market-making opportunity —
         # this converts the edge-gone class instead of skipping it.
-        arm = floor + self.maker_arm_cushion
+        arm = (floor + self.maker_arm_cushion
+               + self._family_slip(taker[0], taker[1]))
         rest_cap = None
         if maker_edge < arm - 1e-9:
             fee_ct = fee / size
@@ -1973,8 +1991,11 @@ class Executor:
             return ExecutionReport(
                 ExecStatus.SKIPPED,
                 f"hedge unfillable: book depth {fillable:g} < 1 — would arm an unhedgeable maker")
-        if fillable < size:
-            size = int(fillable)
+        # PROPORTIONAL cover: the hedge band must hold 3x the rest size — a fill
+        # arrives on a book sweep, and a band that barely covers the size pre-fill
+        # is gone post-fill (24h: 62 killed hedges vs 18 clean).
+        if fillable < 3 * size:
+            size = max(1, int(fillable // 3))
 
         notional = size * (opp.yes_price + opp.no_price)
         decision = self.risk.check(f"{opp.buy_yes_venue}:{opp.buy_yes_market}", notional)
@@ -2209,6 +2230,10 @@ class Executor:
                     hedge, side=taker[2], action="buy", requested=filled, filled=hedged,
                     status=OrderStatus.FILLED,
                     avg_price=(hedge_notional / hedged) if hedged > 1e-9 else taker_limit)
+                self._note_maker_slip(
+                    taker[0], taker[1],
+                    (combined.avg_price if combined.avg_price is not None
+                     else taker_limit) - taker_px)
                 return self._settle_success(opp, filled, [maker_leg, combined])
 
             if attempt < self.hedge_retries:
@@ -2233,6 +2258,10 @@ class Executor:
                 continue
 
             # ----- retries exhausted: settle what's hedged, UNWIND the unhedged remainder -----
+            # adverse-selection ledger: the hedge could not fill inside the ceiling
+            # at all — book the full ceiling shortfall + a tick as the family slip
+            self._note_maker_slip(taker[0], taker[1],
+                                  (fire_ceiling - taker_px) + 0.01)
             # Ending flat-or-hedged always beats halting with a naked leg: the matched
             # ``hedged`` portion is a locked arb; the maker's unhedged excess is sold back.
             return await self._settle_partial_hedge(

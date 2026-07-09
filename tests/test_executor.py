@@ -1047,16 +1047,17 @@ def test_execute_maker_skips_when_hedge_preview_fills_nothing():
 
 
 def test_execute_maker_sizes_down_to_hedge_fillable():
-    # The hedge would only fill 3 of 5 -> arm the maker for 3, not 5 (so the whole fill
-    # hedges) instead of arming 5 and unwinding the unhedgeable 2.
+    # The hedge band holds 3 of 5 -> PROPORTIONAL cover: arm 3//3 = 1 contract
+    # (a maker fill arrives on a sweep; a band that barely covers pre-fill is gone
+    # post-fill — 24h live: 62 killed hedges vs 18 clean).
     kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.RESTING, 0, None)])
     poly = PreviewVenue("poly", [res("poly", Side.YES, OrderStatus.FILLED, 3, 0.40)], preview_filled=3)
-    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 3, 0.45)}))
+    ex, risk = make_maker_exec([kalshi, poly], FakeConfirmer({"kalshi": (OrderStatus.FILLED, 1, 0.45)}))
     report = asyncio.run(ex.execute_maker(opp(yv="poly", nv="kalshi", max_contracts=5,
                                               yes_price=0.40, no_price=0.55)))
     assert report.status is ExecStatus.SUCCESS
-    assert kalshi.calls[0][4] == 3                   # maker armed for the fillable 3, not 5
-    assert round(report.realized_pnl, 4) == round(3 * (1 - 0.40 - 0.55), 4)
+    assert kalshi.calls[0][4] == 1                   # proportional: band 3 -> arm 3//3 = 1
+    assert round(report.realized_pnl, 4) == round(1 * (1 - 0.40 - 0.55), 4)
 
 
 def test_maker_cancel_http_4xx_is_handled_gracefully():
@@ -2531,3 +2532,30 @@ def test_leg2_error_reconciliation_uses_delta_not_absolute():
                                         yes_price=0.40, no_price=0.55)))
     # delta = 20 - 20 = 0 -> hedge did NOT land -> must NOT settle as locked
     assert report.status is not ExecStatus.SUCCESS
+
+
+def test_maker_slip_ewma_raises_arm_bar():
+    # a hostile family (in-play ITF) accumulates observed hedge slip; the ARM bar
+    # rises until the family prices itself out of resting — calm families keep
+    # resting cheaply
+    kalshi = FakeVenue("kalshi", [])
+    poly = FakeVenue("poly", [])
+    ex, _ = make_maker_exec([kalshi, poly], FakeConfirmer({}))
+    ex.maker_arm_cushion = 0.005
+    for _ in range(6):
+        ex._note_maker_slip("poly", "aec-itfme-x-y-2026-07-09", 0.04)
+    assert ex._family_slip("poly", "aec-itfme-a-b-2026-07-09") > 0.03   # family-wide
+    assert ex._family_slip("poly", "aec-cs2-a-b-2026-07-09") == 0.0     # calm family
+    # the raised bar shows up as a DEEPER rest price: the maker manufactures
+    # arm-worth of edge including the family slip (rest_cap = 1 - hedge_ask -
+    # fees - arm). Without slip it would rest ~0.57; with ~3.7c slip <= ~0.553.
+    kalshi2 = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.RESTING, 0, None)])
+    poly2 = FakeVenue("poly", [])
+    ex2, _ = make_maker_exec([kalshi2, poly2], FakeConfirmer({}))
+    ex2.maker_arm_cushion = 0.005
+    from bot.execution.executor import _family
+    ex2._maker_slip = {_family("poly", "P1"): 0.037}
+    asyncio.run(ex2.execute_maker(
+        opp(yv="kalshi", nv="poly", max_contracts=5, yes_price=0.58, no_price=0.40)))
+    rest_px = [c[3] for c in kalshi2.venues["kalshi"].calls] if hasattr(kalshi2, "venues") else               [c[3] for c in kalshi2.calls if c[2] == "buy"]
+    assert rest_px and rest_px[0] <= 0.556, f"rest price must include slip, got {rest_px}"
