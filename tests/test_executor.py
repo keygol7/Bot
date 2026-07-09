@@ -2499,3 +2499,35 @@ def test_capital_yield_early_exit_accepts_bounded_haircut():
     entry = {ex._rpair_key("kalshi", "K1", "poly", "P1"): (0.58, 0.40)}
     acts = ex.plan_early_exit(pair_map, quotes, entry)
     assert acts, "under-yielding lock must exit at a bounded haircut"
+
+
+def test_leg2_error_reconciliation_uses_delta_not_absolute():
+    # FRA-MAR Hakimi bug: attempt #2's errored leg2 saw attempt #1's 20 contracts
+    # and declared "hedge landed" — 20 contracts went naked. The venue position is
+    # PRE + THIS; only the delta above our tracked baseline is this order's fill.
+    # NOTE opp() maps: buy_yes_market="K1" on yv, buy_no_market="P1" on nv —
+    # with yv=poly/nv=kalshi the KALSHI market id is "P1".
+    kalshi = FakeVenue("kalshi", [
+        res("kalshi", Side.NO, OrderStatus.ERROR, 0, None),           # leg2 errors
+        res("kalshi", Side.NO, OrderStatus.KILLED, 0, None),          # recross killed
+    ])
+    from types import SimpleNamespace
+    async def snap():
+        return SimpleNamespace(venue="kalshi", balance=1000.0, positions=[
+            SimpleNamespace(market_id="P1", quantity=-20, is_open=True)])
+    kalshi.account_snapshot = snap
+    poly = FakeVenue("poly", [
+        res("poly", Side.YES, OrderStatus.FILLED, 20, 0.40),          # leg1 fills
+        res("poly", Side.YES, OrderStatus.FILLED, 20, 0.39,           # unwind of leg1
+            action="sell", requested=20),
+    ])
+    ex, risk = make_exec([kalshi, poly], max_order_contracts=0)
+    ex.take_first_venue = "poly"
+    ex._market_rel[("poly", "K1")] = (5, 0, 0, 30.0)
+    ex._market_rel[("kalshi", "P1")] = (5, 0, 0, 30.0)
+    # baseline: we ALREADY hold 20 kalshi NO from attempt #1
+    ex._positions[("kalshi", "P1")] = -20.0
+    report = asyncio.run(ex.execute(opp(yv="poly", nv="kalshi", max_contracts=20,
+                                        yes_price=0.40, no_price=0.55)))
+    # delta = 20 - 20 = 0 -> hedge did NOT land -> must NOT settle as locked
+    assert report.status is not ExecStatus.SUCCESS

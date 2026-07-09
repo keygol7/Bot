@@ -1589,6 +1589,14 @@ class Executor:
                 return self._halt(
                     f"leg2 ambiguous ({leg2.status.value}: {_reject_reason(leg2)}; "
                     f"hedge state unreadable) — manual reconcile", [leg1, leg2])
+            # DELTA, not absolute: the venue position includes PRE-EXISTING holdings —
+            # attempt #2's errored leg read attempt #1's 20 contracts as "hedge
+            # landed" and booked itself hedged while 20 poly went naked (FRA-MAR
+            # Hakimi, 2026-07-09, caught by reconcile at Δ20). Baseline = our
+            # tracked position from confirmed fills.
+            pre = abs(self._positions.get(
+                (getattr(second_venue, "name", second[0]), second[1]), 0.0))
+            qty = max(0.0, qty - pre)
             if qty >= size - 1e-9:
                 # A 500 often means the server DID process the order then errored on the
                 # response: the full hedge is on and the arb is locked -> settle it.
