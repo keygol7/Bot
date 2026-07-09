@@ -1800,15 +1800,18 @@ def test_sweep_fires_fattest_edge_first():
     import asyncio as aio
     ex = FakeExec()
     eng = make_engine(ex, cooldown=0.0)
+    eng.require_rules_verify = False
+    eng.empirical_min_obs = 0
+    eng.edge_persist_secs = 0.0
     eng.set_pairs([ConfirmedPair("THIN", "kalshi", "K1", "poly", "P1"),
                    ConfirmedPair("FAT", "kalshi", "K2", "poly", "P2")])
-    # thin: 0.44+0.55 -> 1c ; fat: 0.40+0.55 -> 5c
-    for quote in (q("poly", "P1", yes_ask=0.44, ya=50), q("kalshi", "K1", no_ask=0.55, na=50),
+    # thin: 0.43+0.55 -> 2c ; fat: 0.40+0.55 -> 5c
+    for quote in (q("poly", "P1", yes_ask=0.43, ya=50), q("kalshi", "K1", no_ask=0.55, na=50),
                   q("poly", "P2", yes_ask=0.40, ya=50), q("kalshi", "K2", no_ask=0.55, na=50)):
         eng.livebook.update(quote)
-    async def _no_fetch(venue, market):
-        return None
-    eng.depth_fetch = _no_fetch
+    async def _echo(venue, market):
+        return eng.livebook.get(venue, market)   # REST confirm sees the same books
+    eng.depth_fetch = _echo
     aio.run(eng.prime_and_sweep())
     assert len(ex.calls) == 2
     assert ex.calls[0].event_key.endswith("K2|poly:P2"), \
