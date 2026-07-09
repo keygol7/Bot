@@ -2559,3 +2559,21 @@ def test_maker_slip_ewma_raises_arm_bar():
         opp(yv="kalshi", nv="poly", max_contracts=5, yes_price=0.58, no_price=0.40)))
     rest_px = [c[3] for c in kalshi2.venues["kalshi"].calls] if hasattr(kalshi2, "venues") else               [c[3] for c in kalshi2.calls if c[2] == "buy"]
     assert rest_px and rest_px[0] <= 0.556, f"rest price must include slip, got {rest_px}"
+
+
+def test_maker_degrades_to_taker_in_play():
+    # in-play kalshi ticker (start time in the past) -> execute_maker routes to the
+    # TAKER path; a pre-game/dateless ticker keeps the maker
+    import time as _t
+    from bot.execution.executor import Executor
+    assert Executor._kalshi_start_ts("KXMLBTOTAL-26JUL091840ATHDET-9") is not None
+    assert Executor._kalshi_start_ts("KXMLBDRAFTTOP-26-5-EBOO") is None
+    kalshi = FakeVenue("kalshi", [res("kalshi", Side.NO, OrderStatus.KILLED, 0, None)])
+    poly = FakeVenue("poly", [res("poly", Side.YES, OrderStatus.KILLED, 0, None)])
+    ex, _ = make_maker_exec([kalshi, poly], FakeConfirmer({}))
+    o = opp(yv="poly", nv="kalshi", max_contracts=5, yes_price=0.40, no_price=0.55)
+    # in-play: buy_no_market must look like a live-game ticker
+    o.buy_no_market = "KXMLBTOTAL-20JAN010000ATHDET-9"   # long past -> in play
+    report = asyncio.run(ex.execute_maker(o))
+    # taker path evidence: leg1 attempted as IOC BUY (killed -> clean skip), no rest
+    assert report.status is ExecStatus.SKIPPED and "leg1" in report.reason

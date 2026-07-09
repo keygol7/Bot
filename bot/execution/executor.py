@@ -808,6 +808,22 @@ class Executor:
             base = min(base, ceiling)
         return base
 
+    @staticmethod
+    def _kalshi_start_ts(market_id: str):
+        """Game start time embedded in kalshi per-game tickers
+        (KXMLBTOTAL-26JUL091840ATHDET-... -> 2026-07-09 18:40 UTC), or None for
+        dateless/futures/draft tickers."""
+        import re as _re
+        from datetime import datetime as _dt, timezone as _tz
+        m = _re.search(r"-(\d{2}[A-Z]{3}\d{2})(\d{4})[A-Z]", market_id or "")
+        if not m:
+            return None
+        try:
+            return _dt.strptime(m.group(1) + m.group(2), "%y%b%d%H%M").replace(
+                tzinfo=_tz.utc).timestamp()
+        except ValueError:
+            return None
+
     def _family_slip(self, venue_name: str, market_id: str) -> float:
         return self._maker_slip.get(_family(venue_name, market_id), 0.0)
 
@@ -1956,6 +1972,15 @@ class Executor:
         # this, so a maker armed on its real edge isn't immediately cancelled on the same basis.
         maker_fee_fn = getattr(maker_venue, "maker_fee_model", None) or self._fee(maker[0])
         fee = maker_fee_fn.fee(maker[3], size) + self._fee(taker[0]).fee(taker[3], size)
+        # IN-PLAY = TAKER-ONLY: adverse selection on live-game books is intrinsic
+        # (a resting quote fills mid-sweep; the hedge is already gone — net -$4.65
+        # across two 4h samples even with the slip cushion). Pre-game and dateless
+        # boards (draft, futures) keep the maker: slow books, the drift guard wins.
+        kalshi_leg = (opp.buy_yes_market if opp.buy_yes_venue == "kalshi"
+                      else opp.buy_no_market if opp.buy_no_venue == "kalshi" else None)
+        start_ts = self._kalshi_start_ts(kalshi_leg) if kalshi_leg else None
+        if start_ts is not None and time.time() >= start_ts:
+            return await self.execute(opp)
         maker_edge = (size * (1.0 - maker[3] - taker[3]) - fee) / size
         # A maker CHOOSES its price: when one tick inside the ask doesn't clear the
         # lock floor + drift cushion, rest DEEPER in the spread at the price that
