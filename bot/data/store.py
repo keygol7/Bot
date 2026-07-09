@@ -893,6 +893,14 @@ class Store:
                     yes_venue = r["venue_a"]
                 else:
                     yes_venue = "kalshi"
+                # NONE/no-scorer outcomes INVERT the window logic: "nothing happens
+                # in the WIDER window" is the SUBSET claim, so the windfall side
+                # flips to the narrower venue (an ET-only goal must make both legs
+                # WIN, never both lose — the ESP-BEL ftts-none shape).
+                pm_l = pm.lower()
+                if pm_l.endswith("-none") or "-none-" in pm_l or ka.upper().endswith("-NONE"):
+                    yes_venue = (r["venue_b"] if yes_venue == r["venue_a"]
+                                 else r["venue_a"])
             out[self._pair_key(r["venue_a"], r["market_a"],
                                r["venue_b"], r["market_b"])] = (
                 pol.policy, pol.extra_edge_ct, yes_venue)

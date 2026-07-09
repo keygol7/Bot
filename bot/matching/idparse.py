@@ -182,6 +182,7 @@ class MarketKey:
     thr_hi: float | None = None
     scope: frozenset = frozenset()       # period/handicap markers (id_scope_tags)
     matchable: bool = True               # False = positively junk (mention/novelty)
+    two_party: bool = False              # title has an A-vs-B structure (game/match)
 
 
 def _tokens(text: str | None) -> frozenset:
@@ -342,6 +343,7 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
         nums = [seg for seg in parts[1:-1] if re.fullmatch(r"\d", seg)]
         scope.add(f"map{nums[-1] if nums else '?'}")
     scope = frozenset(scope)
+    two_party = bool(re.search(r"\bvs\.?\b|\bagainst\b", title or "", re.I))
     oc = (outcome or "").lower() or None
     if oc and _DATE_SHAPED.match(oc):
         # a date-shaped "outcome" is a mis-split residue (unknown-series ticker
@@ -360,7 +362,7 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
         venue="kalshi", market_id=ticker, category=category,
         event_date=event_date, event_year=event_year,
         event_tokens=frozenset(ev_tokens) | (_tokens(title) & frozenset()),
-        outcome_code=oc, outcome_names=names,
+        outcome_code=oc, outcome_names=names, two_party=two_party,
         metric=metric, thr_lo=thr_lo, thr_hi=thr_hi, scope=scope,
         matchable=metric != "unmatchable",
     )
@@ -509,6 +511,7 @@ def parse_poly(slug: str, title: str = "") -> MarketKey:
         event_date=event_date,
         event_year=event_date.year if event_date else event_year,
         event_tokens=frozenset(ev_tokens) | event_names, outcome_code=outcome_code,
+        two_party=bool(re.search(r"\bvs\.?\b|\bagainst\b", title or "", re.I)),
         outcome_names=names, metric=metric, thr_lo=thr_lo, thr_hi=thr_hi, scope=scope,
     )
 
@@ -606,6 +609,19 @@ def events_align(a: MarketKey, b: MarketKey) -> bool:
         yb = b.event_year or (b.event_date.year if b.event_date else None)
         if ya and yb and abs(ya - yb) > 1:
             return False        # +/-1: season codes straddle new year (NFL 26 -> Jan 27)
+        # FUTURES-vs-GAME guard: a year-only side (undated futures like KXUCL-27)
+        # must never marry a fully-DATED two-team game (atc-ucl-inte-lin-2026-07-14)
+        # just because the outcome code aligns — "Inter wins the 2027 UCL" is not
+        # "Inter wins this game" (traded live 2026-07-08, -$5.40).
+        # FUTURES-vs-GAME guard: an undated season/championship market must never
+        # marry a DATED two-party game just because its outcome code names one of
+        # the teams — "Inter wins the 2027 UCL" is not "Inter wins this game"
+        # (traded live 2026-07-08, -$5.40). Single-subject dated events (drafts,
+        # awards) have no vs-structure and still pair with undated futures.
+        dated, undated = (a, b) if a.event_date else (b, a)
+        if dated.event_date and not undated.event_date and dated.two_party \
+                and not undated.two_party:
+            return False
         if not (a.event_tokens and b.event_tokens):
             # no date and a side with no event identity (KXIPO-26-DATABRICKS has only
             # its outcome): defer to the outcome gate — but only with year agreement
