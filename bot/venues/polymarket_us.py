@@ -596,7 +596,11 @@ class PolymarketUSVenue:
         # games on DIFFERENT dates (a Kalshi June-30 KC@CWS paired with a Poly June-26 one;
         # when June-26 settled the Kalshi leg was stranded). The game date is in the slug
         # (...-2026-06-26...), so fall back to it so the date-gap guard can actually fire.
-        close_time = parse_iso8601(m.get("endDate")) or _date_from_slug(slug)
+        # SLUG DATE FIRST: poly's endDate is an ADMIN date, not the event date —
+        # a July 9 game carries endDate=Nov 6, which made a 7-day close window
+        # drop 99.7% of the board (31 of ~9.7k markets, watchlist 0, 2026-07-08).
+        # The slug date is the real event/settlement date.
+        close_time = _date_from_slug(slug) or parse_iso8601(m.get("endDate"))
         # Targeted window: skip markets closing past it (keep unknown close).
         if max_close_ts is not None and close_time is not None and close_time > max_close_ts:
             return None
