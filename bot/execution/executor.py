@@ -1586,10 +1586,14 @@ class Executor:
         ceiling2 = self._breakeven_ceiling(
             getattr(first_venue, "name", first[0]), p1,
             getattr(second_venue, "name", second[0]))
-        leg2_limit = max(second[3], ceiling2)
-        if leg2_limit > second[3] + 1e-9:
-            log.info("leg2 limit %.3f (detected ask %.3f + ceiling reach)",
-                     leg2_limit, second[3])
+        # the ceiling is BOTH floor and CAP: reaching above the detected ask is
+        # free (FOK fills at resting prices), but a detected ask ABOVE the ceiling
+        # must never widen the limit past breakeven — a 10ct lock booked -7.5c/ct
+        # (LYONBBB 2026-07-09) when the second leg filled at 0.73 against a 0.674
+        # ceiling via the max() arm.
+        leg2_limit = ceiling2
+        log.info("leg2 limit %.3f (detected ask %.3f, ceiling %.3f, leg1 fill %.3f)",
+                 leg2_limit, second[3], ceiling2, p1)
         leg2 = await self._place(
             second_venue, second[1], second[2], "buy", leg2_limit, size, "fill_or_kill"
         )
@@ -2295,6 +2299,16 @@ class Executor:
 
     # ---- outcomes ----
     def _settle_success(self, opp, size, legs) -> ExecutionReport:
+        try:
+            ya = next(l.avg_price for l in legs if l.side is Side.YES)
+            na = next(l.avg_price for l in legs if l.side is Side.NO)
+            if ya is not None and na is not None and (1.0 - ya - na) < -0.025:
+                log.critical("NEGATIVE LOCK beyond tolerance: %s yes=%.3f no=%.3f "
+                             "sum=%.3f size=%g — leg limits/detected prices in the "
+                             "preceding lines; investigate the pricing path",
+                             opp.event_key, ya, na, ya + na, size)
+        except (StopIteration, TypeError):
+            pass
         # Identify the legs by side (the placement order may put the NO leg first).
         yes_leg = next(leg for leg in legs if leg.side is Side.YES)
         no_leg = next(leg for leg in legs if leg.side is Side.NO)
