@@ -101,7 +101,13 @@ async def reconcile_startup(
     result = GuardResult(ok=not reasons, reasons=reasons, snapshots=snapshots)
     if not result.ok:
         risk.trip_kill_switch("startup reconciliation failed: " + "; ".join(reasons))
-        log.critical("STARTUP GUARD FAILED — trading disabled. %s", "; ".join(reasons))
+        if all("unreadable" in r for r in reasons):
+            # venue outage/maintenance — the caller retries until it answers;
+            # CRITICAL once a minute for a planned window just pages the operator
+            log.warning("startup guard: venue(s) unreadable — %s", "; ".join(reasons))
+        else:
+            log.critical("STARTUP GUARD FAILED — trading disabled. %s",
+                         "; ".join(reasons))
     else:
         log.info("startup guard passed: %d venue(s) funded and flat", len(snapshots))
     return result
