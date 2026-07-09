@@ -283,6 +283,13 @@ class StreamingEngine:
         for p in pairs:
             for m in p.markets():
                 self._index.setdefault(m, set()).add(p.key)
+        # Co-movement evidence: (last_yes, last_no, last_ts) + paired-delta history.
+        # corr(dYes_A, -dNo_B) ~ +1 = same event (a level far from $1 is a REAL
+        # dislocation); ~0 = independent propositions (the "edge" is noise between
+        # strangers — including the level-check blind spot where two unrelated
+        # 50/50s sum to ~$1.00 chronically).
+        self._comove_last: dict = {}
+        self._comove: dict = {}
         # Prune per-pair / per-market state for pairs that left the watchlist — these maps
         # otherwise grow forever across refreshes (a steady memory leak on long uptimes).
         live_keys = set(self._pairs)
@@ -503,6 +510,23 @@ class StreamingEngine:
         except Exception as exc:
             log.warning("edge log failed for %s: %s", p.event_key, exc)
 
+    def _comove_corr(self, key):
+        """corr(dYes_A, -dNo_B) over paired ticks, or None below 8 observations.
+        +1 = the legs reprice on the same news (same event); ~0 = strangers."""
+        h = self._comove.get(key)
+        if not h or len(h) < 8:
+            return None
+        xs = [d[0] for d in h]
+        ys = [-d[1] for d in h]
+        n = len(xs)
+        mx, my = sum(xs) / n, sum(ys) / n
+        vx = sum((x - mx) ** 2 for x in xs)
+        vy = sum((y - my) ** 2 for y in ys)
+        if vx <= 0 or vy <= 0:
+            return None
+        cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        return cov / (vx * vy) ** 0.5
+
     def _maybe_blacklist(self, p, key, reason: str) -> None:
         """Persist a CONFIRMED false match to the store blacklist so it's excluded from
         matching across restarts. Only once the verdict is backed by enough samples (not a
@@ -516,6 +540,16 @@ class StreamingEngine:
         mean_sum = sum(obs) / n
         if mean_sum >= self.empirical_sum_floor:
             return                                   # behaves like a real complement — don't blacklist
+        corr = self._comove_corr(key)
+        if corr is not None and corr >= 0.6:
+            # The legs reprice TOGETHER on the same news — the level being far from
+            # $1 is a genuine (unarbed) dislocation, not proof of conflict. Level
+            # says whether there is money; CO-MOVEMENT says whether it is the same
+            # event. Never blacklist a co-moving pair on price level alone.
+            log.info("STREAM %s: cheap sum but legs CO-MOVE (corr %.2f over %d "
+                     "paired ticks) — dislocation, not conflict; not blacklisting",
+                     p.event_key, corr, len(self._comove.get(key) or ()))
+            return
         if key in self.verified_pairs:
             # IDENTITY-CERTAIN pairs are never blacklisted on PRICE evidence: a
             # persistently cheap sum on a verified complement is wide/stale books
@@ -585,6 +619,15 @@ class StreamingEngine:
         # gate below relies on. Cheap, in-memory, bounded.
         if self.empirical_min_obs > 0 and yq.yes_ask is not None and nq.no_ask is not None:
             self._sum_obs[key].append(yq.yes_ask + nq.no_ask)
+            # paired deltas: only when BOTH legs changed since the last sample —
+            # that's the co-movement experiment (same news moves both, or doesn't)
+            last = self._comove_last.get(key)
+            self._comove_last[key] = (yq.yes_ask, nq.no_ask)
+            if last is not None:
+                dy, dn = yq.yes_ask - last[0], nq.no_ask - last[1]
+                if abs(dy) >= 0.01 and abs(dn) >= 0.01:
+                    h = self._comove.setdefault(key, deque(maxlen=60))
+                    h.append((dy, dn))
         if edge <= self.min_edge:                # price-edge gate (size checked below)
             self._edge_since.pop(key, None)      # edge gone -> reset persistence timer
             return None
@@ -635,11 +678,15 @@ class StreamingEngine:
                 # fire on TIGHT proven complements.
                 max_mean = 1.06
                 mean_sum = (sum(obs) / n) if n else 0.0
-                if n < need_n or mean_sum < need_mean or mean_sum > max_mean:
+                corr = self._comove_corr(key)
+                anti = corr is not None and corr < 0.2 and len(self._comove.get(key) or ()) >= 15
+                if n < need_n or mean_sum < need_mean or mean_sum > max_mean or anti:
                     if n in (1, need_n // 2):        # occasional heartbeat, not tick spam
                         log.info("STREAM %s: fat edge %+.3f needs stronger proof — %d/%d "
-                                 "samples, mean sum %.3f (need %.3f-%.2f); observing",
-                                 p.event_key, edge, n, need_n, mean_sum, need_mean, max_mean)
+                                 "samples, mean sum %.3f (need %.3f-%.2f), comove %s; "
+                                 "observing",
+                                 p.event_key, edge, n, need_n, mean_sum, need_mean,
+                                 max_mean, f"{corr:.2f}" if corr is not None else "n/a")
                     self._observe(p, edge, yq, nq, size, "fat_edge_unproven")
                     # Evidence-based blacklisting still applies: a pair whose sum history
                     # sits far from $1 over enough samples is a false match, parked.

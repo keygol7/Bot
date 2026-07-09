@@ -1816,3 +1816,23 @@ def test_sweep_fires_fattest_edge_first():
     assert len(ex.calls) == 2
     assert ex.calls[0].event_key == "FAT", \
         f"fat edge must fire first, got {[c.event_key for c in ex.calls]}"
+
+
+def test_comovement_separates_dislocation_from_conflict():
+    from collections import deque
+    ex = FakeExec()
+    eng = make_engine(ex)
+    key = ("k",)
+    # coupled legs: same news moves both (dYes up, dNo down) -> corr ~ +1
+    eng._comove[key] = deque([(0.03, -0.03), (-0.02, 0.02), (0.04, -0.04),
+                              (0.01, -0.01), (-0.03, 0.03), (0.02, -0.02),
+                              (0.05, -0.05), (-0.01, 0.01)])
+    assert eng._comove_corr(key) > 0.95
+    # strangers: independent moves -> corr ~ 0
+    eng._comove[key] = deque([(0.03, 0.02), (-0.02, 0.03), (0.04, -0.01),
+                              (0.01, 0.04), (-0.03, -0.02), (0.02, 0.01),
+                              (0.05, 0.02), (-0.01, -0.03)])
+    assert abs(eng._comove_corr(key)) < 0.6
+    # below 8 paired ticks -> no verdict either way
+    eng._comove[key] = deque([(0.03, -0.03)] * 5)
+    assert eng._comove_corr(key) is None
