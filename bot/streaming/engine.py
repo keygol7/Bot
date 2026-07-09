@@ -215,6 +215,9 @@ class StreamingEngine:
         # settlement-verified consistent) — allowed to fire FAT edges with no price
         # history. Fed by the slow loop from Store.verified_pair_keys().
         self.verified_pairs: set = set()
+        # deterministic NAME-level identity (complete person-codes / full
+        # participant alignment) — may overrule PRICE-LEVEL evidence
+        self.identity_certain: set = set()
         # Async callable depth_fetch(venue, market_id) -> sized MarketQuote | None.
         # WS ticker feeds carry no size (Kalshi), so before firing on a price edge we
         # re-fetch real order-book depth (which also re-validates the price).
@@ -714,7 +717,20 @@ class StreamingEngine:
             if n >= self.empirical_min_obs and mean_sum < self.empirical_sum_floor:
                 # Defense in depth: an empirical NON-complement blocks even a verified
                 # pair (two truth signals disagreeing = investigate, never trade).
-                if key in self.verified_pairs:
+                if key in self.identity_certain:
+                    # identity proven DETERMINISTICALLY (complete person-code /
+                    # full name alignment: the EBOO draft roster, 27% vs 63%
+                    # across venues = a real dislocation on a sleepy book).
+                    # Identity outranks price level — PROCEED to trade; the
+                    # reliability ladder probe-sizes the first fires and
+                    # settlement adjudicates.
+                    now_l = self.clock()
+                    if now_l - self._rules_block_logged.get(("ic",) + tuple(key), 0.0) > 300:
+                        self._rules_block_logged[("ic",) + tuple(key)] = now_l
+                        log.warning("STREAM %s: cheap sum %.3f on an IDENTITY-CERTAIN "
+                                    "pair — real dislocation (probe-sized by the "
+                                    "ladder)", p.event_key, mean_sum)
+                elif key in self.verified_pairs:
                     log.warning("STREAM %s: CONFLICT — pair is rules/settlement-verified "
                                 "but its price history says non-complement (mean %.3f); "
                                 "trusting the prices, not trading", p.event_key, mean_sum)
@@ -724,9 +740,10 @@ class StreamingEngine:
                                 p.event_key, mean_sum, self.empirical_sum_floor, n)
                     self._maybe_blacklist(p, key, f"mean sum {mean_sum:.3f} < "
                                                   f"{self.empirical_sum_floor}")
-                self._observe(p, edge, yq, nq, size, "empirical_reject_false_match")
-                self._backoff_until[key] = self.clock() + self._backoff_cap
-                return None
+                if key not in self.identity_certain:
+                    self._observe(p, edge, yq, nq, size, "empirical_reject_false_match")
+                    self._backoff_until[key] = self.clock() + self._backoff_cap
+                    return None
         # SUB-100ms SYNC PATH: when BOTH legs just ticked within the tight sync window the
         # cross-feed is synchronized NOW, so this is a genuine edge — not a one-sided flicker.
         # Skip the persist wait entirely and take it in tens of ms. Gated to deep books (the

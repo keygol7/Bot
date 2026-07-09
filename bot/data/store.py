@@ -921,7 +921,8 @@ class Store:
         out = set()
         for r in self.conn.execute(
                 "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts "
-                "WHERE identical = 0 AND material = 0 AND confidence >= 0.9"):
+                "WHERE (identical = 1 AND confidence >= 0.8) "
+                "   OR (identical = 0 AND material = 0 AND confidence >= 0.9)"):
             pm = r["market_a"] if r["venue_a"] == "polymarket_us" else r["market_b"]
             ka = r["market_a"] if r["venue_a"] == "kalshi" else r["market_b"]
             kt, pt = titles.get(ka, ""), titles.get(pm, "")

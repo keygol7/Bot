@@ -1012,8 +1012,9 @@ async def stream(
         # Push the strongest-evidence pair set (rules-verified identical + settlement-
         # verified consistent) to the fast path: these may fire fat edges history-free.
         try:
-            engine.verified_pairs = (store.verified_pair_keys()
-                                        | store.identity_certain_keys())
+            _ic = store.identity_certain_keys()
+            engine.identity_certain = _ic
+            engine.verified_pairs = store.verified_pair_keys() | _ic
             engine.rules_checked = store.rules_checked_keys()
             pol = store.pair_divergence_policies()
             engine.one_way_yes = {k: v[2] for k, v in pol.items()
@@ -1338,8 +1339,9 @@ async def stream(
                         continue
                     await verify_pair(p)
                     budget -= 1
-                engine.verified_pairs = (store.verified_pair_keys()
-                                        | store.identity_certain_keys())
+                _ic = store.identity_certain_keys()
+                engine.identity_certain = _ic
+                engine.verified_pairs = store.verified_pair_keys() | _ic
                 engine.rules_checked = store.rules_checked_keys()
                 pol = store.pair_divergence_policies()
                 engine.one_way_yes = {k: v[2] for k, v in pol.items()

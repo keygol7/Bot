@@ -886,6 +886,12 @@ def names_fully_align(ka_title: str, poly_title: str, poly_slug: str) -> bool:
 
     def side_aligns(toks: frozenset) -> bool:
         toks = frozenset(t for t in toks if t not in _NAME_STOP)
+        # GENERATIONAL suffixes are name parts, not sub-orgs: Eric Booth JR. must
+        # not demand a junior-team marker on the other side (that guard exists for
+        # NAVI Junior / BESTIA Academy TEAM branding, which uses the full words)
+        gen = {"jr", "sr", "ii", "iii", "iv"}
+        if len(toks - gen) >= 2:
+            toks = frozenset(toks - gen)
         if not toks:
             return False
         if toks & _SUB_ORG:
@@ -898,7 +904,19 @@ def names_fully_align(ka_title: str, poly_title: str, poly_slug: str) -> bool:
                   or any(t in o or o in t for o in poly_ev if len(t) >= 4)
                   or any(c.endswith(t[:3]) or t[:3] == c[-3:] or t[:6] in c
                          for c in poly_codes if len(c) >= 5))
-        # at least one core token per participant must align by NAME (not 3-char code)
+        # COMPLETE person-code equality is NAME-LEVEL identity: 'eriboo' ==
+        # eri|boo == Eric|Booth binds BOTH name segments (the EBOO draft roster,
+        # priced 27% vs 63% across venues — a real 35c dislocation the name-only
+        # rule blocked). A BONWEI-style single-segment collision ('wei' inside
+        # 'sijwei') still fails: bon|wei != sij|wei.
+        name_parts = [t for t in core if t.isalpha() and len(t) >= 3]
+        if len(name_parts) >= 2:
+            # token order is lost in the set — try both segment orders
+            for x in name_parts:
+                for y in name_parts:
+                    if x != y and (x[:3] + y[:3]) in poly_codes:
+                        return hit >= 1
+        # otherwise: at least one core token must align by NAME (not 3-char code)
         return hit >= 1 and any(t in poly_ev or any(t in o for o in poly_ev if len(t) >= 4)
                                 for t in core)
 
