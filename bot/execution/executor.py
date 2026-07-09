@@ -332,6 +332,9 @@ class Executor:
         # static guard at fire time; this is the dynamic guard while resting). 0 = disabled
         # (rest blindly until fill/expiry — only safe with a large arm cushion).
         self.maker_poll = maker_poll
+        # Optional callable (venue_name, market_id) -> latest streamed MarketQuote;
+        # wired by the streaming host so rest-window drift checks read the WS book.
+        self.live_quote = None
         # After a maker fills, the forced hedge may hit a TRANSIENT venue error (e.g. a
         # Polymarket 500/timeout during a WS wobble). Re-place the hedge up to this many
         # times — but ONLY after reconciling the hedge venue to confirm nothing landed, so
@@ -1699,7 +1702,21 @@ class Executor:
                             order_id, code, body, exc)
 
     async def _taker_ask(self, taker, taker_venue) -> float | None:
-        """Current ask for the taker (hedge) leg from its live book, or None on failure."""
+        """Current ask for the taker (hedge) leg — from the STREAMED live book when
+        fresh (the WS delivers it at ~40-70ms lag, free), REST only as fallback.
+        The drift guard was REST-polling the same book once a second per resting
+        maker (155 fetches/5min observed on one pair)."""
+        lq = self.live_quote
+        if lq is not None:
+            try:
+                q = lq(getattr(taker_venue, "name", taker[0]), taker[1])
+            except Exception:
+                q = None
+            ts = getattr(q, "timestamp", 0.0) or 0.0 if q is not None else 0.0
+            if q is not None and time.time() - ts < 5.0:
+                ask = q.yes_ask if taker[2] is Side.YES else q.no_ask
+                if ask is not None:
+                    return ask
         try:
             q = await taker_venue.fetch_quote(RawMarket(market_id=taker[1], title="", raw={}))
         except Exception as exc:

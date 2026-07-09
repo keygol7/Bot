@@ -865,6 +865,7 @@ async def stream(
         ws_trust_eps=settings.stream_ws_trust_eps,
         require_rules_verify=settings.stream_require_rules_verify,
     )
+    executor.live_quote = engine.livebook.get   # drift guard reads the WS book
 
     # Discovery (embedding shortlist + LLM confirm) only feeds match_verdicts, which the
     # fingerprint sweep ignores — so skip the clients entirely when it's off.
