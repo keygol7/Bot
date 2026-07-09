@@ -952,7 +952,7 @@ class Store:
         keys = set()
         for r in self.conn.execute(
                 "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts "
-                "WHERE identical=1"):
+                "WHERE identical=1 AND confidence >= 0.9"):
             keys.add(self._pair_key(r["venue_a"], r["market_a"],
                                     r["venue_b"], r["market_b"]))
         for r in self.conn.execute(

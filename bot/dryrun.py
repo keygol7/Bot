@@ -1229,6 +1229,7 @@ async def stream(
             # unverifiable forever (small poly markets never get a
             # description — the gate froze real edges on exactly those).
             # The TITLE carries the proposition; verify against it, labeled.
+            fallback_used = not rules_p or not rules_k
             if not rules_p:
                 rules_p = ("[This venue published no resolution rules. "
                            f"The market title is:] {titles0.get(pm, pm)}")
@@ -1272,6 +1273,13 @@ async def stream(
                         v.rationale = "[id-override: ids match] " + v.rationale
                 except Exception:
                     pass
+            if fallback_used and v.identical:
+                # a nameless TITLE cannot prove identity ("MLB Draft: Top 5 Picks -
+                # Yes" verified against "Eric Booth Jr. drafted top 5" — venues
+                # priced it 27% vs 63%). Fallback verdicts PASS the gate but are
+                # capped below the privilege bar: no fat-fire, no observation
+                # bypass, no empirical immunity.
+                v.confidence = min(v.confidence, 0.85)
             store.record_rules_verdict(
                 "kalshi", ka, "polymarket_us", pm,
                 identical=v.identical, confidence=v.confidence,
