@@ -129,9 +129,13 @@ _CATEGORY_GROUPS = {
     "tennis_men": {"atp", "itfme"},
     "tennis_women": {"wta", "itfwo", "itfw"},
     "soccer": {"soccer", "football-soccer", "fwc", "ucl", "epl", "laliga", "mls",
-               "seriea", "bundesliga", "ligue1", "uel"},
+               "seriea", "bundesliga", "ligue1", "uel", "uecl", "bdor",
+               "brasileiro", "uefa", "fifa"},
+    "rugby": {"rugby"},
+    "entertainment": {"entertainment", "tv", "movies", "music", "videogames",
+                      "gaming2", "celebrity", "awards-entertainment"},
     "basketball": {"basketball", "nba", "wnba", "ncaab"},
-    "football": {"football", "nfl", "ncaaf"},
+    "football": {"football", "nfl", "ncaaf", "cfb"},
     "baseball": {"baseball", "mlb", "kbo", "npb"},
     "hockey": {"hockey", "nhl"},
     "motorsport": {"motorsport", "f1", "nascar", "indycar", "motogp"},
@@ -225,7 +229,13 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
     category = None
     if series_meta:
         tags = series_meta.get("tags") or []
-        category = (tags[0].lower() if tags else None) or (
+        _GENERIC_TAGS = {"awards", "sports", "politics", "world"}
+        tag0 = tags[0].lower() if tags else None
+        if tag0 in _GENERIC_TAGS:
+            # "Awards" tags both the Game Awards and the Ballon d'Or — the series
+            # CATEGORY (Entertainment vs Sports) is the real discriminator
+            tag0 = (series_meta.get("category") or "").lower() or tag0
+        category = tag0 or (
             (series_meta.get("category") or "").lower() or None)
     # gendered tennis series override the generic "tennis" tag so the category
     # conflict guard can separate the circuits deterministically
@@ -607,8 +617,14 @@ def events_align(a: MarketKey, b: MarketKey) -> bool:
     else:
         ya = a.event_year or (a.event_date.year if a.event_date else None)
         yb = b.event_year or (b.event_date.year if b.event_date else None)
-        if ya and yb and abs(ya - yb) > 1:
-            return False        # +/-1: season codes straddle new year (NFL 26 -> Jan 27)
+        if ya and yb and ya != yb:
+            # +/-1 exists ONLY for season spillover (NFL 26 season ends Jan/Feb 27);
+            # otherwise strict — the tolerance married the 2027 Nobel to the 2026
+            # prize and Club Brugge's UCL-27 to the 2026 Ballon d'Or.
+            dated_month = (a.event_date or b.event_date)
+            spill = dated_month is not None and dated_month.month <= 2
+            if abs(ya - yb) > 1 or not spill:
+                return False
         # FUTURES-vs-GAME guard: a year-only side (undated futures like KXUCL-27)
         # must never marry a fully-DATED two-team game (atc-ucl-inte-lin-2026-07-14)
         # just because the outcome code aligns — "Inter wins the 2027 UCL" is not
@@ -624,8 +640,10 @@ def events_align(a: MarketKey, b: MarketKey) -> bool:
             return False
         if not (a.event_tokens and b.event_tokens):
             # no date and a side with no event identity (KXIPO-26-DATABRICKS has only
-            # its outcome): defer to the outcome gate — but only with year agreement
-            return bool(ya and yb)
+            # its outcome): defer to the outcome gate — with EXACT year agreement
+            # (the +/-1 tolerance married the 2027 Nobel to the 2026 prize and Club
+            # Brugge's UCL-27 to the 2026 Ballon d'Or)
+            return bool(ya and yb and ya == yb)
     ea, eb = a.event_tokens, b.event_tokens
     if not ea or not eb:
         # dates matched exactly on both sides; allow when at least outcome aligns
@@ -675,6 +693,39 @@ def match_score(a: MarketKey, b: MarketKey) -> int:
     return score
 
 
+_CITY_ALIASES = {"mdw": "chi", "chicago": "chi", "nyc": "ny", "nychigh": "ny",
+                 "lax": "la", "phl": "phil", "philadelphia": "phil", "denver": "den",
+                 "sfo": "sf", "austin": "aus", "miami": "mia"}
+
+
+def _scalar_subject(k) -> set:
+    """Subject evidence for scalar markets, derived from the id itself: the kalshi
+    series residue (KXHIGHPHIL -> highphil, phil) and poly slug segments
+    (tc-temp-mdwhigh -> mdwhigh, mdw/chi). Cheap, id-level, venue-agnostic."""
+    out = set()
+    mid = (k.market_id or "").lower()
+    if k.venue == "kalshi":
+        seg = mid.split("-")[0].replace("kx", "")
+        for pref in ("high", "low"):
+            if seg.startswith(pref) and len(seg) > len(pref):
+                city = seg[len(pref):]
+                out |= {seg, _CITY_ALIASES.get(city, city)}
+        out.add(seg)
+    else:
+        segs = mid.split("-")
+        if segs and segs[0] in ("tc", "cpic", "ec", "fc"):
+            out |= set(segs[1:3])
+        for segp in segs:
+            if segp.endswith(("high", "low")) and len(segp) > 3:
+                city = segp[:-4] if segp.endswith("high") else segp[:-3]
+                out |= {segp, _CITY_ALIASES.get(city, city)}
+    for t in list(out):
+        for stem in ("cpi", "inf", "gdp", "temp"):
+            if stem in t:
+                out.add(stem)
+    return out
+
+
 _DATE_SHAPED = re.compile(r"^\d{2}[a-z]{3}\d{2}$|^\d{2}[a-z]{3}$", re.I)
 
 
@@ -693,10 +744,27 @@ def keys_match(a: MarketKey, b: MarketKey) -> bool:
         return False
     if not events_align(a, b):
         return False
-    if a.outcome_code is None and b.outcome_code is None and a.metric != "winner":
+    def _thr_shaped(oc):
+        return oc is None or re.fullmatch(r"t?\d+(?:\.\d+)?[a-z]?", oc or "")
+    if _thr_shaped(a.outcome_code) and _thr_shaped(b.outcome_code) \
+            and a.metric != "winner":
         # Event-level scalar (CPI above X, temperature, totals): neither id names an
-        # outcome entity — the metric+threshold+event IS the proposition. (Player-stat
-        # thresholds keep an outcome code on at least one side and fall through.)
+        # outcome entity — the metric+threshold+event IS the proposition. But the
+        # SUBJECT must corroborate: same-day scalars with no shared identity married
+        # Philadelphia's high temp to Chicago's and Brazil's inflation to US CPI.
+        sa, sb = _scalar_subject(a), _scalar_subject(b)
+        if sa and sb:
+            # id-level subjects on both sides are authoritative — generic title
+            # words ("highest", "temp") must not vouch for Philadelphia == Chicago
+            if not any(x == y or (len(x) >= 3 and (x in y or y in x))
+                       for x in sa for y in sb):
+                return False
+            return True
+        ta = {_CITY_ALIASES.get(t, t) for t in a.event_tokens if t not in _GENERIC_TOKENS} | sa
+        tb = {_CITY_ALIASES.get(t, t) for t in b.event_tokens if t not in _GENERIC_TOKENS} | sb
+        if ta and tb and not any(
+                x == y or (len(x) >= 3 and (x in y or y in x)) for x in ta for y in tb):
+            return False
         return True
     return outcome_align(a, b)
 
