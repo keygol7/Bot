@@ -1080,11 +1080,25 @@ async def stream(
     # a market-neutral arb into naked risk; this fails closed (kill switch) if so.
     from bot.execution.startup_guard import reconcile_startup
 
-    guard = await reconcile_startup(
-        venues, risk,
-        min_balance=settings.startup_min_balance,
-        allow_existing_positions=settings.startup_allow_positions,
-    )
+    # OUTAGE-PATIENT: an UNREADABLE venue is a maintenance window, not a verdict
+    # (poly 2-4am EST 503d; the guard exited cleanly and systemd Restart=on-failure
+    # never brought the bot back). Wait for the venue and re-run the guard —
+    # definitive states (unfunded / not flat) still refuse below.
+    while True:
+        guard = await reconcile_startup(
+            venues, risk,
+            min_balance=settings.startup_min_balance,
+            allow_existing_positions=settings.startup_allow_positions,
+        )
+        if guard.ok or not any("unreadable" in r for r in guard.reasons):
+            break
+        log.warning("startup guard: venue unreadable (outage?) — retrying in 60s: %s",
+                    "; ".join(guard.reasons))
+        try:
+            risk.reset_kill_switch()
+        except Exception:
+            pass
+        await asyncio.sleep(60.0)
     if not guard.ok:
         log.critical("aborting stream — startup guard failed: %s", "; ".join(guard.reasons))
         for v in venues:
