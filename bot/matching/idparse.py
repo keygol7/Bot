@@ -103,6 +103,12 @@ _POLY_QUALIFIER_METRIC = {
     # metrics (a "round: other" market married a "method: draw" market as
     # winner/winner)
     "mof": "mof", "mov": "mof", "rov": "round",
+    # MLB stat segments — COMBO stats are their own metric: "hrr" (hits+runs+
+    # RBIs) keyword-scanned to plain "hits" and married KXMLBHIT 3+ HITS to a
+    # 3+ H+R+RBI combo at 18c of phantom edge (Vierling, traded live 2026-07-09,
+    # -$5 to flatten). One hit + one run + one RBI loses BOTH legs of that pair.
+    "hrr": "hrr", "tb": "totalbases", "k": "strikeouts", "r": "runs",
+    "rbi": "rbi", "h": "hits",
 }
 _GENERIC_TOKENS = frozenset({
     "the", "and", "for", "will", "who", "in", "at", "of", "vs", "v", "yes", "no",
@@ -219,7 +225,10 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
     # conference" — 'seed' is in the ticker; keyword order handles specificity).
     # Stat-LEADER series are their own metric family (ldr_rbi), never plain stats.
     _K_SERIES_METRIC = {"KXUFCMOF": "mof", "KXUFCVICROUND": "round",
-                        "KXPGACOMPETE": "compete"}
+                        "KXPGACOMPETE": "compete",
+                        "KXMLBHRR": "hrr", "KXMLBTB": "totalbases",
+                        "KXMLBHIT": "hits", "KXMLBKS": "strikeouts",
+                        "KXMLBHR": "homeruns"}
     forced = _K_SERIES_METRIC.get(series)
     metric = forced or leader_metric(f"{meta_title} {series.lower()}")
     if not metric:
