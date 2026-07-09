@@ -834,7 +834,7 @@ class PolymarketUSVenue:
         headers = self._auth_headers("GET", path)
         async with websockets.connect(
             self.cfg.ws_markets, additional_headers=headers, open_timeout=10
-        , compression=None) as ws:
+        , compression=None, ping_timeout=45) as ws:
             await ws.send(json.dumps({"subscribe": {
                 "requestId": "probe",
                 "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",

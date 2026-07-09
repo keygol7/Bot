@@ -580,7 +580,7 @@ class KalshiVenue:
                 headers = self._ws_auth_headers()
                 async with websockets.connect(
                     self.cfg.ws_base, additional_headers=headers, open_timeout=10
-                , compression=None) as ws:
+                , compression=None, ping_timeout=45) as ws:
                     import os
                     channels = ["ticker"]
                     if os.getenv("KALSHI_WS_BOOK", "true").lower() != "false":
@@ -643,7 +643,7 @@ class KalshiVenue:
                 headers = self._ws_auth_headers()
                 async with websockets.connect(
                     self.cfg.ws_base, additional_headers=headers, open_timeout=10
-                , compression=None) as ws:
+                , compression=None, ping_timeout=45) as ws:
                     await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
                                               "params": {"channels": ["fill"]}}))
                     backoff = 1.0
@@ -684,7 +684,7 @@ class KalshiVenue:
                 headers = self._ws_auth_headers()
                 async with websockets.connect(
                     self.cfg.ws_base, additional_headers=headers, open_timeout=10
-                , compression=None) as ws:
+                , compression=None, ping_timeout=45) as ws:
                     await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
                                               "params": {"channels": ["market_lifecycle_v2"]}}))
                     backoff = 1.0
