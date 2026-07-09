@@ -887,6 +887,8 @@ async def stream(
         embed_fn = CachingEmbedFn(make_embed_fn(settings.llm), store, max_new_per_call=1500,
                                   model=settings.llm.embedding_model)
 
+    _bal_fails: dict = {}
+
     async def refresh_balances():
         # Re-read available cash per venue so each arb is sized against what's actually
         # there (covers settlements, deposits, and any drift from the running estimate).
@@ -897,8 +899,23 @@ async def stream(
                 continue
             try:
                 snaps.append(await fn())
+                # account plane healthy again -> fires may resume
+                if v.name in getattr(executor, "venue_down", set()):
+                    executor.venue_down.discard(v.name)
+                    log.warning("ACCOUNT PLANE recovered for %s — fires resume", v.name)
+                _bal_fails[v.name] = 0
             except Exception as exc:
                 log.warning("balance refresh failed for %s: %s", v.name, exc)
+                # ACCOUNT-PLANE gate: market data can be up while account/auth is
+                # still recovering from maintenance (poly 401s, 2026-07-09) — an
+                # order placed then fails at best and strands a leg at worst. Two
+                # consecutive failures suspend fires touching this venue.
+                _bal_fails[v.name] = _bal_fails.get(v.name, 0) + 1
+                if _bal_fails[v.name] >= 2 and hasattr(executor, "venue_down") \
+                        and v.name not in executor.venue_down:
+                    executor.venue_down.add(v.name)
+                    log.warning("ACCOUNT PLANE down for %s (%d consecutive) — "
+                                "suspending fires touching it", v.name, _bal_fails[v.name])
         if snaps:
             executor.set_balances(snaps)
             if settings.risk_caps_from_balance:
