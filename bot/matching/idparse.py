@@ -99,9 +99,14 @@ _POLY_QUALIFIER_METRIC = {
     "tg": "total", "fastlap": "fastlap", "cy": "cyyoung", "roy": "rookie",
     "mvp": "mvp", "dc": "winner",
     "cc": "winner", "sb": "stolen_bases", "hr": "homeruns", "ks": "strikeouts",
+    # UFC prop families: method-of-finish vs round-of-victory are DIFFERENT
+    # metrics (a "round: other" market married a "method: draw" market as
+    # winner/winner)
+    "mof": "mof", "mov": "mof", "rov": "round",
 }
 _GENERIC_TOKENS = frozenset({
     "the", "and", "for", "will", "who", "in", "at", "of", "vs", "v", "yes", "no",
+    "go", "to", "by", "end", "contest", "visit",
     "main", "race", "event", "upcoming", "scheduled", "esports", "gaming", "team",
     # structural/metric words: never event IDENTITY (Dallas-high vs Midwest-high
     # must not align on "high")
@@ -208,7 +213,10 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
     # carries the qualifier the title omits: KXNFL1SEED's title just says "win the
     # conference" — 'seed' is in the ticker; keyword order handles specificity).
     # Stat-LEADER series are their own metric family (ldr_rbi), never plain stats.
-    metric = leader_metric(f"{meta_title} {series.lower()}")
+    _K_SERIES_METRIC = {"KXUFCMOF": "mof", "KXUFCVICROUND": "round",
+                        "KXPGACOMPETE": "compete"}
+    forced = _K_SERIES_METRIC.get(series)
+    metric = forced or leader_metric(f"{meta_title} {series.lower()}")
     if not metric:
         metric = metric_from_text(f"{meta_title} {series.lower()}") if meta_title else "unknown"
     if metric == "unknown":
@@ -334,11 +342,25 @@ def parse_kalshi(ticker: str, title: str = "", series_meta: dict | None = None) 
         nums = [seg for seg in parts[1:-1] if re.fullmatch(r"\d", seg)]
         scope.add(f"map{nums[-1] if nums else '?'}")
     scope = frozenset(scope)
+    oc = (outcome or "").lower() or None
+    if oc and _DATE_SHAPED.match(oc):
+        # a date-shaped "outcome" is a mis-split residue (unknown-series ticker
+        # like KXSUPERBOWLWHITEHOUSE-26DEC31): treat it as the DATE, never as an
+        # outcome code — as an outcome it substring-matched poly's 'dec' and
+        # married the Super Bowl White House market to a McGregor fight prop.
+        if event_date is None:
+            try:
+                from datetime import datetime as _dt
+                event_date = _dt.strptime(oc[:7], "%y%b%d").date()
+                event_year = event_date.year
+            except ValueError:
+                pass
+        oc = None
     return MarketKey(
         venue="kalshi", market_id=ticker, category=category,
         event_date=event_date, event_year=event_year,
         event_tokens=frozenset(ev_tokens) | (_tokens(title) & frozenset()),
-        outcome_code=(outcome or "").lower() or None, outcome_names=names,
+        outcome_code=oc, outcome_names=names,
         metric=metric, thr_lo=thr_lo, thr_hi=thr_hi, scope=scope,
         matchable=metric != "unmatchable",
     )
@@ -635,6 +657,9 @@ def match_score(a: MarketKey, b: MarketKey) -> int:
         else:
             score += 1
     return score
+
+
+_DATE_SHAPED = re.compile(r"^\d{2}[a-z]{3}\d{2}$|^\d{2}[a-z]{3}$", re.I)
 
 
 def keys_match(a: MarketKey, b: MarketKey) -> bool:

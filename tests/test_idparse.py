@@ -236,3 +236,28 @@ def test_names_fully_align_discriminates_pedantry_from_collisions():
     # sub-org: BESTIA Academy never aligns with BESTIA (lowercase esports names too)
     assert not nfa("Will largadosypelados win the BESTIA Academy vs. largadosypelados match?",
                    "largadosypelados vs BESTIA", "aec-cs2-ldp-bsta-2026-07-07")
+
+
+def test_mcgregor_audit_classes():
+    # 2026-07-09 audit: three parse holes married unrelated markets at 0.99
+    # 1. date-shaped residue must be a DATE, never an outcome code
+    k = parse_kalshi("KXSUPERBOWLWHITEHOUSE-26DEC31",
+                     "Will the Super Bowl winners go to the White House?", None)
+    assert k.outcome_code is None and str(k.event_date) == "2026-12-31"
+    p = parse_poly("astatc-ufc-maxhol-conmcg-2026-07-11-rov-dec",
+                   "Will the contest end with a decision in Round 1?")
+    assert not keys_match(k, p)
+    # 2. round-of-victory and method-of-finish are different metrics
+    k2 = parse_kalshi("KXUFCVICROUND-26JUL11MCGHOL-OTHER", "Which round?", None)
+    p2 = parse_poly("astatc-ufc-maxhol-conmcg-2026-07-11-mov-draw",
+                    "Will Max Holloway vs. Conor McGregor end in a draw?")
+    assert k2.metric != p2.metric and not keys_match(k2, p2)
+    # 3. competing-at is not winning
+    k3 = parse_kalshi("KXPGACOMPETE-PGATC26AUG-MMCG", "Will Max McGreevy compete?", None)
+    p3 = parse_poly("tec-pga-genescot-2026-07-12-w-maxmcg", "Genesis Scottish Open - Max McGreevy")
+    assert k3.metric == "compete" and not keys_match(k3, p3)
+    # the REAL McGregor pairs keep matching
+    k4 = parse_kalshi("KXUFCMOF-26JUL11MCGHOL-DEC", "Method of victory? - Decision", None)
+    p4 = parse_poly("astatc-ufc-maxhol-conmcg-2026-07-11-mof-dec",
+                    "Will Max Holloway vs. Conor McGregor end by decision?")
+    assert keys_match(k4, p4)
