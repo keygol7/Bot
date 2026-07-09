@@ -1398,6 +1398,15 @@ class StreamingEngine:
                 state = getattr(q, "state", None) if q is not None else None
                 if state is not None and state != self._OPEN_STATE:
                     return True
+                # HOLLOW quote on a 0-position leg: the fetch "succeeded" but came
+                # back with no state and no prices — an expired/pruned market read
+                # during venue-API recovery (MANYOU 2026-07-09: poly EXPIRED leg
+                # read hollow, all three signals missed, a settled arb-in-transit
+                # halted the bot). A real open market has a state or a book.
+                if (q is not None and state is None and abs(qty) <= self._reconcile_tol
+                        and getattr(q, "yes_ask", None) is None
+                        and getattr(q, "no_ask", None) is None):
+                    return True
             # 0-position leg whose market is UNREADABLE despite an attempted read (404 after
             # the venue pruned the resolved market) -> settled+pruned. Only when we actually
             # checked: with no checker configured, fail toward halt (a human verifies).
