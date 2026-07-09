@@ -281,7 +281,10 @@ class Store:
             parent = Path(path).expanduser().parent
             if parent and not parent.exists():
                 parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        # check_same_thread=False: the heavy fingerprint sweep runs via
+        # asyncio.to_thread so it can't starve the WS keepalives; access remains
+        # serialized (the event loop awaits the thread — no concurrent use).
+        self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         # WAL + NORMAL sync: many small writes per cycle without an fsync per commit.
         try:

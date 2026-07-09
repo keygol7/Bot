@@ -1006,7 +1006,12 @@ async def stream(
         except Exception as exc:
             log.warning("verified-pairs refresh failed: %s", exc)
         await refresh_balances()
-        cached = store.confirmed_pairs(
+        # THREAD, not inline: the fingerprint sweep is ~50s of pure CPU on the
+        # unbounded 80k-market board — run inline it starves the WS keepalives
+        # (both venues 1011-disconnected during every refresh). The GIL still
+        # interleaves the event loop between bytecodes, so pings survive.
+        cached = await asyncio.to_thread(
+            store.confirmed_pairs,
             use_fingerprint=settings.match_use_fingerprint,
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
