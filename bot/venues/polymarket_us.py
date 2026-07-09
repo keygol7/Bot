@@ -764,11 +764,37 @@ class PolymarketUSVenue:
     async def stream_order_book(self, market_ids: list[str]) -> AsyncIterator[MarketQuote]:
         """Stream real-time SIZED top-of-book via the markets WS (MARKET_DATA full book).
 
-        Requires credentials (the markets WS is on the authenticated API, unlike the
-        public REST gateway). Subscribes in batches of 100 slugs; reconnects with
-        exponential backoff; ignores heartbeats. Uses the full-book channel (not the
-        lite BBO) so the streamed quote carries real per-level size.
+        SHARDED across connections: the venue caps subscriptions per connection
+        ("max subscriptions per connection reached" at ~1,480 slugs, 2026-07-08 —
+        everything past the cap silently got NO live feed). Each shard of
+        POLY_WS_MAX_SUBS slugs (default 400) runs its own connection with the
+        original reconnect loop; quotes merge through a queue.
         """
+        import os
+        max_subs = int(os.getenv("POLY_WS_MAX_SUBS", "400"))
+        if market_ids and len(market_ids) > max_subs:
+            queue: asyncio.Queue = asyncio.Queue(maxsize=4096)
+
+            async def _pump(shard):
+                async for quote in self._stream_order_book_single(shard):
+                    await queue.put(quote)
+
+            shards = [market_ids[i:i + max_subs]
+                      for i in range(0, len(market_ids), max_subs)]
+            log.info("polymarket ws: sharding %d slugs across %d connections",
+                     len(market_ids), len(shards))
+            tasks = [asyncio.create_task(_pump(sh)) for sh in shards]
+            try:
+                while True:
+                    yield await queue.get()
+            finally:
+                for t in tasks:
+                    t.cancel()
+        else:
+            async for quote in self._stream_order_book_single(market_ids):
+                yield quote
+
+    async def _stream_order_book_single(self, market_ids) -> AsyncIterator[MarketQuote]:
         if not getattr(self.cfg, "is_trading_configured", False):
             raise OrderNotPermitted("Polymarket US credentials required for the WebSocket")
         import json

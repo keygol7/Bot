@@ -1814,5 +1814,5 @@ def test_sweep_fires_fattest_edge_first():
     eng.depth_fetch = _echo
     aio.run(eng.prime_and_sweep())
     assert len(ex.calls) == 2
-    assert ex.calls[0].event_key.endswith("K2|poly:P2"), \
+    assert ex.calls[0].event_key == "FAT", \
         f"fat edge must fire first, got {[c.event_key for c in ex.calls]}"
