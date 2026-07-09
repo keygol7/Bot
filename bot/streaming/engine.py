@@ -685,6 +685,10 @@ class StreamingEngine:
         # Skip the persist wait entirely and take it in tens of ms. Gated to deep books (the
         # TAKE path; a stale top unwinds cleanly, bounded by the per-order cap). Everything
         # else keeps the persist guard below.
+        vdown = getattr(self.executor, "venue_down", None)
+        if vdown and (yq.venue in vdown or nq.venue in vdown):
+            self._observe(p, edge, yq, nq, size, "venue_outage")
+            return None                    # can't hedge into a downed venue
         req_yes = self.one_way_yes.get(key)
         if req_yes and yq.venue != req_yes:
             self._observe(p, edge, yq, nq, size, "unsafe_direction_timing_scope")

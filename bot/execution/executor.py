@@ -332,6 +332,11 @@ class Executor:
         # static guard at fire time; this is the dynamic guard while resting). 0 = disabled
         # (rest blindly until fill/expiry — only safe with a large arm cushion).
         self.maker_poll = maker_poll
+        # Venue-wide outage state: names of venues currently unreachable (the
+        # engine stops firing pairs touching them); recovery tasks re-hedge parked
+        # naked legs when the venue returns.
+        self.venue_down: set = set()
+        self._recovery_tasks: list = []
         # Capital-yield floor: a lock must earn at least this fraction of its
         # capital PER DAY of holding (0 disables). Policy 2026-07-09: 1%/day.
         import os as _os
@@ -570,6 +575,46 @@ class Executor:
         else:
             log.info("reliability: %s:%s probe FOK failed (%d fills/%d fails/%d streak) — "
                      "probe-gated until proven", venue, market_id, fills, fails + 1, streak)
+
+    async def _venue_down(self, venue) -> bool:
+        """Venue-WIDE outage probe: distinguishes 'this request failed' from 'the
+        venue is in maintenance' (poly 2-4am EST 2026-07-09: a mid-flight hedge
+        503d, its position read 503d, and the fail-closed halt killed the whole
+        bot for a scheduled outage). A cheap public read failing too = outage."""
+        try:
+            ms = await venue.list_markets(limit=1)
+            return not ms
+        except Exception:
+            return True
+
+    def _schedule_hedge_recovery(self, opp, size, first, second,
+                                 first_venue, second_venue, maker_leg) -> None:
+        """The hedge venue is DOWN with a naked maker fill held. Park a recovery
+        task: poll until the venue answers, then complete the hedge for the true
+        imbalance via the existing _complete_hedge machinery. No kill switch —
+        new fires are stopped separately by the engine's venue_down gate."""
+        self.venue_down.add(getattr(second_venue, "name", second[0]))
+
+        async def _recover():
+            for _ in range(240):                      # up to 4 hours
+                await asyncio.sleep(60.0)
+                if not await self._venue_down(second_venue):
+                    break
+            else:
+                self.risk.trip_kill_switch("hedge venue never recovered")
+                return
+            self.venue_down.discard(getattr(second_venue, "name", second[0]))
+            log.warning("VENUE RECOVERED: %s — completing the parked hedge for %s",
+                        getattr(second_venue, "name", second[0]), second[1])
+            try:
+                report = await self._complete_hedge_after_leg1_error(
+                    opp, size, first, second, first_venue, second_venue, maker_leg)
+                log.warning("parked hedge completion: %s %s", report.status,
+                            report.reason)
+            except Exception as exc:
+                self.risk.trip_kill_switch(f"parked hedge completion failed: {exc}")
+
+        self._recovery_tasks.append(asyncio.ensure_future(_recover()))
 
     async def _position_after_error(self, venue, market_id):
         """After an ambiguous leg ERROR, ask the venue whether a position actually
@@ -2073,6 +2118,23 @@ class Executor:
                 # we can't read at all halts for manual reconciliation.
                 qty = await self._hedge_qty_after_error(taker_venue, taker[1])
                 if qty is None:
+                    if await self._venue_down(taker_venue):
+                        # VENUE OUTAGE (maintenance): the naked maker fill is real
+                        # but the venue will return — park a recovery task that
+                        # completes the hedge when it does; do NOT kill the bot
+                        # over a scheduled maintenance window.
+                        log.critical(
+                            "maker hedge venue DOWN (%s) with a naked fill on %s — "
+                            "parking hedge recovery, suspending fires on that venue",
+                            _reject_reason(hedge), maker[1])
+                        self._schedule_hedge_recovery(
+                            opp, size, (maker[0], maker[1], maker[2], maker_px),
+                            (taker[0], taker[1], taker[2], taker_limit),
+                            maker_venue, taker_venue, maker_leg)
+                        return ExecutionReport(
+                            ExecStatus.HALTED,
+                            "hedge venue down — recovery parked (no kill switch)",
+                            [maker_leg, hedge])
                     return self._halt(
                         f"maker hedge ambiguous (ERROR: {_reject_reason(hedge)}; "
                         f"hedge qty unreadable) — manual reconcile", [maker_leg, hedge])
