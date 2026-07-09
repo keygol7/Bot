@@ -1313,6 +1313,11 @@ class StreamingEngine:
         log.info("primed live book with %d/%d market snapshots", primed, len(items))
         for key in list(self._pairs):
             await self._act_on_pair(key)
+            # YIELD between pairs: this sweep runs right after (re)subscribe, and
+            # 400+ back-to-back ladder evals starved the fresh sockets' pong reads —
+            # both venues 1011-closed at exactly ping_interval+ping_timeout after
+            # every resubscribe. sleep(0) lets the loop service IO each iteration.
+            await asyncio.sleep(0)
 
     async def _consume(self, venue) -> None:
         mids = self.market_ids.get(venue.name) or None
