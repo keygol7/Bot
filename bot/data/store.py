@@ -1089,7 +1089,7 @@ class Store:
         can run once over a union. See :meth:`confirmed_pairs` for gate descriptions."""
         rows = self.conn.execute(
             """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b, v.event_key,
-                      ma.title AS title_a, mb.title AS title_b
+                      v.rationale, ma.title AS title_a, mb.title AS title_b
                FROM match_verdicts v
                LEFT JOIN markets ma ON ma.venue=v.venue_a AND ma.market_id=v.market_a
                LEFT JOIN markets mb ON mb.venue=v.venue_b AND mb.market_id=v.market_b
@@ -1099,6 +1099,16 @@ class Store:
         pairs = []
         for r in rows:
             ta, tb = r["title_a"] or "", r["title_b"] or ""
+            # idparse verdicts verified metric/threshold/scope DETERMINISTICALLY at
+            # match time — the legacy title/series gates below were training wheels
+            # for the LLM matcher and rejected whole verified classes it never knew
+            # (safe_types killed 5,232 of 5,233 live MLB prop/total/spread pairs —
+            # the "why no MLB edges" of 2026-07-08). Rules-verify, divergence
+            # policies, fan-out and the empirical gate all still apply downstream.
+            if (r["rationale"] or "") == "idparse":
+                pairs.append((r["venue_a"], r["market_a"], r["venue_b"], r["market_b"],
+                              r["event_key"]))
+                continue
             if drop_scope_mismatch and scope_mismatch(ta, tb):
                 continue
             # Identifier-level scope: filters CACHED verdicts too, so handicap/half
