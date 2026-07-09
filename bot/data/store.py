@@ -897,7 +897,8 @@ class Store:
                 # in the WIDER window" is the SUBSET claim, so the windfall side
                 # flips to the narrower venue (an ET-only goal must make both legs
                 # WIN, never both lose — the ESP-BEL ftts-none shape).
-                pm_l = pm.lower()
+                pm_id = r["market_a"] if r["venue_a"] == "polymarket_us" else r["market_b"]
+                pm_l = (pm_id or "").lower()
                 if pm_l.endswith("-none") or "-none-" in pm_l or ka.upper().endswith("-NONE"):
                     yes_venue = (r["venue_b"] if yes_venue == r["venue_a"]
                                  else r["venue_a"])

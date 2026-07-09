@@ -1004,7 +1004,15 @@ async def stream(
             engine.pair_edge_floor = {k: v[1] for k, v in pol.items()
                                       if v[0] == "edge_floor" and v[1] > 0}
         except Exception as exc:
-            log.warning("verified-pairs refresh failed: %s", exc)
+            if not engine.one_way_yes and not engine.rules_checked:
+                # No last-good safety maps exist (boot-time failure): streaming
+                # without the one-way lane traded the SUI-COL shape for 2.5h
+                # (NameError, 2026-07-09). Refuse to run unprotected — a crash
+                # loop is visible; an unmanned gate is not.
+                raise
+            log.error("SAFETY-MAP refresh failed — keeping last-good maps "
+                      "(one-way %d, floors %d): %s",
+                      len(engine.one_way_yes), len(engine.pair_edge_floor), exc)
         await refresh_balances()
         # THREAD, not inline: the fingerprint sweep is ~50s of pure CPU on the
         # unbounded 80k-market board — run inline it starves the WS keepalives

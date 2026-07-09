@@ -493,3 +493,27 @@ def test_pair_key_matches_confirmedpair_key_format():
     p = ConfirmedPair("e", "kalshi", "K1", "polymarket_us", "P1")
     assert Store._pair_key("kalshi", "K1", "polymarket_us", "P1") == p.key
     assert Store._pair_key("polymarket_us", "P1", "kalshi", "K1") == p.key
+
+
+def test_divergence_policies_one_way_directions_including_none_flip(tmp_path):
+    # The NONE outcome inverts the timing-scope windfall side; and this function
+    # crashing (NameError, 2026-07-09) silently EMPTIED the one-way lane for 2.5h —
+    # it must compute for both outcome shapes.
+    from bot.data.store import Store
+    st = Store(str(tmp_path / "t.db"))
+    st.record_rules_verdict("kalshi", "KXWCFTTS-26JUL11ARGSUI-ARG",
+                            "polymarket_us", "astatc-fwc-arg-sui-2026-07-11-ftts-arg",
+                            identical=False, confidence=1.0, rationale="A includes ET",
+                            divergence="timing_scope", stricter_side="B")
+    st.record_rules_verdict("kalshi", "KXWCFTTS-26JUL09FRAMAR-NONE",
+                            "polymarket_us", "astatc-fwc-fra-mar-2026-07-09-ftts-none",
+                            identical=False, confidence=1.0, rationale="A includes ET",
+                            divergence="timing_scope", stricter_side="B")
+    pol = st.pair_divergence_policies()
+    k1 = st._pair_key("kalshi", "KXWCFTTS-26JUL11ARGSUI-ARG",
+                      "polymarket_us", "astatc-fwc-arg-sui-2026-07-11-ftts-arg")
+    k2 = st._pair_key("kalshi", "KXWCFTTS-26JUL09FRAMAR-NONE",
+                      "polymarket_us", "astatc-fwc-fra-mar-2026-07-09-ftts-none")
+    assert pol[k1][0] == "one_way" and pol[k1][2] == "kalshi"      # scoring: wider side
+    assert pol[k2][0] == "one_way" and pol[k2][2] == "polymarket_us"  # NONE: flipped
+    st.close()
