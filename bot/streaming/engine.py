@@ -1033,8 +1033,25 @@ class StreamingEngine:
 
         Returns the last ExecutionReport produced (or None). The cooldown prevents
         re-firing the same pair on every tick.
-        """
+
+        TOP-OF-LADDER FILTER: the per-event book feed delivers ~280 msg/s (30x the
+        old conflated ticker) and most deltas touch DEEP levels that change nothing
+        actionable. Evaluating every one saturated the CPU (90%) and starved WS
+        pong reads (periodic 1011 disconnects). A delta that leaves the top ask,
+        its size, and the second level unchanged cannot change any edge decision —
+        update the book, skip the eval."""
+        prev = self.livebook.get(q.venue, q.market_id)
         self.livebook.update(q)
+        if prev is not None and q.exchange_ts is not None:
+            def _head(x):
+                yl = getattr(x, "yes_ask_levels", None)
+                nl = getattr(x, "no_ask_levels", None)
+                return (x.yes_ask, x.yes_ask_size, x.no_ask, x.no_ask_size,
+                        yl[1] if yl and len(yl) > 1 else None,
+                        nl[1] if nl and len(nl) > 1 else None)
+            if _head(prev) == _head(q):
+                self._ws_counts[q.venue] = self._ws_counts.get(q.venue, 0) + 1
+                return None
         self.note_feed_lag(q)
         if getattr(q, "state", None):
             self._market_state[(q.venue, q.market_id)] = q.state
