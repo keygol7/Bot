@@ -2194,15 +2194,19 @@ def test_horizon_gate_blocks_thin_longdated_entry():
     o.edge_per_contract = 0.02                    # thin
     o.settle_ts = _time.time() + 90 * 86400       # 90 days out
     assert asyncio.run(ex.execute(o)).status is ExecStatus.SKIPPED
-    # fat edge on the same long-dated market -> allowed
+    # capital-yield policy (2026-07-09): even a fat 8c edge is 0.09%/day over 90
+    # days -> still skipped; the same edge settling within 8 days passes
     o.edge_per_contract = 0.08
+    assert asyncio.run(ex.execute(o)).status is ExecStatus.SKIPPED
+    o.settle_ts = _time.time() + 7 * 86400
     assert asyncio.run(ex.execute(o)).status is ExecStatus.SUCCESS
     # near-dated thin edge -> allowed (fresh venues so the scripted fills aren't drained)
     yes2 = FakeVenue("kalshi", [res("kalshi", Side.YES, OrderStatus.FILLED, 2, 0.40)])
     no2 = FakeVenue("poly", [res("poly", Side.NO, OrderStatus.FILLED, 2, 0.55)])
     ex2, _ = make_exec([yes2, no2])
     ex2.max_settle_days = 30.0; ex2.longdated_min_edge = 0.05
-    o2 = opp(); o2.edge_per_contract = 0.02; o2.settle_ts = _time.time() + 5 * 86400
+    # yield policy: 2c pays for two days, not five
+    o2 = opp(); o2.edge_per_contract = 0.02; o2.settle_ts = _time.time() + 1.5 * 86400
     assert asyncio.run(ex2.execute(o2)).status is ExecStatus.SUCCESS
 
 
@@ -2435,3 +2439,42 @@ def test_taker_leg2_partial_topup_fails_settles_matched_unwinds_rest():
                                         yes_price=0.46, no_price=0.49)))
     assert report.status is ExecStatus.UNWOUND
     assert not ex.risk.is_killed                        # flat, no manual reconcile
+
+
+def test_capital_yield_entry_gate():
+    # policy 2026-07-09: edge must pay >= 1%/day of holding — 2c buys two days
+    import time as _t
+    from dataclasses import replace
+    kalshi = FakeVenue("kalshi", []); poly = FakeVenue("poly", [])
+    ex, _ = make_exec([kalshi, poly])
+    ex.min_daily_yield = 0.01
+    o = opp(yv="poly", nv="kalshi", yes_price=0.40, no_price=0.58)   # 2c edge
+    o = replace(o, settle_ts=_t.time() + 5 * 86400)                  # 5 days out
+    skip = ex._horizon_skip(o)
+    assert skip and "capital yield" in skip
+    o2 = replace(o, settle_ts=_t.time() + 1.5 * 86400)               # 1.5 days out
+    assert ex._horizon_skip(o2) is None
+
+
+def test_capital_yield_early_exit_accepts_bounded_haircut():
+    # a pair locked at 0.98 settling in 100 days earns ~0.02%/day — the exit is
+    # acceptable down to entry x (1 - 1%), not only at a profit
+    from types import SimpleNamespace
+    import time as _t
+    kalshi = FakeVenue("kalshi", []); poly = FakeVenue("poly", [])
+    ex, _ = make_exec([kalshi, poly])
+    ex.min_daily_yield = 0.01
+    ex.early_exit_min_bid_depth = 0.0
+    ex.early_exit_margin = 0.005
+    ex._positions = {("kalshi", "K1"): 10.0, ("poly", "P1"): -10.0}
+    pair_map = {("kalshi", "K1"): ("poly", "P1"), ("poly", "P1"): ("kalshi", "K1")}
+    far = _t.time() + 100 * 86400
+    quotes = {("kalshi", "K1"): SimpleNamespace(no_ask=0.40, no_ask_size=50,
+                                                yes_ask=None, yes_ask_size=0, close_time=far),
+              ("poly", "P1"): SimpleNamespace(yes_ask=0.61, yes_ask_size=50,
+                                              no_ask=None, no_ask_size=0, close_time=far)}
+    # exit value = (1-0.40)+(1-0.61) = 0.99 -> above 0.98*(1-0.01)=0.9702, below
+    # entry+margin -> old rule skipped it, yield rule takes it
+    entry = {ex._rpair_key("kalshi", "K1", "poly", "P1"): (0.58, 0.40)}
+    acts = ex.plan_early_exit(pair_map, quotes, entry)
+    assert acts, "under-yielding lock must exit at a bounded haircut"

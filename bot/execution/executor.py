@@ -332,6 +332,10 @@ class Executor:
         # static guard at fire time; this is the dynamic guard while resting). 0 = disabled
         # (rest blindly until fill/expiry — only safe with a large arm cushion).
         self.maker_poll = maker_poll
+        # Capital-yield floor: a lock must earn at least this fraction of its
+        # capital PER DAY of holding (0 disables). Policy 2026-07-09: 1%/day.
+        import os as _os
+        self.min_daily_yield = float(_os.getenv("RISK_MIN_DAILY_YIELD", "0.01"))
         # Optional callable (venue_name, market_id) -> latest streamed MarketQuote;
         # wired by the streaming host so rest-window drift checks read the WS book.
         self.live_quote = None
@@ -865,17 +869,29 @@ class Executor:
         return None
 
     def _horizon_skip(self, opp) -> str | None:
-        """Capital-horizon gate: don't lock capital in a far-out settlement unless the
-        edge is fat enough to justify the wait. A thin edge on a November election ties
-        up cash for months; the early-exit loop can only free it opportunistically."""
-        if self.max_settle_days <= 0 or not opp.settle_ts:
+        """CAPITAL-YIELD gate (policy 2026-07-09): capital may not be locked at under
+        ``min_daily_yield`` (1%/day) — the edge must pay for every day it is held:
+        edge >= days_to_settle x 1%. A 1c edge justifies a 1-day hold, 5c buys five
+        days; a November election needs an edge no real arb has (the $112 CA-gov
+        lock earned 0.015%/day for 4 months). Same-day settles always pass."""
+        if not opp.settle_ts:
             return None
-        days = (opp.settle_ts - time.time()) / 86400.0
-        if days > self.max_settle_days and opp.edge_per_contract < self.longdated_min_edge:
+        days = max(0.0, (opp.settle_ts - time.time()) / 86400.0)
+        if days <= 1.0 or self.min_daily_yield <= 0:
+            legacy = None
+        else:
+            need = days * self.min_daily_yield
+            if opp.edge_per_contract < need - 1e-9:
+                return (f"horizon: settles in {days:.1f}d and edge "
+                        f"{opp.edge_per_contract:.3f} < {need:.3f} needed for "
+                        f"{self.min_daily_yield:.1%}/day capital yield")
+            legacy = None
+        if self.max_settle_days > 0 and days > self.max_settle_days \
+                and opp.edge_per_contract < self.longdated_min_edge:
             return (f"horizon: settles in {days:.0f}d (> {self.max_settle_days:.0f}d) and "
                     f"edge {opp.edge_per_contract:.3f} < long-dated min "
                     f"{self.longdated_min_edge:.3f} — capital better used near-dated")
-        return None
+        return legacy
 
     def recycle_trigger(self) -> tuple[str, str] | None:
         """(drained, funded) when the recycler should act: one venue's REAL cash below
@@ -1119,8 +1135,20 @@ class Executor:
                          + per_contract_fee(self._fee(counter[0]), cbid))
             exit_value = round(bid + cbid - exit_fees, 4)
             entry_cost = entry[0] + entry[1]
-            if exit_value < entry_cost + self.early_exit_margin - 1e-9:
-                continue                         # market isn't offering a profitable exit
+            required = entry_cost + self.early_exit_margin
+            if self.min_daily_yield > 0 and entry_cost > 0:
+                closes = [t for t in (q.close_time, cq.close_time) if t]
+                if closes:
+                    days = max(1.0, (min(closes) - time.time()) / 86400.0)
+                    rem_rate = (1.0 - entry_cost) / (entry_cost * days)
+                    if rem_rate < self.min_daily_yield:
+                        # CAPITAL-YIELD policy: this lock earns under 1%/day for the
+                        # rest of its life — freeing the capital is worth up to one
+                        # day's yield as a haircut (redeployment repays it in a day;
+                        # the $112 CA-gov lock sat 4 months at 0.015%/day).
+                        required = entry_cost * (1.0 - self.min_daily_yield)
+            if exit_value < required - 1e-9:
+                continue                         # market isn't offering an acceptable exit
             # itm = higher-bid leg (sold first); otm = cheaper leg (a partial leaves the
             # LEAST capital exposed as the remnant).
             legs = sorted([(bid, venue, market, side), (cbid, counter[0], counter[1], cside)],
