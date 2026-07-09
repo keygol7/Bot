@@ -907,6 +907,13 @@ class StreamingEngine:
     async def _run_take(self, key, p, opp, edge, yq, nq, size) -> None:
         """Run a hybrid TAKE to completion off the quote loop, then log + book it."""
         try:
+            trig = max(getattr(yq, "timestamp", 0.0) or 0.0,
+                       getattr(nq, "timestamp", 0.0) or 0.0)
+            if trig > 0:
+                lat_ms = (time.time() - trig) * 1000.0
+                self._fire_lat_max = max(getattr(self, "_fire_lat_max", 0.0), lat_ms)
+                log.info("STREAM %s: fire latency %.0fms (tick arrival -> order send)",
+                         p.event_key, lat_ms)
             report = await self.executor.execute(opp)
             if (getattr(report, "status", None) is not None
                     and str(getattr(report, "reason", "")).startswith("leg1 not filled")):
@@ -1328,15 +1335,21 @@ class StreamingEngine:
                 return True
         return False
 
-    async def prime_and_sweep(self):
-        """Seed the live book with a REST snapshot of every watchlist market, then
+    async def prime_and_sweep(self, only_markets=None):
+        """Seed the live book with a REST snapshot of watchlist markets, then
         edge-check every pair once. Closes the gap where a venue's WS (Kalshi ticker)
         only emits on price *change*, so a stable-priced leg would otherwise never
         enter the book — leaving real edges undetected until the price happened to move.
-        """
+
+        ``only_markets``: prime just this subset (the NEW markets of a resubscribe
+        diff) — carried-over markets already hold live books, and full primes of a
+        ~3k-market watchlist took ~6 minutes."""
         if self.depth_fetch is None:
             return
-        items = list(self._index)
+        items = list(self._index) if only_markets is None else [
+            m for m in self._index if m in only_markets]
+        if only_markets is not None and not items:
+            log.info("prime: no new markets — sweeping existing books only")
         # Fetch the snapshots CONCURRENTLY (bounded) instead of one-at-a-time: a sequential
         # sweep of ~140 legs takes >a minute, which both delays picking up newly-listed
         # markets and widens the window where the book is half-primed. Concurrency collapses
@@ -1388,11 +1401,17 @@ class StreamingEngine:
         consumers: list = []
         subscribed: dict[str, tuple] = {}
 
+        prime_task: list = []
+        prev_markets: set = set()
+
         async def _resubscribe() -> None:
             for c in consumers:
                 c.cancel()
             await asyncio.gather(*consumers, return_exceptions=True)
             consumers.clear()
+            for t in prime_task:
+                t.cancel()                     # stale prime for the OLD market set
+            prime_task.clear()
             # A consumer we just cancelled may have spawned an execution; the shielded
             # task survives. Settle every order before resubscribing — never stream a
             # new market set with an order ambiguously in flight.
@@ -1400,10 +1419,18 @@ class StreamingEngine:
                 log.warning("waiting for %d in-flight execution(s) to settle "
                             "before resubscribe", len(self._inflight))
                 await self.drain()
-            # Seed the book with REST snapshots so a quiet (non-ticking) leg doesn't
-            # leave pairs blind, and catch any edge already present at refresh time.
-            await self.prime_and_sweep()
+            # STREAM FIRST: the livebook retains last-good quotes and the kalshi
+            # book channel self-primes via snapshots on subscribe — tearing the
+            # consumers down for the whole REST prime left the fast path DARK ~6
+            # minutes per resubscribe (17x in 3h observed = dark a third of the
+            # evening). Prime runs in the BACKGROUND, and only for the markets
+            # NEW to this subscription (carried-over books are already live).
             consumers.extend(asyncio.create_task(self._consume(v)) for v in venues)
+            new_markets = set(self._index) - prev_markets
+            prev_markets.clear()
+            prev_markets.update(self._index)
+            prime_task.append(asyncio.create_task(
+                self.prime_and_sweep(only_markets=new_markets)))
 
         try:
             while True:
@@ -1436,7 +1463,9 @@ class StreamingEngine:
                 if dead:
                     log.warning("WS health: %s — NO quotes this interval from %s", counts, dead)
                 else:
-                    log.info("WS health: %s quotes this interval", counts)
+                    log.info("WS health: %s quotes this interval | max fire latency "
+                             "%.0fms", counts, getattr(self, "_fire_lat_max", 0.0))
+                    self._fire_lat_max = 0.0
                 await self.log_edge_snapshot()
         finally:
             for c in consumers:

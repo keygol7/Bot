@@ -1749,3 +1749,46 @@ def test_aligned_edge_separates_standing_from_skew_phantom(monkeypatch):
     p_old2 = q("poly", "P1", yes_ask=0.40, ya=50); p_old2.exchange_ts = now - 0.35
     eng2.livebook.update(p_old2); eng2.livebook.update(p_new)
     assert eng2._aligned_edge_ok(p_new, kq)
+
+
+def test_resubscribe_streams_before_prime_completes():
+    # THE dark-window regression test: a prime that never finishes must NOT block
+    # quote consumption — consumers start first, prime runs in the background.
+    # (Observed live: ~6min REST primes with consumers torn down, 17x in 3h.)
+    import asyncio as aio
+
+    ex = FakeExec()
+    eng = make_engine(ex)
+    blocked = aio.Event()
+
+    async def never_fetch(venue, market):
+        blocked.set()
+        await aio.Event().wait()               # prime hangs forever
+
+    eng.depth_fetch = never_fetch
+    eng.prime_concurrency = 2
+    consumed = []
+
+    class _V:
+        name = "kalshi"
+        async def stream_order_book(self, mids):
+            consumed.append(list(mids))
+            q1 = q("kalshi", "K1", no_ask=0.55, na=50)
+            yield q1
+            await aio.Event().wait()
+
+    async def refresh():
+        return [ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")]
+
+    async def main():
+        task = aio.create_task(eng.run([_V()], refresh, refresh_interval=9999))
+        await aio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except aio.CancelledError:
+            pass
+
+    aio.run(main())
+    assert consumed, "consumers never started while prime was blocked"
+    assert blocked.is_set(), "background prime never ran"
