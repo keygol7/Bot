@@ -127,8 +127,14 @@ _SLUG_HANDICAP = re.compile(r"-(?:neg|pos)-\d+(?:pt\d+)?(?:-|$)")
 _SLUG_FIRST_HALF = re.compile(r"(?:^|-)fh-")
 _SLUG_SECOND_HALF = re.compile(r"(?:^|-)sh-")
 _SLUG_EXTRA_TIME = re.compile(r"-et-")                  # incl.-extra-time lines (-et-neg-0pt5)
+# partial-game periods: -f5- (first five innings) etc. A full-GAME winner matched
+# an atc-...-f5-... slug through the FINGERPRINT arm (the idparse arm scopes it) and
+# streamed 1,435 one-way blocks of a 4c phantom edge (AZ-SD, 2026-07-09) — F5 vs
+# full game is a DIFFERENT event (the leader after 5 loses the game ~15-20%).
+_SLUG_PART_GAME = re.compile(r"(?:^|-)f([2-9])-")   # f5 innings etc; NOT -f1- (Formula 1 league slug)
 _KALSHI_ID_SCOPE = (("SPREAD", "handicap"), ("HANDICAP", "handicap"),
-                    ("1H", "first_half"), ("2H", "second_half"), ("HALF", "first_half"))
+                    ("1H", "first_half"), ("2H", "second_half"), ("HALF", "first_half"),
+                    ("F5", "f5"))
 
 
 def id_scope_tags(market_id: str) -> frozenset[str]:
@@ -151,6 +157,9 @@ def id_scope_tags(market_id: str) -> frozenset[str]:
             tags.add("second_half")
         if _SLUG_EXTRA_TIME.search(s):
             tags.add("extra_time")
+        m = _SLUG_PART_GAME.search(s)
+        if m:
+            tags.add(f"f{m.group(1)}")
     return frozenset(tags)
 
 
