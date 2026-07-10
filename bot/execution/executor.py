@@ -1946,12 +1946,19 @@ class Executor:
             return await self.execute(opp)   # neither leg on the maker venue -> taker path
 
         size, caps = self._max_size(opp, depth_override=hedge_depth)
+        if size < 1:
+            # nothing fireable regardless of the hedge book — say so (193 skips/h
+            # were logged as "thin hedge" while the true blocker was size 0)
+            binding = min(caps, key=caps.get)
+            return ExecutionReport(
+                ExecStatus.SKIPPED,
+                f"size < 1 contract (binding: {binding}={caps[binding]:.3f})")
         if self.min_leg_depth > 0:
-            # Scale the depth bar with the size we would ACTUALLY fire: a 1-2ct
-            # probe needs ~3 of hedge depth, not the full static minimum — the
-            # static bar skipped ~260 probe-size opportunities/day on books that
-            # could hedge them 3x over. Larger fires keep the full bar.
-            need = max(3.0, min(float(self.min_leg_depth), 2.0 * max(size, 1)))
+            # Hedge cover proportional to the fire: size + 1 spare. The old flat
+            # min-3 predates the ceiling/top-up/partial machinery — a thin-hedge
+            # failure now bounds at ~a 0c lock, so a 1ct arb with a 2ct band is
+            # worth taking; larger fires still demand real cover.
+            need = min(float(self.min_leg_depth), float(size) + 1.0)
             if hedge_depth < need:
                 top = opp.yes_size if taker[2] is Side.YES else opp.no_size
                 return ExecutionReport(
