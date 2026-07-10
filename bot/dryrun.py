@@ -942,6 +942,12 @@ async def stream(
                 log.warning("pending-payout refresh failed: %s", exc)
             # Cross-venue naked-exposure backstop: catch a position whose hedge never
             # landed (the failure mode behind the Ruzic loss), not just at startup.
+            _vmap = {v.name: v for v in venues}
+
+            async def _snap_one(vn):
+                fn = getattr(_vmap.get(vn), "account_snapshot", None)
+                return await fn() if fn else None
+            engine.snapshot_fn = _snap_one
             await engine.reconcile_positions(snaps)
 
     _pending_cache: dict = {}          # (venue, market) -> (verdict_ts, counts: bool)

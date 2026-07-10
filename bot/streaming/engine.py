@@ -255,6 +255,9 @@ class StreamingEngine:
         # (dryrun.rules_fast_lane) judges it within one LLM call instead of waiting
         # for the pass-based loop (hot pairs blocked ~1000 ticks over 15 min).
         self.rules_priority_q = None            # asyncio.Queue set by the host
+        # async (venue_name) -> AccountSnapshot, for confirmatory re-reads before
+        # naked verdicts (partial venue position lists)
+        self.snapshot_fn = None
         self._rules_enqueued: set = set()
         self._rules_block_logged: dict = {}
         self._fat_logged: dict = {}     # rate-limit for the block log line
@@ -1354,6 +1357,33 @@ class StreamingEngine:
                     log.info("RECONCILE: %s imbalance (Δ%g) is DUST (mark value $%.2f, "
                              "bid %s) — cost sunk, nothing to protect; settling out",
                              p.event_key, qty, value, f"{bid:.2f}" if bid else "none")
+                    continue
+                kept.append((p, qa, qb))
+            imbalanced = kept
+
+        # CONFIRMATORY RE-READ: the venue positions API can serve PARTIAL lists
+        # (poly 2026-07-10: two long-held hedges read 0 while a direct read a
+        # minute later showed both present — a subtler flap than the all-empty
+        # venue-down case). Before any naked verdict, re-read the zero side once;
+        # if the "missing" position reappears, it was a stale/partial read.
+        if imbalanced and self.snapshot_fn is not None:
+            kept = []
+            reread: dict = {}
+            for p, qa, qb in imbalanced:
+                zv = p.venue_a if abs(qa) < abs(qb) else p.venue_b
+                zm = p.market_a if abs(qa) < abs(qb) else p.market_b
+                try:
+                    if zv not in reread:
+                        snap = await self.snapshot_fn(zv)
+                        reread[zv] = {pos.market_id: float(pos.quantity)
+                                      for pos in (snap.positions if snap else [])}
+                    q2 = reread[zv].get(zm, 0.0)
+                except Exception:
+                    q2 = 0.0
+                if abs(q2) >= 1.0:
+                    log.warning("RECONCILE: %s zero-leg REAPPEARED on re-read "
+                                "(%s=%g) — partial venue read, not naked",
+                                p.event_key, zm, q2)
                     continue
                 kept.append((p, qa, qb))
             imbalanced = kept
