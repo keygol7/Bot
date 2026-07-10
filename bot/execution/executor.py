@@ -332,6 +332,12 @@ class Executor:
         # the family's observed slip is the true cost of being picked off there,
         # and it joins the ARM bar so hostile books price themselves out.
         self._maker_slip: dict = {}
+        # TAKER fire slip: EWMA of (detected edge - realized/ct) per kalshi family.
+        # In-play books lag the WS view (~300-500ms kalshi), so fills land at
+        # ceiling-minus instead of detected — 12 of 20 locks booked negative in a
+        # 45min in-play sample. The family's observed slip joins the entry bar so
+        # stale-feed families demand the slip up front and fills land positive.
+        self._fire_slip: dict = {}
         # While a maker rests, poll the taker leg every this-many seconds; if it drifts so
         # the hedge could no longer lock the floor, CANCEL the maker before it fills into
         # the adverse move. This is what makes arming THIN edges safe (the cushion is the
@@ -823,6 +829,23 @@ class Executor:
                 tzinfo=_tz.utc).timestamp()
         except ValueError:
             return None
+
+    def _fire_slip_for(self, opp) -> float:
+        kalshi_leg = (opp.buy_yes_market if opp.buy_yes_venue == "kalshi"
+                      else opp.buy_no_market if opp.buy_no_venue == "kalshi" else None)
+        if not kalshi_leg:
+            return 0.0
+        return self._fire_slip.get(_family("kalshi", kalshi_leg), 0.0)
+
+    def _note_fire_slip(self, opp, realized_per_ct: float) -> None:
+        kalshi_leg = (opp.buy_yes_market if opp.buy_yes_venue == "kalshi"
+                      else opp.buy_no_market if opp.buy_no_venue == "kalshi" else None)
+        if not kalshi_leg:
+            return
+        fam = _family("kalshi", kalshi_leg)
+        slip = max(0.0, (opp.edge_per_contract or 0.0) - realized_per_ct)
+        prev = self._fire_slip.get(fam, 0.0)
+        self._fire_slip[fam] = round(0.8 * prev + 0.2 * slip, 4)
 
     def _family_slip(self, venue_name: str, market_id: str) -> float:
         return self._maker_slip.get(_family(venue_name, market_id), 0.0)
@@ -1450,7 +1473,7 @@ class Executor:
         # just unwind. We only fire when the edge can pay the hedge buffer AND still lock
         # the floor, so the hedge fills through normal book movement (no unwind).
         floor = self.min_lock_edge if self.min_lock_edge is not None else self.risk.limits.min_edge
-        req_buffer = self._hedge_buffer_for(opp.max_contracts)
+        req_buffer = self._hedge_buffer_for(opp.max_contracts) + self._fire_slip_for(opp)
         if opp.edge_per_contract < floor + req_buffer - 1e-9:
             return ExecutionReport(
                 ExecStatus.SKIPPED,
@@ -2344,6 +2367,11 @@ class Executor:
             self.store.record_opportunity(opp, acted=True)
         self._audit("execute_success", opp, pnl=pnl)
         log.info("ARB LOCKED %s | pnl=%+.2f", opp.event_key, pnl)
+        try:
+            if size >= 1:
+                self._note_fire_slip(opp, pnl / size)
+        except Exception:
+            pass
         return ExecutionReport(ExecStatus.SUCCESS, "both legs filled", list(legs), pnl)
 
     async def _settle_partial_hedge(

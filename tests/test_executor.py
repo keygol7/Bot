@@ -2577,3 +2577,17 @@ def test_maker_degrades_to_taker_in_play():
     report = asyncio.run(ex.execute_maker(o))
     # taker path evidence: leg1 attempted as IOC BUY (killed -> clean skip), no rest
     assert report.status is ExecStatus.SKIPPED and "leg1" in report.reason
+
+
+def test_fire_slip_raises_the_entry_bar():
+    # a family whose fills consistently realize 1.5c under the detected edge must
+    # demand that slip up front — thin edges stop firing there, fat ones still do
+    kalshi = FakeVenue("kalshi", []); poly = FakeVenue("poly", [])
+    ex, _ = make_exec([kalshi, poly])
+    o = opp(yv="poly", nv="kalshi", max_contracts=10, yes_price=0.40, no_price=0.585)
+    for _ in range(8):
+        ex._note_fire_slip(o, (o.edge_per_contract or 0.015) - 0.015)
+    assert ex._fire_slip_for(o) > 0.01
+    report = asyncio.run(ex.execute(o))     # 1.5c edge < floor + slip -> skip
+    assert report.status is ExecStatus.SKIPPED and "hedge" in report.reason
+    assert kalshi.calls == [] and poly.calls == []
