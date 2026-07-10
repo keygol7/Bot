@@ -620,9 +620,11 @@ def events_align(a: MarketKey, b: MarketKey) -> bool:
     """Same underlying event: dates equal when both known (±1 day for timezone skew);
     with a one-sided date, the season year must not conflict and the event tokens must
     share identity. Event tokens align by containment either way."""
+    date_skewed = False
     if a.event_date and b.event_date:
         if abs((a.event_date - b.event_date).days) > 1:
             return False
+        date_skewed = a.event_date != b.event_date
     else:
         ya = a.event_year or (a.event_date.year if a.event_date else None)
         yb = b.event_year or (b.event_date.year if b.event_date else None)
@@ -659,6 +661,16 @@ def events_align(a: MarketKey, b: MarketKey) -> bool:
         return bool(a.event_date and b.event_date)
     small, big = (ea, eb) if len(ea) <= len(eb) else (eb, ea)
     hits = sum(1 for t in small if any(t in o or o in t for o in big if len(t) >= 2))
+    if date_skewed:
+        # +/-1-day tolerance exists for TIMEZONE skew of the SAME matchup — with
+        # dates differing, one shared token is not enough: LAA played TEX on the
+        # 9th and MIN on the 10th, and 'laa' alone married the two totals boards
+        # (Over 11.5, traded 18 fills before the audit). Both sides must FULLY
+        # cover each other (kalshi fuses matchups into one code: 'laatex' covers
+        # {laa, tex} but not {laa, min}).
+        def _covered(xs, ys):
+            return all(any(x in y or y in x for y in ys if len(x) >= 2) for x in xs)
+        return _covered(ea, eb) and _covered(eb, ea)
     if hits >= 1:
         return True
     # abbreviation codes: one side's compact event code segments over the other's tokens
