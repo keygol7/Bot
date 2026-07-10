@@ -258,6 +258,11 @@ class StreamingEngine:
         # async (venue_name) -> AccountSnapshot, for confirmatory re-reads before
         # naked verdicts (partial venue position lists)
         self.snapshot_fn = None
+        # (venue, market) -> (qty, ts) last time a snapshot INCLUDED the position;
+        # a zero-read younger than the grace window against a recent sighting is a
+        # PARTIAL venue read, not a disappearance (poly served lists missing 2-3
+        # long-held positions repeatedly, 2026-07-10)
+        self._pos_last_seen: dict = {}
         self._rules_enqueued: set = set()
         self._rules_block_logged: dict = {}
         self._fat_logged: dict = {}     # rate-limit for the block log line
@@ -1177,6 +1182,12 @@ class StreamingEngine:
         """
         pos: dict[tuple[str, str], float] = {}
         venue_open: dict[str, int] = {}          # per-venue count of open positions (for down-detect)
+        now_seen = self.clock()
+        for snap in snapshots or []:
+            for _vp in (getattr(snap, "positions", None) or []):
+                if abs(float(getattr(_vp, "quantity", 0.0))) >= 1.0:
+                    self._pos_last_seen[(snap.venue, _vp.market_id)] = (
+                        float(_vp.quantity), now_seen)
         for snap in snapshots or []:
             venue = getattr(snap, "venue", None)
             venue_open.setdefault(venue, 0)
@@ -1384,6 +1395,15 @@ class StreamingEngine:
                     log.warning("RECONCILE: %s zero-leg REAPPEARED on re-read "
                                 "(%s=%g) — partial venue read, not naked",
                                 p.event_key, zm, q2)
+                    continue
+                seen_q, seen_ts = self._pos_last_seen.get((zv, zm), (0.0, 0.0))
+                if abs(seen_q) >= 1.0 and self.clock() - seen_ts < 1800.0:
+                    # seen alive within 30min and we placed no sells — correlated
+                    # stale reads (the immediate re-read drew the same cached list)
+                    log.warning("RECONCILE: %s zero-leg seen alive %.0fs ago (%s=%g) "
+                                "— treating as partial venue read; escalates only "
+                                "if absent >30min", p.event_key,
+                                self.clock() - seen_ts, zm, seen_q)
                     continue
                 kept.append((p, qa, qb))
             imbalanced = kept
