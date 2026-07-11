@@ -880,6 +880,14 @@ class Store:
             # prior stays the floor by construction)
             p_override = (hits + 1) / (total + 2) if total >= 1 else None
             pol = policy_for(dv, ka, p_override=p_override)
+            if pol.policy == "edge_floor" and dv == "cancellation_postponement":
+                # a game IN PLAY cannot be postponed — the risk the floor prices
+                # has expired. 1,580 blocks/hr of live MLB props at 0.8c sat under
+                # a 2c pre-game floor (2026-07-11).
+                from bot.execution.executor import Executor
+                st_ts = Executor._kalshi_start_ts(ka)
+                if st_ts is not None and time.time() >= st_ts:
+                    continue
             if pol.policy == "ignore":
                 continue
             # one-way YES side = the WIDER (non-stricter) venue; A is always kalshi
