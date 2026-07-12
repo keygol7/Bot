@@ -8,8 +8,8 @@ Binary mapping (prices in dollars, 0..1): ``bestAsk`` is the cost to buy YES; th
 NO ask is ``1 - bestBid`` (buying NO == taking the YES bid). NOTE: ``askDepth`` /
 ``bidDepth`` in the BBO/lite payload are the NUMBER OF PRICE LEVELS, not contract
 sizes, so real takeable size comes from the full ``/book`` (``offers``/``bids`` with
-``qty``) — see :func:`normalize_book`. Standard markets are ~zero-fee
--> :class:`ZeroFeeModel`.
+``qty``) — see :func:`normalize_book`. Taker trades pay ``0.05 * C * p * (1-p)``
+(published schedule, eff. 2026-04-03) -> :class:`PolymarketUSFeeModel`.
 
 Trading (later) uses the authenticated API (`api.polymarket.us`) with X-PM-* Ed25519
 headers — see :func:`build_auth_headers` / :func:`load_ed25519_key`. Read-only here.
@@ -21,12 +21,13 @@ import asyncio
 import base64
 import logging
 import math
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 from bot.execution.orders import OrderResult, OrderStatus
-from bot.fees import ZeroFeeModel
+from bot.fees import PolymarketUSFeeModel
 from bot.models import MarketQuote, Side
 from bot.timeutil import parse_iso8601
 from bot.venues.base import OrderNotPermitted, RawMarket
@@ -91,6 +92,14 @@ def parse_market_data(message: dict[str, Any]) -> MarketQuote | None:
         return None
     q = normalize_book(slug, "", md)
     q.timestamp = time.time()   # stamp WS arrival so the engine can gate on freshness
+    tt = md.get("transactTime")
+    if tt:
+        try:
+            # nanosecond ISO (2026-07-07T16:04:36.637955962Z): trim to micros
+            iso = re.sub(r"\.(\d{6})\d*", r".\1", str(tt)).replace("Z", "+00:00")
+            q.exchange_ts = datetime.fromisoformat(iso).timestamp()
+        except (ValueError, TypeError):
+            pass
     return q
 
 
@@ -109,6 +118,21 @@ _TIF = {
 _TERMINAL_FILLED = "ORDER_STATE_FILLED"
 _REJECTED = {"ORDER_STATE_REJECTED"}
 _KILLED = {"ORDER_STATE_CANCELED", "ORDER_STATE_EXPIRED"}
+
+
+_SLUG_DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+
+def _date_from_slug(slug: str) -> float | None:
+    """Game date embedded in a per-game slug (e.g. ``aec-mlb-kc-cws-2026-06-26``) as a UTC
+    timestamp, or None. Fallback for the matcher's resolve-date guard when endDate is null."""
+    m = _SLUG_DATE.search(slug or "")
+    if not m:
+        return None
+    try:
+        return datetime(int(m[1]), int(m[2]), int(m[3]), tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
 
 
 def _amount(value: Any) -> float | None:
@@ -227,7 +251,9 @@ def _parse_positions(body: Any):
                       or r.get("netShares")) or 0.0
         resting = int(r.get("openOrders") or r.get("restingOrders")
                       or r.get("resting_orders_count") or 0)
-        pos = VenuePosition(slug, qty, resting)
+        cost = abs(_amount((r.get("cost") or {}).get("value")
+                           if isinstance(r.get("cost"), dict) else r.get("cost")) or 0.0)
+        pos = VenuePosition(slug, qty, resting, cost=cost)
         if pos.is_open:
             out.append(pos)
     return out
@@ -272,8 +298,12 @@ def _parse_create_order_response(data: Any, requested: float, side: Side):
         order_id = terminal_order.get("id")
 
     avg_price = _amount(terminal_order.get("avgPx"))
-    # avgPx is the YES/long-side price; for a NO buy the cost is 1 - that.
-    if avg_price is not None and side is Side.NO:
+    # avgPx is the YES/long-side price; for a NO buy the cost is 1 - that. An UNFILLED
+    # order's avgPx is a meaningless 0 — leaving it set turns a KILLED order into a
+    # phantom @0.0 (YES) / @1.0 (NO) price in logs and accounting.
+    if filled <= 1e-9:
+        avg_price = None
+    elif avg_price is not None and side is Side.NO:
         avg_price = round(1.0 - avg_price, 6)
 
     if state == _STATE_FILLED or (requested > 0 and filled >= requested - 1e-9):
@@ -299,7 +329,11 @@ def _parse_order_snapshot(order: Any, requested: float, side: Side):
     cum = order.get("cumQuantity")
     filled = float(cum) if cum not in (None, "") else 0.0
     avg_price = _amount(order.get("avgPx"))
-    if avg_price is not None and side is Side.NO:      # avgPx is YES-side; NO cost = 1 - it
+    if filled <= 1e-9:
+        # An unfilled order's avgPx is a meaningless 0 — leaving it set turns a KILLED
+        # NO order into a phantom "@1.0" price (1 - 0) in logs/accounting.
+        avg_price = None
+    elif avg_price is not None and side is Side.NO:    # avgPx is YES-side; NO cost = 1 - it
         avg_price = round(1.0 - avg_price, 6)
     if state == _STATE_FILLED or (requested > 0 and filled >= requested - 1e-9):
         status = OrderStatus.FILLED
@@ -375,12 +409,15 @@ def normalize_book(
 
     yes_ask = no_ask = None
     yes_ask_size = no_ask_size = 0.0
+    y_lv = n_lv = None
     if offers:
-        px, qty = min(offers, key=lambda lvl: lvl[0])   # best (lowest) ask
-        yes_ask, yes_ask_size = px, qty
+        lv = sorted(offers, key=lambda l: l[0])[:8]      # best (lowest) ask first
+        y_lv = tuple(lv)
+        yes_ask, yes_ask_size = y_lv[0]
     if bids:
-        px, qty = max(bids, key=lambda lvl: lvl[0])      # best (highest) bid
-        no_ask, no_ask_size = round(1.0 - px, 6), qty
+        lv = sorted(bids, key=lambda l: -l[0])[:8]       # best (highest) bid first
+        n_lv = tuple((round(1.0 - p, 6), q) for p, q in lv)
+        no_ask, no_ask_size = n_lv[0]
 
     return MarketQuote(
         venue=VENUE,
@@ -391,6 +428,8 @@ def normalize_book(
         yes_ask_size=yes_ask_size,
         no_ask=no_ask,
         no_ask_size=no_ask_size,
+        yes_ask_levels=y_lv,
+        no_ask_levels=n_lv,
         state=market_data.get("state"),   # MARKET_STATE_OPEN / SUSPENDED / ... (for the gate)
     )
 
@@ -465,15 +504,19 @@ class PolymarketUSVenue:
 
     def __init__(self, cfg: Any, rate_per_min: float = 100.0) -> None:
         self.cfg = cfg
-        self.fee_model = ZeroFeeModel()
+        self.fee_model = PolymarketUSFeeModel()
         self._gateway_client = None  # public reads
         self._api_client = None      # authenticated trading (later)
         self._key = None
         self._limiter = AsyncRateLimiter(getattr(cfg, "read_rate_per_min", None) or rate_per_min)
+        # ORDERS must never queue behind scan/depth READ tokens (a hedge leg waiting on
+        # read tokens right after leg 1 fills = a widened naked window). Own bucket.
+        self._order_limiter = AsyncRateLimiter(240.0, burst=20)
         # Per-slug order constraints (orderPriceMinTickSize / minimumTradeQty) captured
         # during scan_quotes, so place_order can round price/qty to valid increments
         # without a hot-path fetch. The docs warn NOT to infer these from slug/type.
         self._meta: dict[str, dict[str, float | None]] = {}
+        self._descriptions: dict[str, str] = {}   # slug -> resolution rules text (from scan)
 
     @property
     def is_trading_configured(self) -> bool:
@@ -543,7 +586,21 @@ class PolymarketUSVenue:
             "min_qty": _amount(m.get("minimumTradeQty")),
             "volume24hr": v24,
         }
-        close_time = parse_iso8601(m.get("endDate"))
+        # Resolution rules text, free in the scan payload — the rules-verification
+        # layer reads it via market_rules() (no per-market fetch needed).
+        desc = m.get("description")
+        if desc:
+            self._descriptions[slug] = str(desc)
+        # Per-game markets often carry endDate=None, which left the matcher's resolve-date
+        # guard with no Polymarket date to compare -> it failed OPEN and matched same-teams
+        # games on DIFFERENT dates (a Kalshi June-30 KC@CWS paired with a Poly June-26 one;
+        # when June-26 settled the Kalshi leg was stranded). The game date is in the slug
+        # (...-2026-06-26...), so fall back to it so the date-gap guard can actually fire.
+        # SLUG DATE FIRST: poly's endDate is an ADMIN date, not the event date —
+        # a July 9 game carries endDate=Nov 6, which made a 7-day close window
+        # drop 99.7% of the board (31 of ~9.7k markets, watchlist 0, 2026-07-08).
+        # The slug date is the real event/settlement date.
+        close_time = _date_from_slug(slug) or parse_iso8601(m.get("endDate"))
         # Targeted window: skip markets closing past it (keep unknown close).
         if max_close_ts is not None and close_time is not None and close_time > max_close_ts:
             return None
@@ -711,11 +768,37 @@ class PolymarketUSVenue:
     async def stream_order_book(self, market_ids: list[str]) -> AsyncIterator[MarketQuote]:
         """Stream real-time SIZED top-of-book via the markets WS (MARKET_DATA full book).
 
-        Requires credentials (the markets WS is on the authenticated API, unlike the
-        public REST gateway). Subscribes in batches of 100 slugs; reconnects with
-        exponential backoff; ignores heartbeats. Uses the full-book channel (not the
-        lite BBO) so the streamed quote carries real per-level size.
+        SHARDED across connections: the venue caps subscriptions per connection
+        ("max subscriptions per connection reached" at ~1,480 slugs, 2026-07-08 —
+        everything past the cap silently got NO live feed). Each shard of
+        POLY_WS_MAX_SUBS slugs (default 400) runs its own connection with the
+        original reconnect loop; quotes merge through a queue.
         """
+        import os
+        max_subs = int(os.getenv("POLY_WS_MAX_SUBS", "400"))
+        if market_ids and len(market_ids) > max_subs:
+            queue: asyncio.Queue = asyncio.Queue(maxsize=4096)
+
+            async def _pump(shard):
+                async for quote in self._stream_order_book_single(shard):
+                    await queue.put(quote)
+
+            shards = [market_ids[i:i + max_subs]
+                      for i in range(0, len(market_ids), max_subs)]
+            log.info("polymarket ws: sharding %d slugs across %d connections",
+                     len(market_ids), len(shards))
+            tasks = [asyncio.create_task(_pump(sh)) for sh in shards]
+            try:
+                while True:
+                    yield await queue.get()
+            finally:
+                for t in tasks:
+                    t.cancel()
+        else:
+            async for quote in self._stream_order_book_single(market_ids):
+                yield quote
+
+    async def _stream_order_book_single(self, market_ids) -> AsyncIterator[MarketQuote]:
         if not getattr(self.cfg, "is_trading_configured", False):
             raise OrderNotPermitted("Polymarket US credentials required for the WebSocket")
         import json
@@ -730,7 +813,7 @@ class PolymarketUSVenue:
                 async with websockets.connect(
                     self.cfg.ws_markets, additional_headers=headers, open_timeout=10,
                     ping_interval=20, ping_timeout=30, close_timeout=5,
-                ) as ws:
+                 compression=None) as ws:
                     chunks = (
                         [market_ids[i : i + 100] for i in range(0, len(market_ids), 100)]
                         if market_ids else [None]
@@ -781,7 +864,7 @@ class PolymarketUSVenue:
         headers = self._auth_headers("GET", path)
         async with websockets.connect(
             self.cfg.ws_markets, additional_headers=headers, open_timeout=10
-        ) as ws:
+        , compression=None, ping_timeout=45) as ws:
             await ws.send(json.dumps({"subscribe": {
                 "requestId": "probe",
                 "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
@@ -819,7 +902,7 @@ class PolymarketUSVenue:
                 async with websockets.connect(
                     self.cfg.ws_private, additional_headers=headers, open_timeout=10,
                     ping_interval=20, ping_timeout=30, close_timeout=5,
-                ) as ws:
+                 compression=None) as ws:
                     await ws.send(json.dumps({"subscribe": {
                         "requestId": "ord", "subscriptionType": "SUBSCRIPTION_TYPE_ORDER"}}))
                     backoff = 1.0
@@ -901,7 +984,7 @@ class PolymarketUSVenue:
             # bare "5", NOT a duration like "5s". Keep it under the 10s HTTP client timeout.
             body["synchronousExecution"] = True
             body["maxBlockTime"] = "5"
-        await self._limiter.wait()
+        await self._order_limiter.wait()
         try:
             resp = await self._api().post(
                 "/v1/orders", json=body, headers=self._auth_headers("POST", "/v1/orders")
@@ -971,7 +1054,7 @@ class PolymarketUSVenue:
         """GET /v1/order/{id} -> OrderResult, or None if it couldn't be read. The
         authoritative terminal state for an order we already have an id for."""
         path = f"/v1/order/{order_id}"
-        await self._limiter.wait()
+        await self._order_limiter.wait()
         try:
             resp = await self._api().get(path, headers=self._auth_headers("GET", path))
             resp.raise_for_status()
@@ -987,17 +1070,48 @@ class PolymarketUSVenue:
             order_id=oid or order_id, status=status, raw=data,
         )
 
+    async def order_filled_qty(self, order_id: str, requested: float, side: Side) -> float | None:
+        """Authoritative filled contracts for one order from GET /v1/order/{id}, or None if
+        it couldn't be read. The private-fill stream can MISS a maker partial; this reads the
+        order's true ``cumQuantity`` so the executor never walks away from a real fill."""
+        res = await self._get_order_result(order_id, requested, side)
+        return None if res is None else res.filled
+
     async def cancel_order(self, order_id: str) -> dict:
         if not getattr(self.cfg, "is_trading_configured", False):
             raise OrderNotPermitted("Polymarket US trading credentials not configured")
         path = f"/v1/order/{order_id}/cancel"
-        await self._limiter.wait()
+        await self._order_limiter.wait()
         resp = await self._api().post(path, headers=self._auth_headers("POST", path))
         resp.raise_for_status()
         return resp.json()
 
     async def get_positions(self) -> dict:
         raise NotImplementedError("positions endpoint lands with the live phase")
+
+    async def market_rules(self, slug: str) -> str | None:
+        """Resolution rules text for a market, captured from the scan payload
+        (Polymarket's ``description`` maps every outcome to its settlement condition).
+        None if the market hasn't been scanned this process."""
+        return self._descriptions.get(slug)
+
+    async def settled_positions(self) -> dict:
+        """Raw slug -> position dict INCLUDING recently-settled positions.
+
+        ``?includeSettled=true`` keeps settled positions readable for a window after
+        resolution (they then drop off entirely) — the only place Polymarket exposes a
+        post-settlement ``realized``, which the settlement-truth auditor uses to infer
+        which side actually paid. Read-only. The query string is excluded from the
+        signed path (verified live: signing the bare path returns 200)."""
+        if not getattr(self.cfg, "is_trading_configured", False):
+            raise OrderNotPermitted("Polymarket US trading credentials not configured")
+        path = "/v1/portfolio/positions"
+        await self._limiter.wait()
+        resp = await self._api().get(
+            path + "?includeSettled=true", headers=self._auth_headers("GET", path))
+        resp.raise_for_status()
+        body = resp.json()
+        return (body.get("positions") if isinstance(body, dict) else None) or {}
 
     async def account_snapshot(self):
         """Balance + non-flat positions/resting orders, for the startup guard.

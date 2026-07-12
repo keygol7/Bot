@@ -186,8 +186,7 @@ def test_blacklist_excludes_confirmed_false_match():
     s.blacklist_pair("polymarket_us", "P1", "kalshi", "K1", reason="mean sum 0.68", samples=36)
     pairs = s.confirmed_pairs(safe_types_only=False)
     assert {(p[0], p[1]) for p in pairs} == {("kalshi", "K2")}   # K1/P1 gone, K2/P2 kept
-    assert ("kalshi", "K1", "polymarket_us", "P1") in s.blacklisted_keys() \
-        or ("polymarket_us", "P1", "kalshi", "K1") in s.blacklisted_keys()
+    assert s._pair_key("kalshi", "K1", "polymarket_us", "P1") in s.blacklisted_keys()
     s.close()
 
 
@@ -321,3 +320,200 @@ def test_audit_log():
     assert row["kind"] == "startup"
     assert "DRY_RUN" in row["payload"]
     s.close()
+
+
+def test_indices_exist():
+    # Time/market indices keep the settled-PnL and reconcile queries off full scans.
+    s = Store(":memory:")
+    names = {r["name"] for r in s.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'")}
+    for idx in ("idx_pnl_ts", "idx_fills_ts", "idx_fills_market",
+                "idx_opportunities_ts", "idx_opps_acted", "idx_embed_ts"):
+        assert idx in names
+
+
+def test_rules_divergent_pairs_dropped_from_watchlist():
+    # A pair whose rules the LLM confidently judged NON-identical is not a hedge and
+    # must drop from confirmed_pairs, exactly like a blacklisted pair.
+    s = Store(":memory:")
+    s.conn.execute("INSERT INTO markets (venue, market_id, title) VALUES ('kalshi','K1','A vs B - A')")
+    s.conn.execute("INSERT INTO markets (venue, market_id, title) VALUES ('polymarket_us','p1','A vs B - A')")
+    s.cache_verdict("kalshi", "K1", "polymarket_us", "p1", same_event=True,
+                    confidence=0.95, rationale="", event_key="E1")
+    kw = dict(use_fingerprint=True, combine_verdicts=True, safe_types_only=False)
+    got = {p[4] for p in s.confirmed_pairs(**kw)}
+    assert "E1" in got
+    # TAIL-scenario divergence (same event, differing void/tie wording) does NOT demote
+    s.record_rules_verdict("kalshi", "K1", "polymarket_us", "p1",
+                           identical=False, confidence=1.0,
+                           rationale="cancellation wording differs", material=False)
+    got = {p[4] for p in s.confirmed_pairs(**kw)}
+    assert "E1" in got
+    # MATERIAL divergence (different event/party — the BESTIA class) demotes
+    s.record_rules_verdict("kalshi", "K1", "polymarket_us", "p1",
+                           identical=False, confidence=1.0,
+                           rationale="different events", material=True)
+    got = {p[4] for p in s.confirmed_pairs(**kw)}
+    assert "E1" not in got
+    # low-confidence material divergence does NOT demote (the LLM can be unsure)
+    s.record_rules_verdict("kalshi", "K1", "polymarket_us", "p1",
+                           identical=False, confidence=0.5, rationale="unsure",
+                           material=True)
+    got = {p[4] for p in s.confirmed_pairs(**kw)}
+    assert "E1" in got
+    # legacy (pre-classification) rows count as UNchecked -> re-verified organically
+    s.conn.execute("UPDATE rules_verdicts SET material=NULL")
+    s.conn.commit()
+    assert not s.rules_checked("kalshi", "K1", "polymarket_us", "p1")
+
+
+def test_recycle_remnant_roundtrip():
+    s = Store(":memory:")
+    s.record_recycle_remnant("poly", "p1", 20.0)
+    assert s.recycle_remnants() == {("poly", "p1"): 20.0}
+    s.record_recycle_remnant("poly", "p1", 5.0)            # upsert
+    assert s.recycle_remnants()[("poly", "p1")] == 5.0
+    s.record_recycle_remnant("poly", "p1", 0.0)            # 0 clears
+    assert s.recycle_remnants() == {}
+    s.record_recycle_remnant("kalshi", "K1", 3.0)
+    s.clear_recycle_remnant("kalshi", "K1")
+    assert s.recycle_remnants() == {}
+
+
+def test_prune_stale_markets():
+    import time as _t
+    s = Store(":memory:")
+    now = _t.time()
+    s.conn.execute("INSERT INTO markets (venue, market_id, title, updated_at) VALUES (?,?,?,?)",
+                   ("kalshi", "LIVE", "live", now))
+    s.conn.execute("INSERT INTO markets (venue, market_id, title, updated_at) VALUES (?,?,?,?)",
+                   ("kalshi", "STALE", "stale", now - 10 * 86400))
+    s.conn.execute("INSERT INTO markets (venue, market_id, title, updated_at) VALUES (?,?,?,?)",
+                   ("kalshi", "STALE_CANON", "stale but canon'd", now - 10 * 86400))
+    s.conn.commit()
+    from bot.matching.canon import Canon
+    s.record_canon(Canon("kalshi", "STALE_CANON", "election", ("x",), "x", "winner",
+                          None, None, "full", "2026-11-03", 0.9))
+    pruned = s.prune_stale_markets(older_than_days=7.0)
+    assert pruned == 1                                          # only STALE (not canon'd)
+    ids = {r["market_id"] for r in s.conn.execute("SELECT market_id FROM markets")}
+    assert ids == {"LIVE", "STALE_CANON"}                      # live + canon-referenced kept
+
+
+def test_equity_snapshot_and_pnl():
+    import time as _t
+    s = Store(":memory:")
+    now = _t.time()
+    # baseline 24h ago, then now
+    s.conn.execute("INSERT INTO equity_snapshots VALUES (?,?,?,?,?,?)",
+                   (now - 24*3600, 50, 100, 40, 110, 300))
+    s.conn.execute("INSERT INTO equity_snapshots VALUES (?,?,?,?,?,?)",
+                   (now, 55, 123, 39, 108, 325))
+    s.conn.commit()
+    pnl, frm, to, ts, xfers = s.equity_pnl(hours=24.0)
+    assert pnl == 25.0 and frm == 300.0 and to == 325.0 and xfers == 0.0
+    # record_equity computes total
+    s2 = Store(":memory:")
+    s2.record_equity(55.0, 123.0, 39.0, 108.0)
+    row = s2.conn.execute("SELECT total FROM equity_snapshots").fetchone()
+    assert abs(row["total"] - 325.0) < 1e-6
+    assert s2.equity_pnl() is None                # single snapshot -> no baseline yet
+
+
+def test_transfers_separate_deposits_from_gains():
+    import time as _t
+    s = Store(":memory:")
+    now = _t.time()
+    # equity went 300 -> 425 over the window... but $100 of that was a DEPOSIT
+    s.conn.execute("INSERT INTO equity_snapshots VALUES (?,?,?,?,?,?)",
+                   (now - 24*3600, 50, 100, 40, 110, 300))
+    s.conn.execute("INSERT INTO equity_snapshots VALUES (?,?,?,?,?,?)",
+                   (now, 100, 145, 60, 120, 425))
+    s.conn.commit()
+    s.record_transfer("kalshi", 100.0, source="kalshi_api", external_id="d1",
+                      ts=now - 3600)
+    pnl, frm, to, ts, xfers = s.equity_pnl(hours=24.0)
+    assert xfers == 100.0
+    assert pnl == 25.0                       # 125 delta - 100 deposit = 25 real gains
+    # withdrawal: -50 out means equity fell but trading was flat -> pnl adjusts UP
+    s.record_transfer("kalshi", -50.0, source="kalshi_api", external_id="w1",
+                      ts=now - 1800)
+    pnl2, *_ = s.equity_pnl(hours=24.0)
+    assert pnl2 == 75.0
+    # dedup by external id: re-sync must not double-count
+    assert s.record_transfer("kalshi", 100.0, source="kalshi_api", external_id="d1") is False
+    pnl3, *_, x3 = s.equity_pnl(hours=24.0)
+    assert x3 == 50.0 and pnl3 == 75.0
+    # transfers OUTSIDE the window don't affect it
+    s.record_transfer("polymarket_us", 500.0, source="manual", external_id=None,
+                      ts=now - 48*3600)
+    pnl4, *_ = s.equity_pnl(hours=24.0)
+    assert pnl4 == 75.0
+
+
+def test_identity_certain_keys_grants_tail_pairs_with_full_name_alignment(tmp_path):
+    from bot.data.store import Store
+    st = Store(str(tmp_path / "t.db"))
+    now = __import__("time").time()
+    st.upsert_market("kalshi", "KXITFMATCH-26JUL08ABCDEF-ABC",
+                     "Will Alan Abcman win the Abcman vs Defsson: M25 match?", now)
+    st.upsert_market("polymarket_us", "aec-itfme-alaabc-boddef-2026-07-08",
+                     "Alan Abcman vs. Bodo Defsson - Alan Abcman", now)
+    st.record_rules_verdict("kalshi", "KXITFMATCH-26JUL08ABCDEF-ABC",
+                            "polymarket_us", "aec-itfme-alaabc-boddef-2026-07-08",
+                            identical=False, confidence=1.0,
+                            rationale="cancellation wording differs",
+                            material=False, divergence="cancellation_postponement")
+    # a material drop must NOT be granted even with aligned names
+    st.upsert_market("kalshi", "KXITFMATCH-26JUL08GHIJKL-GHI",
+                     "Will Gil Ghiman win the Ghiman vs Jklsson: M25 match?", now)
+    st.upsert_market("polymarket_us", "aec-itfme-gilghi-jkl-2026-07-08",
+                     "Gil Ghiman vs. Jklsson - Gil Ghiman", now)
+    st.record_rules_verdict("kalshi", "KXITFMATCH-26JUL08GHIJKL-GHI",
+                            "polymarket_us", "aec-itfme-gilghi-jkl-2026-07-08",
+                            identical=False, confidence=1.0,
+                            rationale="different events", material=True,
+                            divergence="different_event")
+    keys = st.identity_certain_keys()
+    assert st._pair_key("kalshi", "KXITFMATCH-26JUL08ABCDEF-ABC",
+                        "polymarket_us", "aec-itfme-alaabc-boddef-2026-07-08") in keys
+    assert st._pair_key("kalshi", "KXITFMATCH-26JUL08GHIJKL-GHI",
+                        "polymarket_us", "aec-itfme-gilghi-jkl-2026-07-08") not in keys
+    st.close()
+
+
+def test_pair_key_matches_confirmedpair_key_format():
+    # THE format contract: store key sets must be directly comparable with the
+    # streaming engine's runtime keys. The old flat 4-tuple never matched — the
+    # rules gate over-blocked every non-identical pair, one-way and divergence
+    # floors were inert (2026-07-08 discovery via a user question about 5/10
+    # observation counts).
+    from bot.data.store import Store
+    from bot.streaming.engine import ConfirmedPair
+    p = ConfirmedPair("e", "kalshi", "K1", "polymarket_us", "P1")
+    assert Store._pair_key("kalshi", "K1", "polymarket_us", "P1") == p.key
+    assert Store._pair_key("polymarket_us", "P1", "kalshi", "K1") == p.key
+
+
+def test_divergence_policies_one_way_directions_including_none_flip(tmp_path):
+    # The NONE outcome inverts the timing-scope windfall side; and this function
+    # crashing (NameError, 2026-07-09) silently EMPTIED the one-way lane for 2.5h —
+    # it must compute for both outcome shapes.
+    from bot.data.store import Store
+    st = Store(str(tmp_path / "t.db"))
+    st.record_rules_verdict("kalshi", "KXWCFTTS-26JUL11ARGSUI-ARG",
+                            "polymarket_us", "astatc-fwc-arg-sui-2026-07-11-ftts-arg",
+                            identical=False, confidence=1.0, rationale="A includes ET",
+                            divergence="timing_scope", stricter_side="B")
+    st.record_rules_verdict("kalshi", "KXWCFTTS-26JUL09FRAMAR-NONE",
+                            "polymarket_us", "astatc-fwc-fra-mar-2026-07-09-ftts-none",
+                            identical=False, confidence=1.0, rationale="A includes ET",
+                            divergence="timing_scope", stricter_side="B")
+    pol = st.pair_divergence_policies()
+    k1 = st._pair_key("kalshi", "KXWCFTTS-26JUL11ARGSUI-ARG",
+                      "polymarket_us", "astatc-fwc-arg-sui-2026-07-11-ftts-arg")
+    k2 = st._pair_key("kalshi", "KXWCFTTS-26JUL09FRAMAR-NONE",
+                      "polymarket_us", "astatc-fwc-fra-mar-2026-07-09-ftts-none")
+    assert pol[k1][0] == "one_way" and pol[k1][2] == "kalshi"      # scoring: wider side
+    assert pol[k2][0] == "one_way" and pol[k2][2] == "polymarket_us"  # NONE: flipped
+    st.close()

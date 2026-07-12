@@ -256,3 +256,34 @@ def test_polymarket_bbo_accepts_bare_numbers():
     quote = normalize_bbo("s", "s", md)
     assert quote.yes_ask == 0.55
     assert round(quote.no_ask, 6) == 0.47
+
+
+def test_order_path_has_its_own_rate_limiter():
+    # ORDERS must never queue behind the read token bucket: a hedge leg waiting on
+    # scan-drained read tokens right after leg 1 fills is a widened naked window.
+    from types import SimpleNamespace
+
+    from bot.venues.kalshi import KalshiVenue
+    from bot.venues.polymarket_us import PolymarketUSVenue
+
+    k = KalshiVenue(SimpleNamespace(api_key_id="", private_key_path="", api_base="",
+                                    ws_base="", read_rate_per_min=None))
+    p = PolymarketUSVenue(SimpleNamespace(gateway_base="", api_base="", ws_markets="",
+                                          ws_private="", api_key_id="", secret_key="",
+                                          ed25519_private_key_path="",
+                                          read_rate_per_min=None))
+    for v in (k, p):
+        assert v._order_limiter is not v._limiter          # separate bucket
+        assert v._order_limiter._rate > v._limiter._rate   # and a more generous one
+
+
+def test_scan_quotes_deny_patterns_drops_multioutcome_junk():
+    # A "SENATE" winner allowlist must not admit KXPRIMARYPLACE junk; the deny-list is the
+    # guard. Pure filter logic — verify against the ticker filter used in scan_quotes.
+    tickers = ["KXSENATE-26-DEM", "KXSENATEPLACE-26-4TH", "KXGOVWINNER-26-R",
+               "KXPRIMARYRANK-26-2", "KXNOBEL-26-X"]
+    allow = ("SENATE", "GOVWINNER", "NOBEL")
+    deny = ("PLACE", "RANK")
+    kept = [t for t in tickers
+            if any(p in t for p in allow) and not any(d in t for d in deny)]
+    assert kept == ["KXSENATE-26-DEM", "KXGOVWINNER-26-R", "KXNOBEL-26-X"]

@@ -18,10 +18,40 @@ matcher's job (see ``bot.matching``); never trade an unconfirmed cross-venue pai
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
-from bot.fees import FeeModel, ZeroFeeModel
+from bot.fees import FeeModel, ZeroFeeModel, per_contract_fee
 from bot.models import MarketQuote
+
+# Settlement date parsed from a market id when the quote omits close_time — which is
+# exactly the case for long-dated non-sports markets (elections/awards return
+# close_time=None), leaving the horizon gate blind. Poly slugs carry an ISO date
+# (...-2026-11-03-...); Kalshi tickers a YYMONDD code (26JUL04).
+_ISO_DATE = re.compile(r"(20\d{2})-(\d{2})-(\d{2})")
+_KALSHI_DATE = re.compile(r"(\d{2}[A-Z]{3}\d{2})")
+
+
+def settle_ts_from_id(market_id: str) -> float:
+    """Best-effort settlement epoch from a market id, or 0.0 if none parseable."""
+    if not market_id:
+        return 0.0
+    m = _ISO_DATE.search(market_id)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                            tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+    m = _KALSHI_DATE.search(market_id.upper())
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%y%b%d").replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+    return 0.0
 
 
 @dataclass
@@ -46,6 +76,13 @@ class ArbOpportunity:
     notional: float            # capital deployed = gross_cost * max_contracts
     yes_size: float = 0.0      # YES leg's own top-of-book depth (0 = unknown)
     no_size: float = 0.0       # NO leg's own top-of-book depth (0 = unknown)
+    settle_ts: float = 0.0     # earliest leg close_time (epoch s); 0 = unknown. Used by
+                               # the horizon gate + early-exit prioritization.
+    fresh_ts: float = 0.0      # wall-clock ts of the OLDEST leg quote backing this opp
+                               # (both legs WS-fresh); 0 = unknown/stale -> re-read books
+    yes_levels: tuple | None = None   # YES leg's ask LADDER ((price, size), best-first)
+    no_levels: tuple | None = None    # NO leg's ask ladder — hedge depth is measured
+                                      # against the ladder within the profit ceiling
 
     @property
     def is_single_venue(self) -> bool:
@@ -62,12 +99,70 @@ class ArbOpportunity:
         )
 
 
+def _pair_settle_ts(yes_q: MarketQuote, no_q: MarketQuote) -> float:
+    """Earliest settlement across both legs — prefer the venue-reported close_time, fall
+    back to the id-parsed date (so long-dated non-sports markets that omit close_time
+    still gate). 0.0 only if neither leg yields anything."""
+    cands = [t for t in (yes_q.close_time, no_q.close_time) if t]
+    cands += [t for t in (settle_ts_from_id(yes_q.market_id),
+                          settle_ts_from_id(no_q.market_id)) if t]
+    return min(cands) if cands else 0.0
+
+
+def sweep_levels(yes_levels, no_levels, yes_fee: FeeModel, no_fee: FeeModel,
+                 min_edge: float = 0.0, max_levels: int = 8):
+    """Best (yes_limit, no_limit, size) sweeping both ask LADDERS: choose the limit
+    price pair maximizing conservative total profit (everything priced AT the limits;
+    real FOK fills take better levels at their own prices, so this only understates)
+    subject to the per-contract edge AT THE LIMITS clearing ``min_edge``. Falls back
+    to the top levels when nothing deeper qualifies. Returns None if even the top
+    combo is unpriced."""
+    ys = list(yes_levels or ())[:max_levels]
+    ns = list(no_levels or ())[:max_levels]
+    if not ys or not ns:
+        return None
+    best = None                    # (profit, yes_limit, no_limit, size)
+    cum_y = 0.0
+    for (py, sy) in ys:
+        cum_y += sy
+        cum_n = 0.0
+        for (pn, sn) in ns:
+            cum_n += sn
+            fee = per_contract_fee(yes_fee, py) + per_contract_fee(no_fee, pn)
+            edge = 1.0 - (py + pn) - fee
+            if edge < min_edge:
+                continue           # deeper NO levels only get worse for this py
+            size = min(cum_y, cum_n)
+            profit = size * edge
+            if best is None or profit > best[0]:
+                best = (profit, py, pn, size)
+    if best is None:
+        py, sy = ys[0]
+        pn, sn = ns[0]
+        return (py, pn, min(sy, sn))
+    return (best[1], best[2], best[3])
+
+
+def usable_depth(levels, max_price: float) -> float:
+    """Cumulative size across ladder levels priced <= ``max_price`` — the depth an
+    IOC/FOK at that limit can actually take. The correct measure of HEDGE depth:
+    a book showing 1 contract at top with 300 behind it at +1 tick hedges 301 as
+    long as the deeper levels stay inside the pair's profit ceiling."""
+    total = 0.0
+    for price, size in (levels or ()):
+        if price > max_price + 1e-9:
+            break                      # best-first ordering: everything past is worse
+        total += size
+    return total
+
+
 def _build(
     *,
     yes_q: MarketQuote,
     yes_fee: FeeModel,
     no_q: MarketQuote,
     no_fee: FeeModel,
+    min_edge: float = 0.0,
 ) -> ArbOpportunity | None:
     """Build an opportunity for buying YES on ``yes_q`` and NO on ``no_q``.
 
@@ -79,11 +174,22 @@ def _build(
         return None
 
     max_contracts = min(yes_q.yes_ask_size, no_q.no_ask_size)
+    # Depth sweep: when either side carries a full ladder, pick the limit prices
+    # maximizing total profit across levels (FOK at the limit sweeps better levels).
+    swept = sweep_levels(
+        yes_q.yes_ask_levels or ((yes_price, yes_q.yes_ask_size),),
+        no_q.no_ask_levels or ((no_price, no_q.no_ask_size),),
+        yes_fee, no_fee, min_edge=min_edge)
+    if swept is not None:
+        yes_price, no_price, max_contracts = swept
     if max_contracts <= 0:
         return None
 
     gross_cost = yes_price + no_price
-    fee_per_pair = yes_fee.fee(yes_price, 1) + no_fee.fee(no_price, 1)
+    # Gate on the UNROUNDED per-contract rate: fee(price, 1) quantizes to a whole cent
+    # (an error the size of the edge floor itself); settlement still books the venue's
+    # rounded fee at real size via total_fees below.
+    fee_per_pair = per_contract_fee(yes_fee, yes_price) + per_contract_fee(no_fee, no_price)
     edge_per_contract = 1.0 - gross_cost - fee_per_pair
 
     total_fees = (
@@ -107,6 +213,9 @@ def _build(
         total_fees=total_fees,
         total_profit=total_profit,
         notional=gross_cost * max_contracts,
+        settle_ts=_pair_settle_ts(yes_q, no_q),
+        yes_size=yes_q.yes_ask_size, no_size=no_q.no_ask_size,
+        yes_levels=yes_q.yes_ask_levels, no_levels=no_q.no_ask_levels,
     )
 
 
@@ -128,8 +237,8 @@ def detect_cross_venue(
     fee_b = fee_b or ZeroFeeModel()
 
     candidates = [
-        _build(yes_q=a, yes_fee=fee_a, no_q=b, no_fee=fee_b),
-        _build(yes_q=b, yes_fee=fee_b, no_q=a, no_fee=fee_a),
+        _build(yes_q=a, yes_fee=fee_a, no_q=b, no_fee=fee_b, min_edge=min_edge),
+        _build(yes_q=b, yes_fee=fee_b, no_q=a, no_fee=fee_a, min_edge=min_edge),
     ]
     opps = [o for o in candidates if o is not None and o.edge_per_contract > min_edge]
     opps.sort(key=lambda o: o.edge_per_contract, reverse=True)
@@ -164,7 +273,7 @@ def _pair_price_edge(
     """Per-contract edge of buying YES on ``yes_q`` and NO on ``no_q``, prices only."""
     if yes_q.yes_ask is None or no_q.no_ask is None:
         return None
-    fees = yes_fee.fee(yes_q.yes_ask, 1) + no_fee.fee(no_q.no_ask, 1)
+    fees = per_contract_fee(yes_fee, yes_q.yes_ask) + per_contract_fee(no_fee, no_q.no_ask)
     return 1.0 - (yes_q.yes_ask + no_q.no_ask) - fees
 
 

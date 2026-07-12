@@ -41,11 +41,19 @@ class _OrderState:
 
 
 class FillTracker:
+    # Bound the per-order state map: it otherwise grows by one entry per order forever
+    # (a slow leak on long uptimes). Insertion order == placement order, so entries
+    # beyond the most recent _max are long-settled and never re-read.
+    _max = 2000
+
     def __init__(self) -> None:
         self._orders: dict[tuple[str, str], _OrderState] = {}
 
     def _state(self, venue: str, order_id: str) -> _OrderState:
-        return self._orders.setdefault((venue, order_id), _OrderState())
+        st = self._orders.setdefault((venue, order_id), _OrderState())
+        while len(self._orders) > self._max:
+            self._orders.pop(next(iter(self._orders)))
+        return st
 
     async def apply(self, ev: FillEvent) -> None:
         """Fold one execution event into the order's aggregate state."""

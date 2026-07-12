@@ -81,6 +81,58 @@ def test_close_within_days_passes_max_close_ts_to_scan():
     assert captured == [None]                              # disabled -> no window
 
 
+def test_kalshi_close_within_days_windows_kalshi_only():
+    # The KALSHI-ONLY window scopes Kalshi to imminent markets with an UNBOUNDED limit (its
+    # per-game lines sit past the --limit cap), while Polymarket keeps the shared limit and
+    # NO window (its per-game endDates are far-future, so a window would drop them).
+    import time as _time
+
+    seen = {}
+
+    class RecordingVenue(StubVenue):
+        async def scan_quotes(self, limit=500, *, max_close_ts=None):
+            seen[self.name] = (limit, max_close_ts)
+            return []
+
+    before = _time.time()
+    asyncio.run(run_cycle(
+        [RecordingVenue("kalshi", {}), RecordingVenue("polymarket_us", {})],
+        store=None, risk=generous_risk(),
+        fee_models={"kalshi": ZeroFeeModel(), "polymarket_us": ZeroFeeModel()},
+        min_edge=0.01, match_threshold=0.3, complete_fn=None, limit=5000,
+        close_within_days=0.0, kalshi_close_within_days=30.0,
+    ))
+    after = _time.time()
+    k_limit, k_window = seen["kalshi"]
+    p_limit, p_window = seen["polymarket_us"]
+    assert k_limit == 0 and k_window is not None                 # kalshi: unbounded + windowed
+    assert int(before + 30 * 86400) <= k_window <= int(after + 30 * 86400)
+    assert p_limit == 0 and p_window is None       # poly: whole board (the CLI limit
+                                                   # truncated the flat scan at 5000), NO window
+
+
+def test_kalshi_ticker_patterns_filter_kalshi_only():
+    # The per-game pattern allowlist scopes Kalshi to an UNBOUNDED, pattern-filtered scan
+    # (embed only arbable head-to-head markets); Polymarket keeps the shared limit and gets
+    # NO ticker_patterns kwarg.
+    seen = {}
+
+    class RecordingVenue(StubVenue):
+        async def scan_quotes(self, limit=500, *, max_close_ts=None, ticker_patterns=None):
+            seen[self.name] = (limit, max_close_ts, ticker_patterns)
+            return []
+
+    asyncio.run(run_cycle(
+        [RecordingVenue("kalshi", {}), RecordingVenue("polymarket_us", {})],
+        store=None, risk=generous_risk(),
+        fee_models={"kalshi": ZeroFeeModel(), "polymarket_us": ZeroFeeModel()},
+        min_edge=0.01, match_threshold=0.3, complete_fn=None, limit=5000,
+        kalshi_ticker_patterns=("GAME", "MATCH", "FIGHT"),
+    ))
+    assert seen["kalshi"] == (0, None, ("GAME", "MATCH", "FIGHT"))   # unbounded + filtered
+    assert seen["polymarket_us"][0] == 0 and seen["polymarket_us"][2] is None  # poly whole-board, no patterns
+
+
 def test_max_confirms_caps_llm_calls_per_cycle():
     # Many candidate pairs, all with a price edge; cap LLM confirmations at 2.
     kalshi = {f"K{i}": mq("kalshi", f"K{i}", f"Team{i} game", yes_ask=0.40, yes_ask_size=100, no_ask=0.65, no_ask_size=100) for i in range(5)}
@@ -761,3 +813,44 @@ def test_prune_market_removes_verdicts():
     assert s.conn.execute(
         "SELECT COUNT(*) c FROM markets WHERE market_id='K'").fetchone()["c"] == 0
     s.close()
+
+
+def test_imbalance_alert_wording_and_rate_limit():
+    from bot.dryrun import imbalance_alert
+    bals = {"kalshi": 8.42, "polymarket_us": 388.51}
+    # not drained long enough -> quiet
+    assert imbalance_alert(bals, drained_since=1000.0, now=1100.0, recyclable=False,
+                           alert_secs=900.0, last_alert=0.0) is None
+    # drained long enough + nothing recyclable -> fires with the exact manual action
+    msg = imbalance_alert(bals, drained_since=1000.0, now=2000.0, recyclable=False,
+                          alert_secs=900.0, last_alert=0.0)
+    assert msg is not None and "STRUCTURAL IMBALANCE" in msg
+    assert "withdraw $190 from polymarket_us" in msg and "deposit to kalshi" in msg
+    # recyclable inventory -> the recycler handles it, no alert
+    assert imbalance_alert(bals, 1000.0, 2000.0, recyclable=True,
+                           alert_secs=900.0, last_alert=0.0) is None
+    # rate limit: one per hour
+    assert imbalance_alert(bals, 1000.0, 2000.0, recyclable=False,
+                           alert_secs=900.0, last_alert=1900.0) is None
+    # disabled
+    assert imbalance_alert(bals, 1000.0, 2000.0, recyclable=False,
+                           alert_secs=0.0, last_alert=0.0) is None
+
+
+def test_run_cycle_forwards_unknown_fingerprint_to_llm():
+    # An F1-class pair: the sports-tuned fingerprint can't read the poly side
+    # (metric=unknown) — that must FORWARD to the LLM, not die at the gate (the
+    # watchlist stopped growing when unknown was killed). Positively-classified
+    # novelty (unmatchable) stays killed per the test above.
+    k = mq("kalshi", "KXF1FASTLAP-BRIGP26-ALB",
+           "Will Alexander Albon set the fastest lap in the British Grand Prix?",
+           yes_ask=0.10, yes_ask_size=100, no_ask=0.85, no_ask_size=100)
+    p = mq("polymarket_us", "aachc-f1-gbr-2026-07-05-fastlap-alealb",
+           "British Grand Prix Main Race Fastest Lap - Alexander Albon",
+           yes_ask=0.86, yes_ask_size=100, no_ask=0.11, no_ask_size=100)
+    venues = [StubVenue("kalshi", {k.market_id: k}),
+              StubVenue("polymarket_us", {p.market_id: p})]
+    fake = lambda prompt: '{"same_event": true, "confidence": 0.95, "rationale": "x"}'
+    res = run_cycle_kw(venues, complete_fn=fake, use_fingerprint=True)
+    confirmed = {(a, b) for (_, a, _, b, _) in res.confirmed_pairs}
+    assert ("KXF1FASTLAP-BRIGP26-ALB", "aachc-f1-gbr-2026-07-05-fastlap-alealb") in confirmed

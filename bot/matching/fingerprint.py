@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from bot.matching.scope import (
     _METRIC_RULES,
     _threshold_tag,
+    id_scope_tags,
     kalshi_series,
     scope_tags,
 )
@@ -323,7 +324,12 @@ def from_polymarket(slug: str, title: str, end_date: str | None = None,
         # their team/player suffix above (preserving YES polarity).
         subject = _subject_tokens(title.rsplit(" - ", 1)[0])
     return ContractFingerprint(
-        venue="polymarket_us", metric=metric, scope=_scope_only(title),
+        # Slug-encoded scope (handicap -neg-2pt5 / -fh- -sh- half markers) folds into
+        # the title scope: Poly spread/half markets carry a plain-matchup TITLE, so
+        # without the slug tags they fingerprint as moneyline winners and falsely
+        # complement a real moneyline on the other venue.
+        venue="polymarket_us", metric=metric,
+        scope=_scope_only(title) | id_scope_tags(slug),
         threshold=_threshold_int(title), subject=subject, date=date,
         league=_league_of(slug),
         matchup=_matchup_tokens(title) if metric == "winner" else frozenset(),
@@ -368,16 +374,44 @@ def _matchup_conflict(a: frozenset, b: frozenset) -> bool:
     return bool(a_only) and bool(b_only)
 
 
+# Sub-organization markers: an org and its academy/junior/reserve squad are DIFFERENT
+# teams playing DIFFERENT matches, but token-subset alignment sees "BESTIA" ⊆ "BESTIA
+# Academy" and matches them (live incident: a 95-contract "hedge" across the BESTIA org's
+# main and Academy CS2 games — the legs settled independently, one naked). If the residue
+# tokens (the part of the LARGER name the smaller doesn't cover) contain one of these,
+# the subjects are related-but-distinct entities, never the same one.
+_SUB_ORG = frozenset({"academy", "jr", "junior", "youth", "reserve", "reserves",
+                      "u17", "u18", "u19", "u20", "u21", "u23", "ii", "prospects"})
+
+
 def _subjects_align(a: frozenset, b: frozenset) -> bool:
     """The YES outcomes refer to the same entity. The SMALLER (cleaner) subject must be
     fully covered by the larger — every one of its tokens matches. A single shared token
     is NOT enough, so two different multi-token entities that share one word (different
     players 'Ronald Araujo' vs 'Maximiliano Araujo', or teams sharing a dropped suffix)
-    no longer falsely align."""
+    no longer falsely align. Residue containing a sub-org marker (Academy/Jr/U21/...)
+    means a RELATED but DIFFERENT team — never aligned."""
     if not a or not b:
         return False
     small, large = (a, b) if len(a) <= len(b) else (b, a)
-    return all(_token_matches(x, large) for x in small)
+    if not all(_token_matches(x, large) for x in small):
+        return False
+    return not (large - small) & _SUB_ORG
+
+
+def _subject_sub_org_ambiguous(a: frozenset, b: frozenset) -> bool:
+    """True when the subjects WOULD align except a sub-org residue marker — the
+    ambiguous class ('BESTIA' vs 'BESTIA Academy'): either one venue shortened the SAME
+    academy team's name, or they're the org and its academy (different teams). Not
+    deterministically matchable — but escalatable to the title-LLM + rules verification
+    instead of a hard kill (a one-sided shortening of a real academy pair would
+    otherwise never trade)."""
+    if not a or not b:
+        return False
+    small, large = (a, b) if len(a) <= len(b) else (b, a)
+    if not all(_token_matches(x, large) for x in small):
+        return False
+    return bool((large - small) & _SUB_ORG)
 
 
 def complement_reason(a: ContractFingerprint, b: ContractFingerprint,
@@ -411,6 +445,10 @@ def complement_reason(a: ContractFingerprint, b: ContractFingerprint,
     if a.metric in _QUESTION_SUBJECT_METRICS and _event_overlap(a.event, b.event) is False:
         return f"event {sorted(a.event)}!={sorted(b.event)}"
     if not _subjects_align(a.subject, b.subject):
+        if _subject_sub_org_ambiguous(a.subject, b.subject):
+            # Distinct reason: the deterministic sweep must NOT match these, but the
+            # discovery gate may forward them to the LLM/rules stack for arbitration.
+            return "subject-sub-org"
         return f"subject {sorted(a.subject)}!={sorted(b.subject)}"
     return "ok"
 

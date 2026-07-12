@@ -16,6 +16,7 @@ class VenuePosition:
     market_id: str
     quantity: float = 0.0       # signed contracts held (sign = direction)
     resting_orders: int = 0     # open (unfilled) orders on this market
+    cost: float = 0.0           # venue-reported cost basis / exposure ($), 0 if unknown
 
     @property
     def is_open(self) -> bool:

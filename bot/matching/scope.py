@@ -116,6 +116,58 @@ def scope_tags(title: str) -> frozenset[str]:
     return frozenset(tags)
 
 
+# --- Identifier-level scope (slug/ticker markers the TITLE doesn't carry) -----------
+# Polymarket encodes handicap/period lines ONLY in the slug: ``-neg-2pt5``/``-pos-1pt5``
+# = a +-N.5 goal handicap, ``-fh-``/``-sh-`` = first/second half. Their titles look like
+# plain matchups, so title-only scope guards pass them — the source of the observed
+# spread-vs-moneyline false matches ("COL wins" paired with "COL -2.5", phantom 10-44%
+# "edges"). Kalshi encodes the same in the series token. Tag names mirror scope_tags'
+# so identical lines on both venues still align.
+_SLUG_HANDICAP = re.compile(r"-(?:neg|pos)-\d+(?:pt\d+)?(?:-|$)")
+_SLUG_FIRST_HALF = re.compile(r"(?:^|-)fh-")
+_SLUG_SECOND_HALF = re.compile(r"(?:^|-)sh-")
+_SLUG_EXTRA_TIME = re.compile(r"-et-")                  # incl.-extra-time lines (-et-neg-0pt5)
+# partial-game periods: -f5- (first five innings) etc. A full-GAME winner matched
+# an atc-...-f5-... slug through the FINGERPRINT arm (the idparse arm scopes it) and
+# streamed 1,435 one-way blocks of a 4c phantom edge (AZ-SD, 2026-07-09) — F5 vs
+# full game is a DIFFERENT event (the leader after 5 loses the game ~15-20%).
+_SLUG_PART_GAME = re.compile(r"(?:^|-)f([2-9])-")   # f5 innings etc; NOT -f1- (Formula 1 league slug)
+_KALSHI_ID_SCOPE = (("SPREAD", "handicap"), ("HANDICAP", "handicap"),
+                    ("1H", "first_half"), ("2H", "second_half"), ("HALF", "first_half"),
+                    ("F5", "f5"))
+
+
+def id_scope_tags(market_id: str) -> frozenset[str]:
+    """Scope tags carried by the market IDENTIFIER (Poly slug / Kalshi ticker)."""
+    if not market_id:
+        return frozenset()
+    tags = set()
+    if market_id[:2].isupper():                         # Kalshi ticker style
+        series = market_id.split("-", 1)[0].upper()
+        for needle, tag in _KALSHI_ID_SCOPE:
+            if needle in series:
+                tags.add(tag)
+    else:                                               # Polymarket slug style
+        s = market_id.lower()
+        if _SLUG_HANDICAP.search(s):
+            tags.add("handicap")
+        if _SLUG_FIRST_HALF.search(s):
+            tags.add("first_half")
+        if _SLUG_SECOND_HALF.search(s):
+            tags.add("second_half")
+        if _SLUG_EXTRA_TIME.search(s):
+            tags.add("extra_time")
+        m = _SLUG_PART_GAME.search(s)
+        if m:
+            tags.add(f"f{m.group(1)}")
+    return frozenset(tags)
+
+
+def id_scope_mismatch(id_a: str, id_b: str) -> bool:
+    """True if the two market identifiers encode DIFFERENT handicap/period scopes."""
+    return id_scope_tags(id_a) != id_scope_tags(id_b)
+
+
 def scope_mismatch(title_a: str, title_b: str) -> bool:
     """True if the two titles carry DIFFERENT scope/metric qualifiers.
 

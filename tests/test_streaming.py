@@ -32,6 +32,138 @@ def make_engine(executor, cooldown=100.0, now=0.0):
     return eng
 
 
+class _Risk:
+    def __init__(self): self.is_killed = False
+    def trip_kill_switch(self, reason): self.is_killed = True
+
+
+class _ExecR(FakeExec):
+    def __init__(self): super().__init__(); self.risk = _Risk()
+
+
+def _snap(venue, positions):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        venue=venue,
+        positions=[SimpleNamespace(market_id=m, quantity=q, is_open=True) for m, q in positions])
+
+
+def _open_quote(state):
+    from types import SimpleNamespace
+    return SimpleNamespace(state=state)
+
+
+def test_reconcile_skips_actively_trading_pair_then_halts_when_quiesced():
+    # A pair traded within the grace window shows a TRANSIENT burst imbalance (Poly fills
+    # land instantly; Kalshi /positions lags) — it must NOT false-halt while active. Only
+    # once trading quiesces past the grace does a persistent imbalance trip the kill switch.
+    t = [1000.0]
+    fe = _ExecR()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: t[0], reconcile_halt=True,
+        depth_fetch=lambda v, m: _open_quote("MARKET_STATE_OPEN"))   # both legs OPEN
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    key = next(iter(eng._pairs))
+    snaps = [_snap("kalshi", [("K1", 34)]), _snap("poly", [("P1", 46)])]  # Δ12 mid-burst
+
+    eng._last_acted[key] = 1000.0                       # pair just traded
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))         # two checks INSIDE the grace window
+    assert not fe.risk.is_killed                        # no false halt while actively trading
+
+    t[0] = 1000.0 + 30.0                                # trading quiesces (> 25s grace)
+    asyncio.run(eng.reconcile_positions(snaps))         # first sighting after quiesce -> warn
+    assert not fe.risk.is_killed
+    asyncio.run(eng.reconcile_positions(snaps))         # still imbalanced -> persistent -> halt
+    assert fe.risk.is_killed
+
+
+def _settled_engine(open_states, depth_states):
+    fe = _ExecR()
+    async def oc(v, m): return open_states.get(v)          # True/False/None per venue
+    async def fetch(v, m): return _open_quote(depth_states.get(v))
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 5000.0, reconcile_halt=True,
+        depth_fetch=fetch, open_check=oc)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    return eng, fe
+
+
+def test_reconcile_skips_poly_settled_leg_leftover():
+    # Poly leg EXPIRED (settled -> 0) while Kalshi remains: realized arb, not stranded.
+    eng, fe = _settled_engine(
+        open_states={"kalshi": True, "poly": False},
+        depth_states={"kalshi": "MARKET_STATE_OPEN", "poly": "MARKET_STATE_EXPIRED"})
+    snaps = [_snap("kalshi", [("K1", 2)]), _snap("poly", [])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
+
+
+def test_reconcile_skips_kalshi_finalized_leg_leftover():
+    # Kalshi market FINALIZED (settled -> 0) while Poly remains open: Kalshi's quote state is
+    # None, so this relies on open_check (status field) reporting it settled -> no halt.
+    eng, fe = _settled_engine(
+        open_states={"kalshi": False, "poly": True},
+        depth_states={"kalshi": None, "poly": "MARKET_STATE_OPEN"})
+    snaps = [_snap("kalshi", []), _snap("poly", [("P1", 2)])]   # kalshi=0 vs poly=2
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
+
+
+def test_reconcile_halts_when_both_legs_open_real_naked():
+    # Both markets OPEN but imbalanced -> a genuine stranded hedge -> still halts.
+    eng, fe = _settled_engine(
+        open_states={"kalshi": True, "poly": True},
+        depth_states={"kalshi": "MARKET_STATE_OPEN", "poly": "MARKET_STATE_OPEN"})
+    snaps = [_snap("kalshi", []), _snap("poly", [("P1", 2)])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert fe.risk.is_killed
+
+
+def test_reconcile_treats_empty_venue_read_as_down_not_naked():
+    # Poly's API returns ZERO positions (an outage) while Kalshi holds hedges on 2+ pairs, so
+    # every pair looks naked at once. That's a venue-DOWN/stale read, not simultaneous hedge
+    # failures — it must NOT halt even when it persists across checks (the outage spans them).
+    fe = _ExecR()
+    async def depth(v, m): return _open_quote("MARKET_STATE_OPEN")   # markets OPEN (not settled)
+    async def opencheck(v, m): return True
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 5000.0, reconcile_halt=True,
+        depth_fetch=depth, open_check=opencheck)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1"),
+                   ConfirmedPair("E2", "kalshi", "K2", "poly", "P2")])
+    down = [_snap("kalshi", [("K1", 40), ("K2", 30)]), _snap("poly", [])]   # poly empty (down)
+    asyncio.run(eng.reconcile_positions(down))
+    asyncio.run(eng.reconcile_positions(down))          # persists across checks, but it's a down-read
+    assert not fe.risk.is_killed                         # NOT halted (venue down, not naked)
+
+    # a SINGLE pair naked on an empty venue is below the threshold -> still treated as real
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    one = [_snap("kalshi", [("K1", 40)]), _snap("poly", [])]
+    asyncio.run(eng.reconcile_positions(one))
+    asyncio.run(eng.reconcile_positions(one))
+    assert fe.risk.is_killed                             # isolated naked still halts
+
+
+def test_reconcile_skips_settled_and_removed_leg_404():
+    # Poly settled AND was pruned -> /book 404 -> is_open None AND quote state None. The
+    # 0-position leg whose market is now unreadable is a settled leftover (not a stranded
+    # leg, whose market would still read OPEN). Must NOT halt.
+    eng, fe = _settled_engine(
+        open_states={"kalshi": True, "poly": None},     # poly 404 -> unknown
+        depth_states={"kalshi": "MARKET_STATE_OPEN", "poly": None})
+    snaps = [_snap("kalshi", [("K1", 66)]), _snap("poly", [])]  # kalshi=66 vs poly=0 (pruned)
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
+
+
 def test_index_built_from_pairs():
     eng = make_engine(FakeExec())
     assert ("kalshi", "K1") in eng._index and ("poly", "P1") in eng._index
@@ -115,6 +247,132 @@ def test_run_consumes_streams_and_stops(monkeypatch):
     assert len(fe.calls) >= 1
 
 
+def test_run_streams_during_a_slow_refresh(monkeypatch):
+    # THE duty-cycle fix: the discovery pass used to CANCEL the consumers for its whole
+    # duration (~minutes), leaving the fast path dark. Consumers must now keep consuming
+    # (and trading) WHILE a slow refresh is in progress.
+    fe = FakeExec()
+    eng = make_engine(fe)
+
+    class SlowStreamVenue:
+        def __init__(self, name, quotes):
+            self.name = name
+            self._quotes = quotes
+
+        async def stream_order_book(self, mids):
+            await asyncio.sleep(0.05)          # quotes arrive DURING the slow refresh below
+            for x in self._quotes:
+                yield x
+            await asyncio.sleep(10)            # stay open
+
+    venues = [
+        SlowStreamVenue("kalshi", [q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)]),
+        SlowStreamVenue("poly", [q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)]),
+    ]
+    refreshes = [0]
+
+    async def refresh():
+        refreshes[0] += 1
+        if refreshes[0] == 1:
+            return [ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")]   # boot: fast
+        await asyncio.sleep(10)                # second refresh is SLOW (a discovery pass)
+        return [ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")]
+
+    async def driver():
+        task = asyncio.create_task(eng.run(venues, refresh, refresh_interval=0.01))
+        await asyncio.sleep(0.3)               # well into the slow second refresh
+        assert len(fe.calls) >= 1              # traded WHILE the refresh was running
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(driver())
+
+
+def test_run_resubscribes_only_when_market_set_changes():
+    # Unchanged watchlist -> consumers keep their WS sessions (no churn); a changed
+    # market set -> resubscribe.
+    fe = FakeExec()
+    eng = make_engine(fe)
+    subscribes = []
+
+    class CountingVenue:
+        def __init__(self, name):
+            self.name = name
+
+        async def stream_order_book(self, mids):
+            subscribes.append((self.name, tuple(sorted(mids))))
+            await asyncio.sleep(10)            # stay open, never yields
+            yield None                          # pragma: no cover (makes it a generator)
+
+    venues = [CountingVenue("kalshi"), CountingVenue("poly")]
+    sets = [
+        [ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")],
+        [ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")],   # unchanged -> no resubscribe
+        [ConfirmedPair("E2", "kalshi", "K2", "poly", "P2")],   # changed -> resubscribe
+    ]
+    idx = [0]
+
+    async def refresh():
+        i = min(idx[0], len(sets) - 1)
+        idx[0] += 1
+        return sets[i]
+
+    async def driver():
+        task = asyncio.create_task(eng.run(venues, refresh, refresh_interval=0.02))
+        await asyncio.sleep(0.15)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(driver())
+    per_venue = [s for s in subscribes if s[0] == "kalshi"]
+    assert len(per_venue) == 2                                  # boot + the ONE change
+    assert per_venue[0][1] == ("K1",) and per_venue[1][1] == ("K2",)
+
+
+def test_hybrid_take_does_not_block_the_quote_loop():
+    # A slow execution must not stall on_quote: the take is spawned, on_quote returns
+    # immediately, and a second pair's edge on the same venue stream is still evaluated
+    # while the first take is mid-flight.
+    class SlowExec(FakeExec):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def execute(self, opp):
+            self.calls.append(opp)
+            self.started.set()
+            await self.release.wait()          # simulate a slow two-leg execution
+            return f"executed {opp.event_key}"
+
+    fe = SlowExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, maker_mode=True,
+        hybrid_take_depth=10)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1"),
+                   ConfirmedPair("E2", "kalshi", "K2", "poly", "P2")])
+
+    async def driver():
+        await eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
+        await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60))
+        await fe.started.wait()                # first take is now mid-flight (blocked)
+        # the quote loop must still process OTHER pairs while it runs:
+        await eng.on_quote(q("kalshi", "K2", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
+        await eng.on_quote(q("poly", "P2", yes_ask=0.62, ya=100, no_ask=0.55, na=60))
+        fe.release.set()
+        await eng.drain()
+
+    asyncio.run(driver())
+    assert len(fe.calls) == 2                  # both pairs fired despite the slow first take
+
+
 def test_edge_snapshot_only_includes_two_sided_pairs(caplog):
     import logging
     # The snapshot proves WS prices are matched to events: a pair appears only when
@@ -170,9 +428,10 @@ def test_log_edge_snapshot_ranks_by_confirmed_depth_excludes_one_sided(caplog):
     with caplog.at_level(logging.INFO, logger="bot.streaming"):
         asyncio.run(eng.log_edge_snapshot())
     text = caplog.text
-    # Both pairs quote two-sided on WS (the honest denominator), but only the genuinely
-    # two-sided REAL book is tradeable — shown with its real (non-zero) confirmed size.
-    assert "2/2 pairs two-sided on WS, 1 tradeable" in text
+    # The confirm RESEEDS the live book with REST truth: the phantom pair's one-sided
+    # real book replaces its lying WS quote, so the denominator honestly reads 1/2
+    # (pre-reseed it read 2/2 and the stale book kept re-triggering confirms).
+    assert "1/2 pairs two-sided on WS; depth-sampled top 1: 1 verified two-sided" in text
     assert "sz=500" in text          # min(K_real 500, P_real 800) from the confirmed book
     assert "sz=0" not in text        # the empty/sentinel pair is gone, not shown at size 0
 
@@ -348,6 +607,74 @@ def test_implausible_edge_skipped_as_false_match():
     asyncio.run(eng.on_quote(q("kalshi", "K1", yes_ask=0.50, ya=100, no_ask=0.50, na=100)))
     asyncio.run(eng.on_quote(q("poly", "P1", yes_ask=0.50, ya=100, no_ask=0.09, na=100)))
     assert fe.calls == []                            # 0.50+0.09=0.59 -> edge ~0.41 > 0.06 -> skip
+
+
+def test_fat_edge_fires_on_proven_complement():
+    # NO hard edge ceiling: a pair whose observed YES+NO history proves complementarity
+    # (>= ~30 samples, mean >= 0.97) fires on ANY edge — a fat edge on a proven pair is
+    # a genuine dislocation, not a false match.
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, max_plausible_edge=0.06, empirical_min_obs=4,
+        empirical_sum_floor=0.93, cooldown=0.0, clock=lambda: 0.0)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    async def driver():
+        await eng.on_quote(q("poly", "P1", yes_ask=0.52, ya=100, no_ask=0.51, na=100))
+        for _ in range(31):                       # build a ~$1.01-sum history (no edge)
+            await eng.on_quote(q("kalshi", "K1", yes_ask=0.50, ya=100, no_ask=0.50, na=100))
+        assert fe.calls == []                     # nothing fired while sum ~1.01
+        # genuine dislocation: poly NO collapses -> sum 0.90 -> edge 0.10 > the 0.06 bar
+        await eng.on_quote(q("poly", "P1", yes_ask=0.52, ya=100, no_ask=0.40, na=100))
+
+    asyncio.run(driver())
+    assert len(fe.calls) == 1                     # proven complement -> fat edge FIRES
+
+
+def test_fat_edge_unproven_observes_then_fires_once_proven():
+    # An unproven pair showing a fat edge must NOT fire yet — but it also must NOT be
+    # permanently parked (the old hard-cap behavior): once its history proves the
+    # complement, the same fat edge fires.
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, max_plausible_edge=0.06, empirical_min_obs=4,
+        empirical_sum_floor=0.93, cooldown=0.0, clock=lambda: 0.0)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    async def driver():
+        await eng.on_quote(q("poly", "P1", yes_ask=0.52, ya=100, no_ask=0.40, na=100))
+        await eng.on_quote(q("kalshi", "K1", yes_ask=0.50, ya=100, no_ask=0.50, na=100))
+        assert fe.calls == []                     # fat edge, 2 samples -> observe only
+        for _ in range(35):                       # now prove the complement (sum ~1.02)
+            await eng.on_quote(q("poly", "P1", yes_ask=0.52, ya=100, no_ask=0.52, na=100))
+        await eng.on_quote(q("poly", "P1", yes_ask=0.52, ya=100, no_ask=0.40, na=100))
+
+    asyncio.run(driver())
+    assert len(fe.calls) == 1                     # not parked: fires once proven
+
+
+def test_fat_edge_persistent_false_match_still_blacklists():
+    # A pair whose sum history sits far from $1 (a spread-vs-moneyline false match) never
+    # fires AND still gets evidence-blacklisted, exactly as before.
+    from bot.data.store import Store
+    store = Store(":memory:")
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, max_plausible_edge=0.06, empirical_min_obs=4,
+        empirical_sum_floor=0.93, cooldown=0.0, clock=lambda: 0.0, store=store)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    async def driver():
+        await eng.on_quote(q("poly", "P1", yes_ask=0.50, ya=100, no_ask=0.09, na=100))
+        for _ in range(10):                       # sum ~0.59 every tick -> false match
+            await eng.on_quote(q("kalshi", "K1", yes_ask=0.50, ya=100, no_ask=0.50, na=100))
+
+    asyncio.run(driver())
+    assert fe.calls == []                         # never traded
+    assert store.blacklisted_keys()               # and evidence-blacklisted
 
 
 def test_empirical_gate_blocks_false_match_and_confirms_real_pair():
@@ -809,9 +1136,11 @@ def test_hybrid_takes_deep_edge_that_clears_taker_bar():
 
     async def driver():
         await eng.on_quote(q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100))
-        r = await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60))
-        assert r is not None                        # taker runs inline and returns its report
-        await asyncio.gather(*list(eng._inflight))
+        # The take is SPAWNED off the quote loop (a blocking inline take stalled the
+        # venue's whole WS stream during execution), so on_quote returns None and the
+        # execution is settled via drain().
+        await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60))
+        await eng.drain()
 
     asyncio.run(driver())
     assert len(fe.taker) == 1 and fe.maker == []    # took it, did not rest a maker
@@ -914,11 +1243,12 @@ def test_reconcile_flags_and_halts_on_persistent_naked():
     eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
 
     # Kalshi holds 140, Polymarket holds nothing -> naked. First check warns, no halt.
+    # No depth_fetch -> can't verify a settled leg -> fails toward halt (real naked).
     snaps = [_snap("kalshi", [("K1", 140)]), _snap("poly", [])]
-    out = eng.reconcile_positions(snaps)
+    out = asyncio.run(eng.reconcile_positions(snaps))
     assert len(out) == 1 and not exc.risk.is_killed     # warned, not yet halted
     # Still naked on the next check -> trip the kill switch.
-    eng.reconcile_positions(snaps)
+    asyncio.run(eng.reconcile_positions(snaps))
     assert exc.risk.is_killed
 
 
@@ -931,7 +1261,7 @@ def test_reconcile_balanced_pair_is_clean():
     eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
     # Equal contracts on both legs = a locked arb, not naked.
     snaps = [_snap("kalshi", [("K1", 140)]), _snap("poly", [("P1", 140)])]
-    assert eng.reconcile_positions(snaps) == []
+    assert asyncio.run(eng.reconcile_positions(snaps)) == []
 
 
 def test_preview_no_fill_backs_off_pair():
@@ -965,3 +1295,544 @@ def test_consume_counts_ws_quotes_for_health():
 
     asyncio.run(eng._consume(V()))
     assert eng._ws_counts["kalshi"] == 2
+
+
+def test_fill_tracker_is_bounded():
+    # One _OrderState per order forever = a slow leak; the map must stay bounded.
+    from bot.streaming.fills import FillEvent, FillTracker
+
+    async def main():
+        t = FillTracker()
+        t._max = 50
+        for i in range(200):
+            await t.apply(FillEvent("kalshi", f"o{i}", "FILL", 1.0, 0.5))
+        assert len(t._orders) <= 50
+        # the most recent order's state survived
+        status, filled, _ = await t.confirm("kalshi", "o199", 1.0, timeout=0.01)
+        assert filled == 1.0
+
+    asyncio.run(main())
+
+
+def _acted_store(pairs):
+    """Store with acted opportunities for (kalshi_mkt, poly_mkt) pairs."""
+    from types import SimpleNamespace
+
+    from bot.data.store import Store
+    store = Store(":memory:")
+    for km, pm in pairs:
+        store.record_opportunity(SimpleNamespace(
+            event_key=f"{km}|{pm}", buy_yes_venue="kalshi", buy_yes_market=km,
+            buy_no_venue="poly", buy_no_market=pm, yes_price=0.4, no_price=0.55,
+            edge_per_contract=0.05, max_contracts=10, total_profit=0.5), acted=True)
+    return store
+
+
+def _hist_engine(store):
+    fe = _ExecR()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 5000.0, reconcile_halt=True,
+        store=store)
+    eng.set_pairs([ConfirmedPair("LIVE", "kalshi", "KL", "poly", "PL")])  # unrelated live pair
+    return eng, fe
+
+
+def test_reconcile_halts_unpaired_naked_via_history():
+    # THE TPZRL regression: a pair leaves the watchlist but its Kalshi leg is still held
+    # and its counterpart is FLAT — a genuinely naked leg that used to be only an INFO
+    # line. The store's acted history identifies the counterpart; persistent -> halt.
+    store = _acted_store([("K_old", "p-old")])
+    eng, fe = _hist_engine(store)
+    snaps = [_snap("kalshi", [("K_old", 3)]), _snap("poly", [("P_other", 1)])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed                       # first sighting: warn only
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert fe.risk.is_killed                           # persisted -> halt
+
+
+def test_reconcile_unpaired_but_hedged_on_counterpart_is_quiet():
+    # Both legs of the forgotten pair still hold matching size -> hedged, no alarm.
+    store = _acted_store([("K_old", "p-old")])
+    eng, fe = _hist_engine(store)
+    snaps = [_snap("kalshi", [("K_old", 3)]), _snap("poly", [("p-old", 3)])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
+
+
+def test_reconcile_unpaired_blacklisted_pair_stays_quarantined():
+    # A quarantined (blacklisted) pair's stranded leg was deliberately recorded and left —
+    # the whole point of quarantine is NOT freezing the bot on it. Must not halt.
+    store = _acted_store([("K_q", "p-q")])
+    store.blacklist_pair("kalshi", "K_q", "poly", "p-q", reason="quarantine test")
+    eng, fe = _hist_engine(store)
+    snaps = [_snap("kalshi", [("K_q", 5)]), _snap("poly", [])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
+
+
+def test_reconcile_unpaired_without_history_stays_info():
+    # No acted history for the market at all -> can't verify -> surface for a human,
+    # never halt on a guess.
+    store = _acted_store([])
+    eng, fe = _hist_engine(store)
+    snaps = [_snap("kalshi", [("K_manual", 4)]), _snap("poly", [])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
+
+
+def test_verified_pair_fires_fat_edge_with_zero_history():
+    # A rules/settlement-verified pair needs NO price history: first-ever tick with a
+    # 41% edge fires (definitional truth outranks price statistics). An unverified pair
+    # in the identical situation observes instead.
+    def make(verified):
+        fe = FakeExec()
+        eng = StreamingEngine(
+            executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+            min_edge=0.01, max_plausible_edge=0.06, empirical_min_obs=4,
+            empirical_sum_floor=0.93, cooldown=0.0, clock=lambda: 0.0)
+        pair = ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")
+        eng.set_pairs([pair])
+        if verified:
+            eng.verified_pairs = {pair.key}
+        return eng, fe
+
+    async def driver(eng):
+        await eng.on_quote(q("kalshi", "K1", yes_ask=0.50, ya=100, no_ask=0.50, na=100))
+        await eng.on_quote(q("poly", "P1", yes_ask=0.50, ya=100, no_ask=0.09, na=100))
+
+    eng, fe = make(verified=True)
+    asyncio.run(driver(eng))
+    assert len(fe.calls) == 1                        # fired on the first sighting
+
+    eng, fe = make(verified=False)
+    asyncio.run(driver(eng))
+    assert fe.calls == []                            # unverified -> observes first
+
+
+def test_fat_edge_rejects_wide_book_high_sum_history():
+    # A mean ASK-sum far ABOVE $1 = chronically wide/illiquid books (live incident: a
+    # pair averaging 1.281 "fat-fired" when one book collapsed — a quote pull, not a
+    # dislocation). The proven-complement band must reject it, floor AND ceiling.
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, max_plausible_edge=0.06, empirical_min_obs=4,
+        empirical_sum_floor=0.93, cooldown=0.0, clock=lambda: 0.0)
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    async def driver():
+        await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.78, na=100))
+        for _ in range(35):                        # wide books: sum history ~1.28
+            await eng.on_quote(q("kalshi", "K1", yes_ask=0.50, ya=100, no_ask=0.50, na=100))
+        # one book collapses -> apparent 26% "edge" on a 1.28-mean pair -> must NOT fire
+        await eng.on_quote(q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.24, na=100))
+
+    asyncio.run(driver())
+    assert fe.calls == []
+
+
+def test_reconcile_ignores_recycle_remnant():
+    # A capital-recycled pair holds only the cheap OTM leg (upset-hedge remnant) with
+    # both markets still OPEN — the reconcile must read it from the remnant registry,
+    # not as naked exposure. Larger-than-remnant imbalance still halts.
+    eng, fe = _settled_engine(
+        open_states={"kalshi": True, "poly": True},
+        depth_states={"kalshi": "MARKET_STATE_OPEN", "poly": "MARKET_STATE_OPEN"})
+    fe.recycled_remnants = {("poly", "P1"): 2.0}
+    snaps = [_snap("kalshi", []), _snap("poly", [("P1", 2)])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed
+    # imbalance beyond the registered remnant -> still a genuine naked -> halts
+    fe.recycled_remnants = {("poly", "P1"): 2.0}
+    snaps = [_snap("kalshi", []), _snap("poly", [("P1", 8)])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert fe.risk.is_killed
+
+
+def test_stream_build_opp_carries_settle_ts_from_id():
+    # The CA-gov leak: _build_opp omitted settle_ts -> 0 -> horizon gate silently OFF
+    # on the fast path (where all live fires happen). The id-parsed date must flow in.
+    from datetime import datetime, timezone
+    from bot.models import MarketQuote
+    eng = make_engine(FakeExec())
+    p = ConfirmedPair("E1", "kalshi", "KXGOVCA-26-SHIL",
+                      "poly", "ewc-usgub-ca-2026-11-03-stehil")
+    yq = MarketQuote(venue="kalshi", market_id="KXGOVCA-26-SHIL", title="",
+                     yes_ask=0.08, yes_ask_size=100, no_ask=0.93, no_ask_size=100)
+    nq = MarketQuote(venue="poly", market_id="ewc-usgub-ca-2026-11-03-stehil", title="",
+                     yes_ask=0.11, yes_ask_size=100, no_ask=0.90, no_ask_size=100)
+    opp = eng._build_opp(p, 0.01, yq, nq, 10)
+    assert opp.settle_ts > 0
+    got = datetime.fromtimestamp(opp.settle_ts, timezone.utc).strftime("%Y-%m-%d")
+    assert got == "2026-11-03"
+
+
+def test_eval_direction_depth_sweep_reprices_quotes():
+    from bot.fees import ZeroFeeModel
+    from bot.streaming.engine import StreamingEngine
+    eng = StreamingEngine.__new__(StreamingEngine)
+    eng.min_edge = 0.0
+    eng._fee = lambda v: ZeroFeeModel()
+    a = MarketQuote(venue="kalshi", market_id="K", title="",
+                    yes_ask=0.44, yes_ask_size=5, no_ask=0.60, no_ask_size=5,
+                    yes_ask_levels=((0.44, 5), (0.46, 200)),
+                    no_ask_levels=((0.60, 5),))
+    b = MarketQuote(venue="poly", market_id="P", title="",
+                    yes_ask=0.60, yes_ask_size=5, no_ask=0.50, no_ask_size=300,
+                    yes_ask_levels=((0.60, 5),),
+                    no_ask_levels=((0.50, 300),))
+    edge, yq, nq, size = eng._eval_direction(a, b)
+    assert yq.yes_ask == 0.46 and size == 205      # swept to level 2, cumulative size
+    assert abs(edge - 0.04) < 1e-9
+    # original book quotes untouched (copies were re-priced, not the shared book)
+    assert a.yes_ask == 0.44 and a.yes_ask_size == 5
+
+
+def test_confirm_reject_escalates_backoff_and_reseeds():
+    import asyncio
+    from bot.models import MarketQuote
+    from bot.streaming.engine import StreamingEngine, ConfirmedPair, LiveBook
+    from bot.fees import ZeroFeeModel
+
+    eng = StreamingEngine.__new__(StreamingEngine)
+    eng.min_edge = 0.005
+    eng._fee = lambda v: ZeroFeeModel()
+    eng.livebook = LiveBook()
+    eng._backoff_base = 30.0
+    eng._backoff_cap = 1800.0
+    eng._confirm_fails = {}
+    eng._backoff_until = {}
+    eng.clock = lambda: 1000.0
+    p = ConfirmedPair("ek", "kalshi", "K1", "poly", "P1")
+    # REST truth: NO edge (sum 1.02) — the WS book was lying
+    rest_k = MarketQuote(venue="kalshi", market_id="K1", title="",
+                         yes_ask=0.52, yes_ask_size=50, no_ask=0.50, no_ask_size=50)
+    rest_p = MarketQuote(venue="poly", market_id="P1", title="",
+                         yes_ask=0.52, yes_ask_size=50, no_ask=0.50, no_ask_size=50)
+    async def fake_fetch(venue, market):
+        return rest_k if venue == "kalshi" else rest_p
+    eng.depth_fetch = fake_fetch
+    ev = asyncio.run(eng._confirm_depth(p, quiet=True))
+    # reseed: livebook now carries the REST truth
+    assert eng.livebook.get("kalshi", "K1").yes_ask == 0.52
+    assert eng.livebook.get("poly", "P1").no_ask == 0.50
+    # and REST-seeded quotes are timestampless -> can never enable the fast path
+    assert (eng.livebook.get("kalshi", "K1").timestamp or 0) == 0
+
+
+def test_ws_trust_ladder_earns_skip_and_resets_on_lie():
+    # Three straight confirms where REST agrees with the WS claim earn the pair a
+    # trusted fast-fire (no REST round-trip); a lying book cannot climb the ladder.
+    import time as _time
+
+    class MakerFake(FakeExec):
+        async def execute_maker(self, opp):
+            self.calls.append(opp)
+            return f"executed {opp.event_key}"
+
+    fe = MakerFake()
+    fetched = []
+    honest = {"v": True}
+    t = [0.0]
+
+    async def depth_fetch(venue, mid):
+        fetched.append((venue, mid))
+        if honest["v"]:   # same books the WS shows -> agreement
+            return (q(venue, mid, yes_ask=0.40, ya=100, no_ask=0.65, na=100)
+                    if venue == "kalshi" else
+                    q(venue, mid, yes_ask=0.62, ya=100, no_ask=0.55, na=60))
+        return q(venue, mid, yes_ask=0.99, ya=1, no_ask=0.99, na=1)  # liar: no edge
+
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: t[0], depth_fetch=depth_fetch,
+        max_ws_quote_age=5.0, maker_mode=True, ws_trust_min=3,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+
+    def tick():
+        t[0] += 200.0                                 # clear the cooldown each tick
+        ka = q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100)
+        ka.timestamp = _time.time()
+        pa = q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60)
+        pa.timestamp = _time.time()
+        asyncio.run(eng.on_quote(ka))
+        asyncio.run(eng.on_quote(pa))
+
+    for _ in range(3):
+        tick()
+    assert max(eng._ws_trust.values()) >= 3           # ladder climbed on honest confirms
+    n_confirmed = len(fetched)
+    assert n_confirmed > 0
+    tick()                                            # trusted -> fires with NO REST call
+    assert len(fetched) == n_confirmed
+    assert len(fe.calls) == 4
+    # a lying book can never climb: reset and confirm against the liar
+    honest["v"] = False
+    eng._ws_trust = {k: 0 for k in eng._ws_trust}
+    tick()
+    assert max(eng._ws_trust.values()) == 0
+
+
+def test_ws_synced_uses_exchange_time_over_arrival():
+    import time as _time
+    from bot.streaming.engine import StreamingEngine
+    eng = StreamingEngine.__new__(StreamingEngine)
+    eng.sync_window_secs = 0.1
+    now = _time.time()
+    # arrival times 80ms apart (inside window) but EXCHANGE times 5s apart:
+    # one venue repriced, the other book is old news delivered late -> NOT synced
+    a = q("kalshi", "K1", yes_ask=0.40, ya=50, no_ask=0.62, na=50)
+    b = q("poly", "P1", yes_ask=0.62, ya=50, no_ask=0.55, na=50)
+    a.timestamp = now; b.timestamp = now - 0.08
+    a.exchange_ts = now - 0.01; b.exchange_ts = now - 5.0
+    assert not eng._ws_synced(a, b)
+    # exchange times 50ms apart -> genuinely simultaneous repricing -> synced,
+    # even with arrival skew near the window edge (transport jitter)
+    b.exchange_ts = now - 0.06
+    assert eng._ws_synced(a, b)
+    # missing exchange ts on one side falls back to arrival comparison
+    b.exchange_ts = None
+    assert eng._ws_synced(a, b)
+
+
+def test_kalshi_parse_ticker_carries_exchange_ts():
+    from bot.venues.kalshi import parse_ticker
+    msg = {"type": "ticker", "msg": {
+        "market_ticker": "KXT-1", "yes_bid_dollars": "0.40", "yes_ask_dollars": "0.42",
+        "yes_bid_size_fp": "10", "yes_ask_size_fp": "12", "ts_ms": 1783440160211}}
+    quote = parse_ticker(msg)
+    assert abs(quote.exchange_ts - 1783440160.211) < 1e-6
+
+
+def test_rules_gate_blocks_unchecked_pairs():
+    # A pair with NO rules verdict may not trade (the FTTS incident traded 4 minutes
+    # after appearing, before the rules loop reached it); a checked pair fires.
+    import time as _time
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0,
+        max_ws_quote_age=5.0, require_rules_verify=True,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    now = _time.time()
+    ka = q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100); ka.timestamp = now
+    pa = q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60); pa.timestamp = now
+    asyncio.run(eng.on_quote(ka)); asyncio.run(eng.on_quote(pa))
+    assert fe.calls == []                          # unchecked -> blocked
+    eng.rules_checked = {eng._pairs[next(iter(eng._pairs))].key} if hasattr(eng, "_pairs") else set()
+    # simpler: mark via the pair's own key
+    for p in [ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")]:
+        eng.rules_checked = {p.key}
+    eng._last_acted.clear()
+    asyncio.run(eng.on_quote(ka)); asyncio.run(eng.on_quote(pa))
+    assert len(fe.calls) == 1                      # checked -> trades
+
+
+def test_reconcile_dust_remnant_does_not_halt():
+    # a worthless leftover (bid ~1c on 5 contracts = $0.05) must not trip the kill
+    # switch; the fail-closed path (unreadable book -> still naked) is covered by
+    # test_reconcile_ignores_recycle_remnant's genuine-naked case.
+    eng, fe = _settled_engine(
+        open_states={"kalshi": True, "poly": True},
+        depth_states={"kalshi": "MARKET_STATE_OPEN", "poly": "MARKET_STATE_OPEN"})
+    async def penny_depth(venue, mid):
+        return q(venue, mid, yes_ask=0.99, ya=1, no_ask=0.99, na=1)   # bids = 0.01
+    eng.depth_fetch = penny_depth
+    snaps = [_snap("kalshi", []), _snap("poly", [("P1", 5)])]
+    asyncio.run(eng.reconcile_positions(snaps))
+    asyncio.run(eng.reconcile_positions(snaps))
+    assert not fe.risk.is_killed                     # $0.05 of dust: no halt
+
+
+def test_one_way_pair_fires_only_safe_direction():
+    # timing-scope pair: YES must sit on the wider-window venue (kalshi). The edge
+    # here favors YES on POLY -> refused; flipping the books so kalshi is the YES
+    # side -> fires.
+    import time as _time
+    fe = FakeExec()
+    eng = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, max_ws_quote_age=5.0,
+    )
+    eng.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    pair = ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")
+    eng.one_way_yes = {pair.key: "kalshi"}
+    now = _time.time()
+    # direction: YES poly (0.40) + NO kalshi (0.55) -> UNSAFE (yes on poly)
+    ka = q("kalshi", "K1", yes_ask=0.62, ya=100, no_ask=0.55, na=100); ka.timestamp = now
+    pa = q("poly", "P1", yes_ask=0.40, ya=100, no_ask=0.65, na=60); pa.timestamp = now
+    asyncio.run(eng.on_quote(ka)); asyncio.run(eng.on_quote(pa))
+    assert fe.calls == []
+    # flip the books: YES kalshi (0.40) + NO poly (0.55) -> SAFE -> fires
+    eng2 = StreamingEngine(
+        executor=fe, fee_models={"kalshi": ZeroFeeModel(), "poly": ZeroFeeModel()},
+        min_edge=0.01, cooldown=100.0, clock=lambda: 0.0, max_ws_quote_age=5.0,
+    )
+    eng2.set_pairs([ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")])
+    eng2.one_way_yes = {pair.key: "kalshi"}
+    ka2 = q("kalshi", "K1", yes_ask=0.40, ya=100, no_ask=0.65, na=100); ka2.timestamp = now
+    pa2 = q("poly", "P1", yes_ask=0.62, ya=100, no_ask=0.55, na=60); pa2.timestamp = now
+    asyncio.run(eng2.on_quote(ka2)); asyncio.run(eng2.on_quote(pa2))
+    assert len(fe.calls) == 1
+
+
+def test_timing_scope_keys_from_legacy_rationale_and_new_column():
+    from bot.data.store import Store
+    st = Store(":memory:")
+    # legacy row: material=0, rationale mentions extra time
+    st.record_rules_verdict("kalshi", "KA", "polymarket_us", "PA",
+                            identical=False, confidence=1.0,
+                            rationale="Market A includes extra time while B does not")
+    # new row: explicit category — but the belt+suspenders guard also requires
+    # window language in the rationale (the category was briefly misused for
+    # listing-time skew, which must not restrict anything)
+    st.record_rules_verdict("kalshi", "KB", "polymarket_us", "PB",
+                            identical=False, confidence=1.0,
+                            rationale="A counts extra time while B settles on regulation",
+                            divergence="timing_scope")
+    # timing_scope WITHOUT window language (listing-skew misuse) -> not restricted
+    st.record_rules_verdict("kalshi", "KD", "polymarket_us", "PD",
+                            identical=False, confidence=1.0,
+                            rationale="different resolution times", divergence="timing_scope")
+    # different_event stays a hard drop, NOT one-way
+    st.record_rules_verdict("kalshi", "KC", "polymarket_us", "PC",
+                            identical=False, confidence=1.0,
+                            rationale="different teams", material=True,
+                            divergence="different_event")
+    keys = st.timing_scope_keys()
+    assert len(keys) == 2
+    assert st._pair_key("kalshi", "KC", "polymarket_us", "PC") in st.rules_divergent_keys()
+    assert st._pair_key("kalshi", "KA", "polymarket_us", "PA") not in st.rules_divergent_keys()
+    st.close()
+
+
+def test_livebook_asof_rewinds_event_time():
+    import dataclasses
+    from bot.streaming.engine import LiveBook
+    lb = LiveBook()
+    base = q("poly", "P1", yes_ask=0.40, ya=10)
+    for ts, ask in ((100.0, 0.40), (100.2, 0.45), (100.4, 0.50)):
+        quote = dataclasses.replace(base, yes_ask=ask)
+        quote.exchange_ts = ts
+        lb.update(quote)
+    assert lb.asof("poly", "P1", 100.25).yes_ask == 0.45   # rewound between ticks
+    assert lb.asof("poly", "P1", 100.5).yes_ask == 0.50    # latest
+    assert lb.asof("poly", "P1", 99.9) is None             # before history
+
+
+def test_aligned_edge_separates_standing_from_skew_phantom(monkeypatch):
+    import dataclasses
+    import time as _time
+    ex = FakeExec()
+    eng = make_engine(ex)
+    now = _time.time()
+    # SKEW PHANTOM: poly just moved (yes 0.40) creating an apparent edge against
+    # kalshi's 300ms-old book (no 0.55); at kalshi's event time poly was 0.47 (no
+    # edge). Rewinding poly must kill the fast-take.
+    kq = q("kalshi", "K1", no_ask=0.55, na=50); kq.exchange_ts = now - 0.30
+    kq.timestamp = now - 0.05
+    p_old = q("poly", "P1", yes_ask=0.47, ya=50); p_old.exchange_ts = now - 0.35
+    p_new = q("poly", "P1", yes_ask=0.40, ya=50); p_new.exchange_ts = now - 0.02
+    p_new.timestamp = now - 0.01
+    eng.livebook.update(p_old); eng.livebook.update(p_new)
+    assert not eng._aligned_edge_ok(p_new, kq)
+    # STANDING dislocation: poly was ALREADY 0.40 at kalshi's event time.
+    eng2 = make_engine(FakeExec())
+    p_old2 = q("poly", "P1", yes_ask=0.40, ya=50); p_old2.exchange_ts = now - 0.35
+    eng2.livebook.update(p_old2); eng2.livebook.update(p_new)
+    assert eng2._aligned_edge_ok(p_new, kq)
+
+
+def test_resubscribe_streams_before_prime_completes():
+    # THE dark-window regression test: a prime that never finishes must NOT block
+    # quote consumption — consumers start first, prime runs in the background.
+    # (Observed live: ~6min REST primes with consumers torn down, 17x in 3h.)
+    import asyncio as aio
+
+    ex = FakeExec()
+    eng = make_engine(ex)
+    blocked = aio.Event()
+
+    async def never_fetch(venue, market):
+        blocked.set()
+        await aio.Event().wait()               # prime hangs forever
+
+    eng.depth_fetch = never_fetch
+    eng.prime_concurrency = 2
+    consumed = []
+
+    class _V:
+        name = "kalshi"
+        async def stream_order_book(self, mids):
+            consumed.append(list(mids))
+            q1 = q("kalshi", "K1", no_ask=0.55, na=50)
+            yield q1
+            await aio.Event().wait()
+
+    async def refresh():
+        return [ConfirmedPair("E1", "kalshi", "K1", "poly", "P1")]
+
+    async def main():
+        task = aio.create_task(eng.run([_V()], refresh, refresh_interval=9999))
+        await aio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except aio.CancelledError:
+            pass
+
+    aio.run(main())
+    assert consumed, "consumers never started while prime was blocked"
+    assert blocked.is_set(), "background prime never ran"
+
+
+def test_sweep_fires_fattest_edge_first():
+    # Two standing edges after a prime: the 5c pair must claim capital before the
+    # 1c pair — allocation order is edge-descending, not dict order.
+    import asyncio as aio
+    ex = FakeExec()
+    eng = make_engine(ex, cooldown=0.0)
+    eng.require_rules_verify = False
+    eng.empirical_min_obs = 0
+    eng.edge_persist_secs = 0.0
+    eng.set_pairs([ConfirmedPair("THIN", "kalshi", "K1", "poly", "P1"),
+                   ConfirmedPair("FAT", "kalshi", "K2", "poly", "P2")])
+    # thin: 0.43+0.55 -> 2c ; fat: 0.40+0.55 -> 5c
+    for quote in (q("poly", "P1", yes_ask=0.43, ya=50), q("kalshi", "K1", no_ask=0.55, na=50),
+                  q("poly", "P2", yes_ask=0.40, ya=50), q("kalshi", "K2", no_ask=0.55, na=50)):
+        eng.livebook.update(quote)
+    async def _echo(venue, market):
+        return eng.livebook.get(venue, market)   # REST confirm sees the same books
+    eng.depth_fetch = _echo
+    aio.run(eng.prime_and_sweep())
+    assert len(ex.calls) == 2
+    assert ex.calls[0].event_key == "FAT", \
+        f"fat edge must fire first, got {[c.event_key for c in ex.calls]}"
+
+
+def test_comovement_separates_dislocation_from_conflict():
+    from collections import deque
+    ex = FakeExec()
+    eng = make_engine(ex)
+    key = ("k",)
+    # coupled legs: same news moves both (dYes up, dNo down) -> corr ~ +1
+    eng._comove[key] = deque([(0.03, -0.03), (-0.02, 0.02), (0.04, -0.04),
+                              (0.01, -0.01), (-0.03, 0.03), (0.02, -0.02),
+                              (0.05, -0.05), (-0.01, 0.01)])
+    assert eng._comove_corr(key) > 0.95
+    # strangers: independent moves -> corr ~ 0
+    eng._comove[key] = deque([(0.03, 0.02), (-0.02, 0.03), (0.04, -0.01),
+                              (0.01, 0.04), (-0.03, -0.02), (0.02, 0.01),
+                              (0.05, 0.02), (-0.01, -0.03)])
+    assert abs(eng._comove_corr(key)) < 0.6
+    # below 8 paired ticks -> no verdict either way
+    eng._comove[key] = deque([(0.03, -0.03)] * 5)
+    assert eng._comove_corr(key) is None

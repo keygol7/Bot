@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from bot.matching.scope import (
+    id_scope_mismatch,
     is_allowed_kalshi_series,
     is_tradeable_market_type,
     scope_mismatch,
@@ -135,6 +136,141 @@ CREATE TABLE IF NOT EXISTS match_blacklist (
     ts        REAL,
     PRIMARY KEY (venue_a, market_a, venue_b, market_b)
 );
+
+-- Empirical per-market fill reliability: did a FOK order actually FILL (real depth) or
+-- KILL/REJECT (phantom depth)? This is the live, learned replacement for the volume proxy —
+-- a market is probed small until it proves it fills, then scaled up; one that keeps failing
+-- its hedge is excluded. Persisted so the verdict survives restarts.
+CREATE TABLE IF NOT EXISTS market_reliability (
+    venue      TEXT NOT NULL,
+    market_id  TEXT NOT NULL,
+    fills      INTEGER NOT NULL DEFAULT 0,
+    fails      INTEGER NOT NULL DEFAULT 0,
+    streak     INTEGER NOT NULL DEFAULT 0,   -- CONSECUTIVE fails (reset to 0 on a fill)
+    max_fill   REAL NOT NULL DEFAULT 0,       -- largest size a real FOK has FILLED (for scale-up)
+    ts         REAL,
+    PRIMARY KEY (venue, market_id)
+);
+
+-- Title-embedding cache. Market titles are stable strings, but the discovery cycle was
+-- re-embedding the ENTIRE scanned board every pass (~3.4k calls/cycle -> ~8-minute
+-- cycles). Persisting text-hash -> vector means each pass embeds only NEW titles, and a
+-- restart doesn't re-pay the whole board. vec is packed float32 (array('f').tobytes()).
+CREATE TABLE IF NOT EXISTS embedding_cache (
+    model      TEXT NOT NULL,
+    text_hash  TEXT NOT NULL,
+    vec        BLOB NOT NULL,
+    ts         REAL NOT NULL,
+    PRIMARY KEY (model, text_hash)
+);
+
+-- Settlement ground truth: every settled pair is a completed experiment. If a matched
+-- pair's two legs ever SETTLE DIFFERENTLY, that's PROOF of a false match (no statistics
+-- needed) -> blacklist. Consistent settlements accumulate as positive evidence per pair.
+CREATE TABLE IF NOT EXISTS settlement_checks (
+    venue_a    TEXT NOT NULL,
+    market_a   TEXT NOT NULL,
+    venue_b    TEXT NOT NULL,
+    market_b   TEXT NOT NULL,
+    result_a   TEXT,               -- yes/no as settled on venue A
+    result_b   TEXT,               -- yes/no as settled on venue B (inferred from realized)
+    consistent INTEGER NOT NULL,   -- 1 = same outcome (true match), 0 = DIVERGED (false)
+    ts         REAL NOT NULL,
+    PRIMARY KEY (venue_a, market_a, venue_b, market_b)
+);
+
+-- Canonical contracts (canonicalize-then-join matching): ONE cached LLM extraction per
+-- market (from its resolution rules), matched by deterministic join on the fields that
+-- decide settlement. O(N) LLM work instead of O(N^2) pairwise confirms; domain-agnostic.
+CREATE TABLE IF NOT EXISTS market_canon (
+    venue       TEXT NOT NULL,
+    market_id   TEXT NOT NULL,
+    event_type  TEXT,
+    entities    TEXT,              -- JSON array, lowercase canonical names
+    subject     TEXT,              -- the ONE entity YES pays for (null: draw/range)
+    metric      TEXT,
+    comparator  TEXT,
+    value       REAL,
+    period      TEXT,
+    date        TEXT,              -- YYYY-MM-DD event date
+    confidence  REAL,
+    ts          REAL NOT NULL,
+    PRIMARY KEY (venue, market_id)
+);
+CREATE INDEX IF NOT EXISTS idx_canon_join ON market_canon (event_type, metric, date);
+
+-- Rules-text verification: LLM comparison of the two markets' RESOLUTION RULES (the
+-- contract, not the title). identical=1 pairs are definitionally the same bet -> the
+-- streaming engine may fire fat edges on them with no price history.
+CREATE TABLE IF NOT EXISTS rules_verdicts (
+    venue_a    TEXT NOT NULL,
+    market_a   TEXT NOT NULL,
+    venue_b    TEXT NOT NULL,
+    market_b   TEXT NOT NULL,
+    identical  INTEGER NOT NULL,
+    confidence REAL,
+    rationale  TEXT,
+    material   INTEGER,           -- 1 = different-event divergence (demote); NULL = legacy
+    ts         REAL NOT NULL,
+    PRIMARY KEY (venue_a, market_a, venue_b, market_b)
+);
+
+-- Capital-recycler remnants: the unsold cheap OTM leg of an early-exited pair, held to
+-- settlement as a free upset-hedge. Persisted so a restart doesn't make the reconcile
+-- read the lone leg as naked exposure (-> false kill switch).
+CREATE TABLE IF NOT EXISTS recycle_remnants (
+    venue      TEXT NOT NULL,
+    market_id  TEXT NOT NULL,
+    qty        REAL NOT NULL,
+    ts         REAL NOT NULL,
+    PRIMARY KEY (venue, market_id)
+);
+
+-- Kalshi series metadata (synced from /series): the data-driven semantics source for
+-- deterministic id parsing — title ("F1 Fastest Lap"), category, tags (JSON array).
+CREATE TABLE IF NOT EXISTS kalshi_series (
+    ticker    TEXT PRIMARY KEY,
+    title     TEXT,
+    category  TEXT,
+    tags      TEXT,
+    ts        REAL NOT NULL
+);
+
+-- External transfers (deposits/withdrawals): the ground truth that separates DEPOSITS
+-- from GAINS in equity-based PnL. Kalshi rows sync from /portfolio/deposits+withdrawals
+-- (deduped by external_id); Polymarket has no API for this -> manual rows via
+-- ``--record-transfer``. amount is SIGNED dollars (+in/-out), net of venue fees.
+CREATE TABLE IF NOT EXISTS transfers (
+    ts          REAL NOT NULL,
+    venue       TEXT NOT NULL,
+    amount      REAL NOT NULL,
+    source      TEXT NOT NULL,          -- 'kalshi_api' | 'manual'
+    external_id TEXT UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_transfers_ts ON transfers(ts);
+
+-- Equity snapshots: total account value (cash + open-position cost basis, per venue)
+-- sampled periodically. The ONLY reliable PnL source — venue records don't window by
+-- time, local fills overstate cost, and Poly's settled positions age out. A "last N
+-- hours" PnL is then just latest_equity - equity_N_hours_ago (mind external transfers).
+CREATE TABLE IF NOT EXISTS equity_snapshots (
+    ts            REAL NOT NULL,
+    kalshi_cash   REAL NOT NULL,
+    poly_cash     REAL NOT NULL,
+    kalshi_pos    REAL NOT NULL,
+    poly_pos      REAL NOT NULL,
+    total         REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_snapshots(ts);
+
+-- Time/market indices: the settled-PnL reconciliation, reconcile pairing, and every
+-- "last N hours" query scan these tables, which grow without bound.
+CREATE INDEX IF NOT EXISTS idx_pnl_ts            ON pnl (ts);
+CREATE INDEX IF NOT EXISTS idx_fills_ts          ON fills (ts);
+CREATE INDEX IF NOT EXISTS idx_fills_market      ON fills (venue, market_id);
+CREATE INDEX IF NOT EXISTS idx_opportunities_ts  ON opportunities (ts);
+CREATE INDEX IF NOT EXISTS idx_opps_acted        ON opportunities (acted);
+CREATE INDEX IF NOT EXISTS idx_embed_ts          ON embedding_cache (ts);
 """
 
 
@@ -145,7 +281,10 @@ class Store:
             parent = Path(path).expanduser().parent
             if parent and not parent.exists():
                 parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        # check_same_thread=False: the heavy fingerprint sweep runs via
+        # asyncio.to_thread so it can't starve the WS keepalives; access remains
+        # serialized (the event loop awaits the thread — no concurrent use).
+        self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         # WAL + NORMAL sync: many small writes per cycle without an fsync per commit.
         try:
@@ -154,6 +293,33 @@ class Store:
         except sqlite3.OperationalError:
             pass  # e.g. :memory: — fall back to defaults
         self.conn.executescript(_SCHEMA)
+        # Migrations: add market_reliability columns to DBs created before they existed.
+        _rel_cols = {r["name"] for r in
+                     self.conn.execute("PRAGMA table_info(market_reliability)")}
+        if "streak" not in _rel_cols:
+            self.conn.execute(
+                "ALTER TABLE market_reliability ADD COLUMN streak INTEGER NOT NULL DEFAULT 0")
+        if "max_fill" not in _rel_cols:
+            self.conn.execute(
+                "ALTER TABLE market_reliability ADD COLUMN max_fill REAL NOT NULL DEFAULT 0")
+        # rules_verdicts.material: 1 = different-event divergence (never a hedge -> demote),
+        # 0 = tail-scenario/identical, NULL = legacy row from the pre-classification prompt —
+        # rules_checked() treats NULL as unchecked so old verdicts re-verify organically.
+        _rv_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(rules_verdicts)")}
+        if "divergence" not in _rv_cols:
+            self.conn.execute("ALTER TABLE rules_verdicts ADD COLUMN divergence TEXT")
+            _rv_cols.add("divergence")
+        if "stricter_side" not in _rv_cols:
+            self.conn.execute("ALTER TABLE rules_verdicts ADD COLUMN stricter_side TEXT")
+            _rv_cols.add("stricter_side")
+        if "material" not in _rv_cols:
+            self.conn.execute("ALTER TABLE rules_verdicts ADD COLUMN material INTEGER")
+        # pnl.event_key: pair attribution for every booking. Without it, per-pair booked
+        # profit is unqueryable (note='arb locked' carries no identity) — the root of the
+        # QOR mis-analysis. NULL = legacy rows.
+        _pnl_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(pnl)")}
+        if "event_key" not in _pnl_cols:
+            self.conn.execute("ALTER TABLE pnl ADD COLUMN event_key TEXT")
         self.conn.commit()
 
     def close(self) -> None:
@@ -240,10 +406,10 @@ class Store:
         )
         self.conn.commit()
 
-    def record_pnl(self, amount: float, note: str = "") -> None:
+    def record_pnl(self, amount: float, note: str = "", event_key: str | None = None) -> None:
         self.conn.execute(
-            "INSERT INTO pnl (ts, amount, note) VALUES (?, ?, ?)",
-            (time.time(), amount, note),
+            "INSERT INTO pnl (ts, amount, note, event_key) VALUES (?, ?, ?, ?)",
+            (time.time(), amount, note, event_key),
         )
         self.conn.commit()
 
@@ -253,9 +419,136 @@ class Store:
 
     # ---- match verdict cache ----
     @staticmethod
-    def _pair_key(va: str, ma: str, vb: str, mb: str) -> tuple[str, str, str, str]:
+    def _pair_key(va: str, ma: str, vb: str, mb: str) -> tuple:
         # Order-independent: a pair is the same regardless of argument order.
-        return tuple(sorted([(va, ma), (vb, mb)]))[0] + tuple(sorted([(va, ma), (vb, mb)]))[1]
+        # FORMAT CONTRACT: must equal streaming.ConfirmedPair.key (sorted 2-tuples).
+        # The old flat 4-tuple silently never matched the engine runtime keys —
+        # the rules gate over-blocked every non-identical pair (47k rules_pending/
+        # day), one-way and divergence floors were inert, and identity-certain
+        # privileges never applied. One format, one truth (2026-07-08).
+        return tuple(sorted([(va, ma), (vb, mb)]))
+
+    def record_equity(self, kalshi_cash: float, poly_cash: float,
+                      kalshi_pos: float, poly_pos: float) -> None:
+        total = kalshi_cash + poly_cash + kalshi_pos + poly_pos
+        self.conn.execute(
+            "INSERT INTO equity_snapshots (ts, kalshi_cash, poly_cash, kalshi_pos, "
+            "poly_pos, total) VALUES (?, ?, ?, ?, ?, ?)",
+            (time.time(), kalshi_cash, poly_cash, kalshi_pos, poly_pos, total))
+        self.conn.commit()
+
+    def upsert_series(self, rows) -> None:
+        """Bulk-sync Kalshi series metadata ({ticker,title,category,tags} dicts)."""
+        now = time.time()
+        self.conn.executemany(
+            "INSERT INTO kalshi_series (ticker, title, category, tags, ts) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(ticker) DO UPDATE SET "
+            "title=excluded.title, category=excluded.category, tags=excluded.tags, "
+            "ts=excluded.ts",
+            [(r.get("ticker"), r.get("title"), r.get("category"),
+              json.dumps(r.get("tags") or []), now) for r in rows if r.get("ticker")])
+        self.conn.commit()
+
+    def series_meta_map(self) -> dict:
+        """ticker -> {title, category, tags} for deterministic parsing."""
+        return {r["ticker"]: {"title": r["title"], "category": r["category"],
+                              "tags": json.loads(r["tags"] or "[]")}
+                for r in self.conn.execute(
+                    "SELECT ticker, title, category, tags FROM kalshi_series")}
+
+    def record_idparse_verdicts(self, pairs) -> int:
+        """Persist deterministic join results as match verdicts (INSERT-only: never
+        overwrite an existing verdict, LLM or otherwise). The watchlist, fan-out,
+        blacklist and rules-verify machinery then treat them like any confirm —
+        idparse is a verdict SOURCE, not a hot-path union member (the whole-board
+        join takes minutes and runs in a subprocess on its own cadence)."""
+        now = time.time()
+        cur = self.conn.executemany(
+            "INSERT OR IGNORE INTO match_verdicts (venue_a, market_a, venue_b, "
+            "market_b, same_event, confidence, rationale, event_key, ts) "
+            "VALUES (?, ?, ?, ?, 1, 0.99, 'idparse', ?, ?)",
+            [(p[0], p[1], p[2], p[3], p[4], now) for p in pairs])
+        self.conn.commit()
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def idparse_pairs(self, *, max_age_days: float = 2.0) -> list[tuple]:
+        """Deterministic id-parse join over recently-scanned markets — the LLM-free
+        union member (mirrors canon_pairs' contract). Fail-closed parsing; the shared
+        fan-out/blacklist backstops apply in confirmed_pairs."""
+        from bot.matching.idparse import join_pairs, parse_kalshi, parse_poly
+
+        series = self.series_meta_map()
+        cutoff = time.time() - max_age_days * 86400.0
+        kk, pk = [], []
+        for r in self.conn.execute(
+                "SELECT venue, market_id, title FROM markets WHERE updated_at >= ?",
+                (cutoff,)):
+            if r["venue"] == "kalshi":
+                meta = series.get((r["market_id"] or "").split("-")[0])
+                kk.append(parse_kalshi(r["market_id"], r["title"] or "", meta))
+            elif r["venue"] == "polymarket_us":
+                pk.append(parse_poly(r["market_id"], r["title"] or ""))
+        pairs = []
+        for a, b in join_pairs(kk, pk):
+            pairs.append(("kalshi", a.market_id, "polymarket_us", b.market_id,
+                          f"kalshi:{a.market_id}|polymarket_us:{b.market_id}"))
+        return pairs
+
+    def record_transfer(self, venue: str, amount: float, *, source: str = "manual",
+                        external_id: str | None = None, ts: float | None = None) -> bool:
+        """Record an external deposit (+) / withdrawal (−). Returns False when a row
+        with the same external_id already exists (idempotent venue syncs)."""
+        try:
+            self.conn.execute(
+                "INSERT INTO transfers (ts, venue, amount, source, external_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ts if ts is not None else time.time(), venue, amount, source, external_id))
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False                              # duplicate external_id -> already known
+
+    def transfers_net(self, since_ts: float, until_ts: float | None = None) -> float:
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) s FROM transfers WHERE ts > ? AND ts <= ?",
+            (since_ts, until_ts if until_ts is not None else time.time())).fetchone()
+        return float(row["s"])
+
+    def equity_pnl(self, hours: float = 24.0):
+        """(trading_pnl, from_total, to_total, from_ts, net_transfers) over the window,
+        or None if no baseline snapshot exists yet. trading_pnl = equity delta MINUS the
+        net external transfers in the window — deposits are not gains, withdrawals are
+        not losses. Kalshi transfers sync from the venue API; Poly ones must be recorded
+        manually (--record-transfer), else they'll show up here as phantom pnl."""
+        cutoff = time.time() - hours * 3600.0
+        latest = self.conn.execute(
+            "SELECT ts, total FROM equity_snapshots ORDER BY ts DESC LIMIT 1").fetchone()
+        base = self.conn.execute(
+            "SELECT ts, total FROM equity_snapshots WHERE ts <= ? ORDER BY ts DESC LIMIT 1",
+            (cutoff,)).fetchone()
+        if base is None:                          # not enough history yet -> oldest we have
+            base = self.conn.execute(
+                "SELECT ts, total FROM equity_snapshots ORDER BY ts ASC LIMIT 1").fetchone()
+        if latest is None or base is None or latest["ts"] == base["ts"]:
+            return None
+        xfers = self.transfers_net(base["ts"], latest["ts"])
+        return (round(latest["total"] - base["total"] - xfers, 2), round(base["total"], 2),
+                round(latest["total"], 2), base["ts"], round(xfers, 2))
+
+    def entry_cost_for_pair(self, va: str, ma: str, vb: str, mb: str):
+        """(yes_price, no_price) of the most-recent ACTED opportunity for this pair, or
+        None if never acted. Order-independent — the early-exit trigger needs the entry
+        cost basis regardless of which leg the caller names first."""
+        key = self._pair_key(va, ma, vb, mb)
+        for r in self.conn.execute(
+            "SELECT buy_yes_venue, buy_yes_market, buy_no_venue, buy_no_market, "
+            "yes_price, no_price FROM opportunities WHERE acted = 1 ORDER BY rowid DESC"):
+            if self._pair_key(r["buy_yes_venue"], r["buy_yes_market"],
+                              r["buy_no_venue"], r["buy_no_market"]) == key:
+                if r["yes_price"] is None or r["no_price"] is None:
+                    return None
+                return float(r["yes_price"]), float(r["no_price"])
+        return None
 
     # ---- empirical false-match blacklist (Layer 2 learning loop) ----
     def blacklist_pair(self, va: str, ma: str, vb: str, mb: str, *,
@@ -264,7 +557,7 @@ class Store:
         """Persist a CONFIRMED false match so it's excluded from matching forever (the
         engine calls this when a pair's price behavior empirically proves the legs aren't
         complements). Order-independent; idempotent (keeps the latest verdict)."""
-        a, ma2, b, mb2 = self._pair_key(va, ma, vb, mb)
+        (a, ma2), (b, mb2) = self._pair_key(va, ma, vb, mb)
         self.conn.execute(
             """INSERT INTO match_blacklist
                  (venue_a, market_a, venue_b, market_b, reason, mean_sum, samples, ts)
@@ -279,24 +572,442 @@ class Store:
     def blacklisted_keys(self) -> set:
         """All confirmed false-match pairs as order-independent keys, for fast exclusion."""
         return {
-            (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
+            self._pair_key(r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
             for r in self.conn.execute(
                 "SELECT venue_a, market_a, venue_b, market_b FROM match_blacklist")
         }
 
     def _drop_blacklisted(self, pairs: list[tuple]) -> list[tuple]:
-        """Remove any confirmed false-match pairs from a watchlist result."""
-        bl = self.blacklisted_keys()
-        if not bl:
+        """Remove confirmed false matches AND confidently rules-divergent pairs from a
+        watchlist result. Divergent rules = the contracts settle differently in some
+        outcome = not a hedge (learned the hard way: a divergent-at-1.0 pair was left
+        tradeable and produced a naked leg when its legs settled independently)."""
+        drop = self.blacklisted_keys() | self.rules_divergent_keys()
+        if not drop:
             return pairs
-        return [p for p in pairs if self._pair_key(p[0], p[1], p[2], p[3]) not in bl]
+        return [p for p in pairs if self._pair_key(p[0], p[1], p[2], p[3]) not in drop]
+
+    # ---- empirical per-market fill reliability (probe-then-scale) ----
+    def record_market_outcome(self, venue: str, market_id: str, ok: bool,
+                              fill_size: float = 0.0) -> None:
+        """Record one FOK outcome for a market: ok=filled (real depth) / not (phantom).
+        ``streak`` is the CONSECUTIVE-fail count (reset to 0 on a fill) — it catches a
+        once-proven market whose depth later vanishes. ``max_fill`` tracks the LARGEST size
+        a real FOK actually filled, so the sizer can scale up on demonstrated depth instead
+        of a slow per-fill count."""
+        mf = float(fill_size) if ok else 0.0
+        self.conn.execute(
+            """INSERT INTO market_reliability (venue, market_id, fills, fails, streak, max_fill, ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(venue, market_id) DO UPDATE SET
+                 fills=fills+?, fails=fails+?,
+                 streak=CASE WHEN ?=1 THEN 0 ELSE streak+1 END,
+                 max_fill=MAX(max_fill, ?),
+                 ts=excluded.ts""",
+            (venue, market_id, 1 if ok else 0, 0 if ok else 1, 0 if ok else 1, mf, time.time(),
+             1 if ok else 0, 0 if ok else 1, 1 if ok else 0, mf),
+        )
+        self.conn.commit()
+
+    def market_reliability(self) -> dict:
+        """All markets' (fills, fails, streak, max_fill) by (venue, market_id), for the gate."""
+        return {
+            (r["venue"], r["market_id"]): (r["fills"], r["fails"], r["streak"], r["max_fill"])
+            for r in self.conn.execute(
+                "SELECT venue, market_id, fills, fails, streak, max_fill FROM market_reliability")
+        }
+
+    def acted_pair_map(self) -> dict:
+        """(venue, market) -> its historical counterpart, from every ACTED opportunity.
+
+        The live watchlist forgets a pair once it's pruned (settled/thin), but a held
+        position on a forgotten market still has a knowable counterpart here — used by
+        the reconcile to verify 'unpaired' positions instead of just logging them
+        (the TPZRL naked leg sat exactly in that blind spot)."""
+        out: dict = {}
+        for r in self.conn.execute(
+            "SELECT DISTINCT buy_yes_venue, buy_yes_market, buy_no_venue, buy_no_market "
+            "FROM opportunities WHERE acted = 1"):
+            a = (r["buy_yes_venue"], r["buy_yes_market"])
+            b = (r["buy_no_venue"], r["buy_no_market"])
+            out[a] = b
+            out[b] = a
+        return out
+
+    # ---- capital-recycler remnants ----
+
+    def record_recycle_remnant(self, venue: str, market_id: str, qty: float) -> None:
+        """Upsert the held OTM remnant qty for a recycled pair (0 clears it)."""
+        if qty <= 1e-9:
+            self.clear_recycle_remnant(venue, market_id)
+            return
+        self.conn.execute(
+            "INSERT OR REPLACE INTO recycle_remnants (venue, market_id, qty, ts) "
+            "VALUES (?, ?, ?, ?)", (venue, market_id, qty, time.time()))
+        self.conn.commit()
+
+    def recycle_remnants(self) -> dict:
+        return {(r["venue"], r["market_id"]): r["qty"] for r in self.conn.execute(
+            "SELECT venue, market_id, qty FROM recycle_remnants")}
+
+    def clear_recycle_remnant(self, venue: str, market_id: str) -> None:
+        self.conn.execute("DELETE FROM recycle_remnants WHERE venue=? AND market_id=?",
+                          (venue, market_id))
+        self.conn.commit()
+
+    # ---- settlement ground truth ----
+
+    def record_settlement_check(self, va: str, ma: str, vb: str, mb: str, *,
+                                result_a: str, result_b: str, consistent: bool) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settlement_checks "
+            "(venue_a, market_a, venue_b, market_b, result_a, result_b, consistent, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (va, ma, vb, mb, result_a, result_b, 1 if consistent else 0, time.time()))
+        self.conn.commit()
+
+    def settlement_checked(self, va: str, ma: str, vb: str, mb: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM settlement_checks WHERE venue_a=? AND market_a=? "
+            "AND venue_b=? AND market_b=?", (va, ma, vb, mb)).fetchone() is not None
+
+    def settlement_consistency(self) -> tuple[int, int]:
+        """(consistent, divergent) totals — the ground-truth track record."""
+        row = self.conn.execute(
+            "SELECT SUM(consistent) c, SUM(1 - consistent) d FROM settlement_checks"
+        ).fetchone()
+        return (row["c"] or 0, row["d"] or 0)
+
+    # ---- canonical contracts (canonicalize-then-join) ----
+
+    def record_canon(self, c) -> None:
+        """Persist one Canon extraction (cached forever — contracts don't change)."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO market_canon (venue, market_id, event_type, entities,"
+            " subject, metric, comparator, value, period, date, confidence, ts)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (c.venue, c.market_id, c.event_type, json.dumps(list(c.entities)),
+             c.subject, c.metric, c.comparator, c.value, c.period, c.date,
+             c.confidence, time.time()))
+        self.conn.commit()
+
+    def canon_checked(self, venue: str, market_id: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM market_canon WHERE venue=? AND market_id=?",
+            (venue, market_id)).fetchone() is not None
+
+    def canon_pairs(self, *, min_confidence: float = 0.7,
+                    max_past_s: Optional[float] = None) -> list[tuple]:
+        """Cross-venue complements from the canonical-contract join. SQL blocks by the
+        exact join fields (event_type, metric, date) so the Python complement check runs
+        on tiny buckets, not N^2. Pre-fan-out (the caller's shared backstop applies)."""
+        from bot.matching.canon import Canon, complementary, normalize_stored
+        cutoff_date = None
+        if max_past_s is not None:
+            cutoff_date = time.strftime(
+                "%Y-%m-%d", time.gmtime(time.time() - max_past_s))
+        buckets: dict[tuple, dict[str, list]] = {}
+        for r in self.conn.execute(
+                "SELECT venue, market_id, event_type, entities, subject, metric,"
+                " comparator, value, period, date, confidence FROM market_canon"
+                " WHERE confidence >= ?", (min_confidence,)):
+            if cutoff_date and r["date"] and r["date"] < cutoff_date:
+                continue                             # long-settled event
+            # Normalize on read: legacy rows carry free-form metrics ("cpi_increase")
+            # and raw dates; normalizing here makes them joinable without re-extraction.
+            n_metric, n_date = normalize_stored(r["metric"], r["date"], r["event_type"])
+            c = Canon(venue=r["venue"], market_id=r["market_id"],
+                      event_type=r["event_type"] or "other",
+                      entities=tuple(json.loads(r["entities"] or "[]")),
+                      subject=r["subject"], metric=n_metric,
+                      comparator=r["comparator"], value=r["value"],
+                      period=r["period"] or "full", date=n_date,
+                      confidence=r["confidence"] or 0.0)
+            b = buckets.setdefault((c.event_type, c.metric, c.date), {})
+            b.setdefault(c.venue, []).append(c)
+        pairs = []
+        for b in buckets.values():
+            for ka in b.get("kalshi", []):
+                for pb in b.get("polymarket_us", []):
+                    if complementary(ka, pb, min_confidence=min_confidence):
+                        pairs.append(("kalshi", ka.market_id,
+                                      "polymarket_us", pb.market_id,
+                                      f"kalshi:{ka.market_id}|polymarket_us:{pb.market_id}"))
+        return pairs
+
+    # ---- rules-text verification ----
+
+    def record_rules_verdict(self, va: str, ma: str, vb: str, mb: str, *,
+                             identical: bool, confidence: float, rationale: str,
+                             material: bool = False, divergence: str = "",
+                             stricter_side: str = "") -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO rules_verdicts "
+            "(venue_a, market_a, venue_b, market_b, identical, confidence, rationale,"
+            " material, divergence, stricter_side, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (va, ma, vb, mb, 1 if identical else 0, confidence, rationale,
+             1 if material else 0, divergence, stricter_side, time.time()))
+        self.conn.commit()
+
+    def rules_checked(self, va: str, ma: str, vb: str, mb: str) -> bool:
+        # Legacy rows (material IS NULL, from the pre-classification prompt) count as
+        # UNchecked so they re-verify organically with the material/tail distinction.
+        return self.conn.execute(
+            "SELECT 1 FROM rules_verdicts WHERE venue_a=? AND market_a=? "
+            "AND venue_b=? AND market_b=? AND material IS NOT NULL",
+            (va, ma, vb, mb)).fetchone() is not None
+
+    def rules_divergent_keys(self, min_confidence: float = 0.9) -> set:
+        """Pairs whose RESOLUTION RULES the LLM confidently judged NON-identical.
+
+        These are not hedges — the contracts settle differently in some outcome (live
+        proof: the BESTIA-Academy-vs-BESTIA pair was flagged divergent at 1.0 and later
+        cost a naked leg when the legs settled independently). Dropped from the
+        watchlist like blacklisted pairs."""
+        # material=1 ("different event") drops outright. TIMING-SCOPE divergences
+        # (one venue counts extra time, the other regulation only — the 2026-07-07
+        # SUI-COL naked FTTS class) do NOT drop: they route to ONE-WAY trading via
+        # timing_scope_keys() — YES on the wider-window venue makes the mismatch a
+        # windfall (an ET goal pays BOTH legs), never a naked hole.
+        return {
+            self._pair_key(r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
+            for r in self.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts "
+                "WHERE identical = 0 AND material = 1 AND confidence >= ?",
+                (min_confidence,))
+        }
+
+    def timing_scope_keys(self, min_confidence: float = 0.9) -> set:
+        """Pairs whose rules diverge ONLY in the settlement window (extra time /
+        overtime / shootout inclusion). Tradeable ONE-WAY: hold YES on the venue with
+        the WIDER window (kalshi full-game) + NO on the narrower (poly regulation) —
+        action inside the non-shared window then pays BOTH legs. The reverse
+        direction is the naked SUI-COL shape and is refused by the engine."""
+        rows = self.conn.execute(
+            "SELECT venue_a, market_a, venue_b, market_b, material, rationale, "
+            "COALESCE(divergence,'') dv FROM rules_verdicts "
+            "WHERE identical = 0 AND confidence >= ?", (min_confidence,))
+        timing = ("extra time", "overtime", "penalty shootout", "shootout",
+                  "90 minutes", "regulation")
+        out = set()
+        for r in rows:
+            rat = (r["rationale"] or "").lower()
+            # belt + suspenders: even an explicit timing_scope verdict only
+            # restricts when the rationale describes a settlement WINDOW — the
+            # model briefly used the new category for listing-time skew
+            # ("different resolution times"), which must not restrict anything
+            if any(t in rat for t in timing) and (
+                    r["dv"] == "timing_scope" or r["material"] != 1):
+                out.add(self._pair_key(r["venue_a"], r["market_a"],
+                                       r["venue_b"], r["market_b"]))
+        return out
+
+    def rules_unverified_cached(self, limit: int = 20) -> list[tuple]:
+        """Confirmed pairs (verdict cache) with NO rules verdict whose markets are
+        both still listed — the PRE-verification queue. Verifying only the live
+        watchlist meant thin pairs arrived on game day (books fattening) exactly
+        when they were still unverified, and the pre-trade gate blocked their first
+        — often best — edges."""
+        cutoff = time.time() - 2 * 86400
+        cands = [
+            (r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], "")
+            for r in self.conn.execute(
+                """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b
+                   FROM match_verdicts v
+                   JOIN markets ma ON ma.market_id = v.market_a AND ma.updated_at >= :c
+                   JOIN markets mb ON mb.market_id = v.market_b AND mb.updated_at >= :c
+                   LEFT JOIN rules_verdicts r
+                     ON r.market_a = v.market_a AND r.market_b = v.market_b
+                   WHERE v.same_event = 1 AND r.market_a IS NULL""",
+                {"c": cutoff})
+        ]
+        # Only fan-out SURVIVORS are worth LLM budget: the raw cache holds
+        # multi-outcome cross-products (one kalshi F1 team x every poly team) that
+        # can never trade — verifying them one by one was most of a 5,349 backlog.
+        survivors = drop_fanout_pairs(cands, max_fanout=1)
+        return [(p[0], p[1], p[2], p[3]) for p in survivors[:limit]]
+
+    def divergence_branch_rates(self) -> dict:
+        """(divergence_class, sport_family) -> (hits, total) from settled pairs —
+        the empirical calibration for the severity priors. A settled pair carrying a
+        classified divergence is a completed experiment: divergent settlement = the
+        branch HIT, consistent = it missed. Computed by join (small tables), no
+        incremental state to corrupt."""
+        from bot.matching.divergence_policy import classify_rationale, sport_family
+
+        out: dict = {}
+        for r in self.conn.execute(
+                """SELECT s.consistent, rv.rationale, rv.material,
+                          COALESCE(rv.divergence,'') dv,
+                          CASE WHEN s.venue_a='kalshi' THEN s.market_a
+                               ELSE s.market_b END AS ka
+                   FROM settlement_checks s
+                   JOIN rules_verdicts rv
+                     ON (rv.market_a = s.market_a AND rv.market_b = s.market_b)
+                     OR (rv.market_a = s.market_b AND rv.market_b = s.market_a)
+                   WHERE rv.identical = 0"""):
+            dv = r["dv"] or classify_rationale(r["rationale"] or "")
+            if dv in ("", "none", "different_event"):
+                continue
+            key = (dv, sport_family(r["ka"] or ""))
+            hits, total = out.get(key, (0, 0))
+            out[key] = (hits + (0 if r["consistent"] else 1), total + 1)
+        return out
+
+    def pair_divergence_policies(self, min_confidence: float = 0.9) -> dict:
+        """pair key -> (policy, extra_edge_ct, one_way_yes_venue) from classified
+        rules verdicts + the severity table (bot/matching/divergence_policy). Legacy
+        free-text rationales classify via the keyword taxonomy."""
+        from bot.matching.divergence_policy import (classify_rationale, policy_for,
+                                                     sport_family)
+
+        rates = self.divergence_branch_rates()
+        out = {}
+        for r in self.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b, rationale, material, "
+                "COALESCE(divergence,'') dv, COALESCE(stricter_side,'') ss "
+                "FROM rules_verdicts WHERE identical = 0 AND confidence >= ?",
+                (min_confidence,)):
+            dv = r["dv"] or ("different_event" if r["material"] == 1
+                             else classify_rationale(r["rationale"] or ""))
+            if r["material"] == 1:
+                dv = "different_event"
+            ka = r["market_a"] if r["venue_a"] == "kalshi" else r["market_b"]
+            hits, total = rates.get((dv, sport_family(ka)), (0, 0))
+            # Laplace posterior; policy_for maxes it against the prior, so evidence
+            # can only RAISE severity (softening waits for a critical mass — the
+            # prior stays the floor by construction)
+            p_override = (hits + 1) / (total + 2) if total >= 1 else None
+            pol = policy_for(dv, ka, p_override=p_override)
+            if pol.policy == "edge_floor" and dv == "cancellation_postponement":
+                # a game IN PLAY cannot be postponed — the risk the floor prices
+                # has expired. 1,580 blocks/hr of live MLB props at 0.8c sat under
+                # a 2c pre-game floor (2026-07-11).
+                from bot.execution.executor import Executor
+                st_ts = Executor._kalshi_start_ts(ka)
+                if st_ts is not None and time.time() >= st_ts:
+                    continue
+            if pol.policy == "ignore":
+                continue
+            # one-way YES side = the WIDER (non-stricter) venue; A is always kalshi
+            # in loop-recorded rows; fallback kalshi (matches all audited cases)
+            yes_venue = None
+            if pol.policy == "one_way":
+                ss = r["ss"]
+                if ss == "A":
+                    yes_venue = r["venue_b"]
+                elif ss == "B":
+                    yes_venue = r["venue_a"]
+                else:
+                    yes_venue = "kalshi"
+                # NONE/no-scorer outcomes INVERT the window logic: "nothing happens
+                # in the WIDER window" is the SUBSET claim, so the windfall side
+                # flips to the narrower venue (an ET-only goal must make both legs
+                # WIN, never both lose — the ESP-BEL ftts-none shape).
+                pm_id = r["market_a"] if r["venue_a"] == "polymarket_us" else r["market_b"]
+                pm_l = (pm_id or "").lower()
+                if pm_l.endswith("-none") or "-none-" in pm_l or ka.upper().endswith("-NONE"):
+                    yes_venue = (r["venue_b"] if yes_venue == r["venue_a"]
+                                 else r["venue_a"])
+            out[self._pair_key(r["venue_a"], r["market_a"],
+                               r["venue_b"], r["market_b"])] = (
+                pol.policy, pol.extra_edge_ct, yes_venue)
+        return out
+
+    def identity_certain_keys(self) -> set:
+        """Pairs whose IDENTITY is certain without price history: a tradeable rules
+        verdict (not different_event) AND full participant-name alignment across
+        venues (names_fully_align — every matchup participant or the futures subject
+        aligns by name). For such pairs a fat edge is a genuine dislocation by
+        construction — a true complement under $1 pays regardless of WHY the edge
+        exists — so they earn the verified-pair fat-fire privilege."""
+        from bot.matching.idparse import names_fully_align
+
+        titles = {r["market_id"]: r["title"] or "" for r in self.conn.execute(
+            "SELECT market_id, title FROM markets")}
+        out = set()
+        for r in self.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts "
+                "WHERE (identical = 1 AND confidence >= 0.8) "
+                "   OR (identical = 0 AND material = 0 AND confidence >= 0.9)"):
+            pm = r["market_a"] if r["venue_a"] == "polymarket_us" else r["market_b"]
+            ka = r["market_a"] if r["venue_a"] == "kalshi" else r["market_b"]
+            kt, pt = titles.get(ka, ""), titles.get(pm, "")
+            try:
+                if kt and pt and names_fully_align(kt, pt, pm):
+                    out.add(self._pair_key(r["venue_a"], r["market_a"],
+                                           r["venue_b"], r["market_b"]))
+            except Exception:
+                continue
+        return out
+
+    def rules_checked_keys(self) -> set:
+        """Pairs with ANY rules verdict (either outcome) — the pre-trade rules gate:
+        a pair may not TRADE until its resolution rules have been compared once. The
+        2026-07-07 FTTS incident traded 4 minutes after the pair first appeared,
+        before the rules loop reached it — the same divergence the LLM had flagged on
+        sibling pairs days earlier."""
+        return {
+            self._pair_key(r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
+            for r in self.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts")
+        }
+
+    def verified_pair_keys(self) -> set:
+        """Pair keys (ConfirmedPair.key format: sorted 2-tuples) with the STRONGEST
+        match evidence — rules-verified identical, or settlement-verified consistent.
+        The streaming engine lets these fire fat edges without price history."""
+        keys = set()
+        for r in self.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM rules_verdicts "
+                "WHERE identical=1 AND confidence >= 0.9"):
+            keys.add(self._pair_key(r["venue_a"], r["market_a"],
+                                    r["venue_b"], r["market_b"]))
+        for r in self.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM settlement_checks "
+                "WHERE consistent=1"):
+            keys.add(self._pair_key(r["venue_a"], r["market_a"],
+                                    r["venue_b"], r["market_b"]))
+        return keys
+
+    # ---- embedding cache (see schema comment) ----
+
+    def embeddings_get(self, model: str, hashes: list[str]) -> dict[str, bytes]:
+        """Cached packed-float32 vectors for ``hashes`` (missing ones absent)."""
+        out: dict[str, bytes] = {}
+        CHUNK = 500                                   # stay under SQLite's param limit
+        for i in range(0, len(hashes), CHUNK):
+            chunk = hashes[i:i + CHUNK]
+            marks = ",".join("?" * len(chunk))
+            for r in self.conn.execute(
+                f"SELECT text_hash, vec FROM embedding_cache "
+                f"WHERE model = ? AND text_hash IN ({marks})", [model, *chunk]):
+                out[r["text_hash"]] = r["vec"]
+        return out
+
+    def embeddings_put(self, model: str, rows: list[tuple[str, bytes]]) -> None:
+        """Persist ``(text_hash, packed_vec)`` rows (INSERT OR REPLACE)."""
+        now = time.time()
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO embedding_cache (model, text_hash, vec, ts) "
+            "VALUES (?, ?, ?, ?)",
+            [(model, h, v, now) for h, v in rows])
+        self.conn.commit()
+
+    def embeddings_prune(self, *, max_age_days: float = 30.0) -> int:
+        """Drop cache entries older than ``max_age_days`` (titles that left the board)."""
+        cutoff = time.time() - max_age_days * 86400
+        cur = self.conn.execute("DELETE FROM embedding_cache WHERE ts < ?", (cutoff,))
+        self.conn.commit()
+        return cur.rowcount
 
     def cache_verdict(
         self, va: str, ma: str, vb: str, mb: str, *,
         same_event: bool, confidence: float, rationale: str = "",
         event_key: Optional[str] = None,
     ) -> None:
-        a, ma2, b, mb2 = self._pair_key(va, ma, vb, mb)
+        (a, ma2), (b, mb2) = self._pair_key(va, ma, vb, mb)
         self.conn.execute(
             """INSERT INTO match_verdicts
                (venue_a, market_a, venue_b, market_b, same_event, confidence,
@@ -318,6 +1029,7 @@ class Store:
         drop_scope_mismatch: bool = True, safe_types_only: bool = True,
         use_fingerprint: bool = False, fingerprint_metrics: Optional[frozenset] = None,
         sweep_max_past_s: Optional[float] = None, combine_verdicts: bool = False,
+        use_canon: bool = False, use_idparse: bool = False,
     ) -> list[tuple]:
         """Cached tradeable pairs: (venue_a, market_a, venue_b, market_b, event_key).
 
@@ -370,8 +1082,17 @@ class Store:
         # runs once over the combined set (a market the two map to different counterparties
         # is ambiguous and both pairs drop). Dedup keeps the first occurrence per pair key.
         fp = self._fingerprint_sweep(fingerprint_metrics, None, sweep_max_past_s)
+        # Canonical-contract join (canonicalize-then-join): a THIRD member of the union.
+        # Domain-agnostic (elections/econ/crypto join the same as matches) and immune to
+        # the shortlist's recall ceiling — any two markets whose cached extractions agree
+        # on every settlement-deciding field become tradeable. Same shared fan-out +
+        # blacklist backstops apply. Canon legs are kalshi-first like the sweep's.
+        cp = self.canon_pairs(max_past_s=sweep_max_past_s) if use_canon else []
+        # Deterministic id-parse join (LLM-free): fourth union member; same shared
+        # fan-out + blacklist backstops as the others.
+        ip = self.idparse_pairs() if use_idparse else []
         merged: dict = {}
-        for p in (*fp, *verdict):
+        for p in (*fp, *verdict, *cp, *ip):
             merged.setdefault(self._pair_key(p[0], p[1], p[2], p[3]), p)
         pairs = list(merged.values())
         if max_fanout is not None:
@@ -386,7 +1107,7 @@ class Store:
         can run once over a union. See :meth:`confirmed_pairs` for gate descriptions."""
         rows = self.conn.execute(
             """SELECT v.venue_a, v.market_a, v.venue_b, v.market_b, v.event_key,
-                      ma.title AS title_a, mb.title AS title_b
+                      v.rationale, ma.title AS title_a, mb.title AS title_b
                FROM match_verdicts v
                LEFT JOIN markets ma ON ma.venue=v.venue_a AND ma.market_id=v.market_a
                LEFT JOIN markets mb ON mb.venue=v.venue_b AND mb.market_id=v.market_b
@@ -396,7 +1117,22 @@ class Store:
         pairs = []
         for r in rows:
             ta, tb = r["title_a"] or "", r["title_b"] or ""
+            # idparse verdicts verified metric/threshold/scope DETERMINISTICALLY at
+            # match time — the legacy title/series gates below were training wheels
+            # for the LLM matcher and rejected whole verified classes it never knew
+            # (safe_types killed 5,232 of 5,233 live MLB prop/total/spread pairs —
+            # the "why no MLB edges" of 2026-07-08). Rules-verify, divergence
+            # policies, fan-out and the empirical gate all still apply downstream.
+            if (r["rationale"] or "") == "idparse":
+                pairs.append((r["venue_a"], r["market_a"], r["venue_b"], r["market_b"],
+                              r["event_key"]))
+                continue
             if drop_scope_mismatch and scope_mismatch(ta, tb):
+                continue
+            # Identifier-level scope: filters CACHED verdicts too, so handicap/half
+            # slugs the LLM already rubber-stamped (plain-matchup titles) drop out of
+            # the watchlist instead of persisting as spread-vs-moneyline false matches.
+            if drop_scope_mismatch and id_scope_mismatch(r["market_a"], r["market_b"]):
                 continue
             if safe_types_only:
                 if not (is_tradeable_market_type(ta) and is_tradeable_market_type(tb)):
@@ -470,6 +1206,25 @@ class Store:
             pairs = drop_fanout_pairs(pairs, max_fanout=max_fanout)
         return pairs
 
+    def prune_stale_markets(self, older_than_days: float = 7.0) -> int:
+        """Bulk-delete markets not scanned in ``older_than_days`` — they're no longer live
+        (the scan refreshes updated_at for every current market each cycle), so they only
+        bloat the fingerprint-sweep/canon scans and RAM. Preserves markets referenced by
+        a cached CANON extraction (the join reads market_canon, but keep the pair for
+        settled-leg realization) and by any confirmed verdict. Returns rows deleted."""
+        cutoff = time.time() - older_than_days * 86400.0
+        cur = self.conn.execute(
+            """DELETE FROM markets WHERE updated_at < ?
+               AND NOT EXISTS (SELECT 1 FROM market_canon c
+                               WHERE c.venue = markets.venue AND c.market_id = markets.market_id)
+               AND NOT EXISTS (SELECT 1 FROM match_verdicts v
+                               WHERE (v.venue_a = markets.venue AND v.market_a = markets.market_id)
+                                  OR (v.venue_b = markets.venue AND v.market_b = markets.market_id))""",
+            (cutoff,))
+        n = cur.rowcount
+        self.conn.commit()
+        return n
+
     def prune_market(self, venue: str, market_id: str) -> int:
         """Delete a settled/closed market and every cached verdict referencing it.
 
@@ -490,7 +1245,7 @@ class Store:
         return n
 
     def get_verdict(self, va: str, ma: str, vb: str, mb: str) -> Optional[sqlite3.Row]:
-        a, ma2, b, mb2 = self._pair_key(va, ma, vb, mb)
+        (a, ma2), (b, mb2) = self._pair_key(va, ma, vb, mb)
         return self.conn.execute(
             """SELECT * FROM match_verdicts
                WHERE venue_a=? AND market_a=? AND venue_b=? AND market_b=?""",

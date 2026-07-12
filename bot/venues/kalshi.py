@@ -115,15 +115,17 @@ def normalize_orderbook(
     yes_ask = no_ask = None
     yes_ask_size = no_ask_size = 0.0
 
+    y_lv = n_lv = None
     if no_bids:
-        price, size = max(no_bids, key=lambda lvl: lvl[0])
-        yes_ask = round(1.0 - price, 4)
-        yes_ask_size = size
+        # cost to buy YES = 1 - NO bid, per level, best (highest bid) first
+        lv = sorted(no_bids, key=lambda l: -l[0])[:8]
+        y_lv = tuple((round(1.0 - p, 4), sz) for p, sz in lv)
+        yes_ask, yes_ask_size = y_lv[0]
 
     if yes_bids:
-        price, size = max(yes_bids, key=lambda lvl: lvl[0])
-        no_ask = round(1.0 - price, 4)
-        no_ask_size = size
+        lv = sorted(yes_bids, key=lambda l: -l[0])[:8]
+        n_lv = tuple((round(1.0 - p, 4), sz) for p, sz in lv)
+        no_ask, no_ask_size = n_lv[0]
 
     return MarketQuote(
         venue=VENUE,
@@ -134,7 +136,85 @@ def normalize_orderbook(
         yes_ask_size=yes_ask_size,
         no_ask=no_ask,
         no_ask_size=no_ask_size,
+        yes_ask_levels=y_lv,
+        no_ask_levels=n_lv,
     )
+
+
+_BOOK_SHAPE_LOGGED = False
+
+
+def apply_book_message(books: dict, seqs: dict, data: dict) -> tuple:
+    """Apply one ``orderbook_snapshot``/``orderbook_delta`` WS message to the local
+    book state. Returns ``(quote_or_None, gap)`` — ``gap=True`` means a sequence
+    number was skipped and the caller must reconnect for fresh snapshots (the local
+    book can no longer be trusted). Pure: no I/O, unit-testable.
+
+    Kalshi book semantics: the book holds YES bids and NO bids (in cents); the cost
+    to buy YES crosses the best NO bid — normalize_orderbook owns that math (and the
+    8-level ladders), so WS books and REST books CANNOT drift in interpretation."""
+    typ = data.get("type")
+    m = data.get("msg") or {}
+    t = m.get("market_ticker")
+    sid, seq = data.get("sid"), data.get("seq")
+    if sid is not None and seq is not None:
+        prev = seqs.get(sid)
+        seqs[sid] = seq
+        if typ == "orderbook_delta" and prev is not None and seq != prev + 1:
+            return None, True
+    if not t:
+        return None, False
+    if typ == "orderbook_snapshot":
+        def _levels(side):
+            out = {}
+            for p, q in (m.get(side) or []):
+                out[int(p)] = float(q)
+            for p, q in (m.get(side + "_dollars") or []):
+                out[round(float(p) * 100)] = float(q)
+            return out
+        books[t] = {"yes": _levels("yes"), "no": _levels("no")}
+    elif typ == "orderbook_delta":
+        book = books.get(t)
+        if book is None:
+            return None, False               # delta before its snapshot — ignore
+        side = m.get("side")
+        price = m.get("price")
+        if price is None:
+            price = m.get("price_dollars")   # fp-shape variant
+            if price is not None:
+                price = round(float(price) * 100)
+        if side not in ("yes", "no") or price is None:
+            global _BOOK_SHAPE_LOGGED
+            if not _BOOK_SHAPE_LOGGED:
+                _BOOK_SHAPE_LOGGED = True
+                log.warning("kalshi book delta in unrecognized shape (keys=%s) — "
+                            "ignoring this variant", sorted(m.keys()))
+            return None, False
+        price = int(price)
+        q = book[side].get(price, 0.0) + float(m.get("delta_fp") or m.get("delta") or 0.0)
+        if q <= 1e-9:
+            book[side].pop(price, None)
+        else:
+            book[side][price] = q
+    else:
+        return None, False
+    book = books[t]
+    ob = {"yes": [[p, q] for p, q in book["yes"].items()],
+          "no": [[p, q] for p, q in book["no"].items()]}
+    quote = normalize_orderbook(t, "", ob)
+    ts = m.get("ts")
+    if ts:
+        try:
+            ts = float(ts)
+            quote.exchange_ts = ts / 1000.0 if ts > 1e12 else ts
+        except (TypeError, ValueError):
+            try:                             # live shape: ISO-8601 with Z
+                from datetime import datetime
+                quote.exchange_ts = datetime.fromisoformat(
+                    str(ts).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
+    return quote, False
 
 
 def is_multivariate(ticker: str) -> bool:
@@ -175,6 +255,8 @@ def parse_ticker(message: dict[str, Any]) -> MarketQuote | None:
         no_ask=round(1.0 - yes_bid, 4) if yes_bid is not None else None,
         no_ask_size=_sz(m.get("yes_bid_size_fp")),
         timestamp=time.time(),
+        exchange_ts=(float(m["ts_ms"]) / 1000.0 if m.get("ts_ms")
+                     else float(m["ts"]) if m.get("ts") else None),
     )
 
 
@@ -304,13 +386,22 @@ class KalshiVenue:
 
     name = VENUE
 
-    def __init__(self, cfg: Any, fee_rate: float = 0.07, rate_per_min: float = 55.0) -> None:
+    def __init__(self, cfg: Any, fee_rate: float = 0.07, maker_fee_rate: float = 0.0175,
+                 rate_per_min: float = 55.0) -> None:
         self.cfg = cfg
         self.fee_model = KalshiFeeModel(rate=fee_rate)
+        # Maker fee (resting orders): 0.0175 vs 0.07 taker (Kalshi schedule, eff. 2026-06-29).
+        # The executor RESTS the Kalshi leg as a maker, so its real fee is this, not the taker
+        # rate — used to credit the maker arm gate so profitable thin arbs aren't skipped.
+        self.maker_fee_model = KalshiFeeModel(rate=maker_fee_rate)
         self._client = None  # lazy httpx.AsyncClient
         self._private_key = None
         self._base_path = urlsplit(cfg.api_base).path.rstrip("/")  # e.g. /trade-api/v2
         self._limiter = AsyncRateLimiter(getattr(cfg, "read_rate_per_min", None) or rate_per_min)
+        # ORDERS must never queue behind scan/depth READ tokens: a hedge leg waiting on
+        # the read bucket right after leg 1 fills is a widened naked window. Writes get
+        # their own generous bucket (venue-side write limits are far above this).
+        self._order_limiter = AsyncRateLimiter(240.0, burst=20)
 
     @property
     def authenticated(self) -> bool:
@@ -387,7 +478,9 @@ class KalshiVenue:
         }
 
     async def scan_quotes(
-        self, limit: int = 500, *, max_close_ts: int | None = None
+        self, limit: int = 500, *, max_close_ts: int | None = None,
+        ticker_patterns: tuple[str, ...] | None = None,
+        deny_patterns: tuple[str, ...] | None = None,
     ) -> list[MarketQuote]:
         """Phase 1: price-only quotes for open markets, up to ``limit`` markets total.
 
@@ -402,6 +495,12 @@ class KalshiVenue:
         ``max_close_ts`` query param AND enforced client-side on ``close_time`` as a
         fail-safe — so coverage is correct whether or not the server honors the param.
         Markets with no close_time are kept (don't drop a live market on missing data).
+
+        ``ticker_patterns`` (uppercase substrings) keeps ONLY markets whose ticker contains
+        one of them — the per-game allowlist. Paired with ``limit <= 0`` this scans the whole
+        board cheaply (the list endpoint is fast) but returns only the arbable head-to-head
+        markets (~3.2k of 61k), so the matcher embeds a small set: full per-game coverage at
+        baseline memory. ``None``/empty = no ticker filter.
         """
         out: list[MarketQuote] = []
         cursor: str | None = None
@@ -429,7 +528,17 @@ class KalshiVenue:
             fetched += len(markets)
             # Drop multivariate/parlay markets — not arbitrageable, junk titles.
             for m in markets:
-                if not m.get("ticker") or is_multivariate(m["ticker"]):
+                tk = m.get("ticker")
+                if not tk or is_multivariate(tk):
+                    continue
+                # Per-game allowlist: keep only arbable head-to-head market types, dropping
+                # the election/crypto/streaming bulk before it ever reaches the matcher.
+                if ticker_patterns and not any(p in tk for p in ticker_patterns):
+                    continue
+                # Deny-list: drop multi-outcome place/rank/spread junk that an allowlist
+                # substring would otherwise admit (e.g. KXPRIMARYPLACE under a "SENATE"
+                # pattern) — keeps non-sports scanning to binary winner markets.
+                if deny_patterns and any(d in tk for d in deny_patterns):
                     continue
                 q = normalize_summary(m)
                 # Client-side fail-safe for the targeted window (server may ignore the
@@ -471,9 +580,17 @@ class KalshiVenue:
                 headers = self._ws_auth_headers()
                 async with websockets.connect(
                     self.cfg.ws_base, additional_headers=headers, open_timeout=10
-                ) as ws:
+                , compression=None, ping_timeout=45) as ws:
+                    import os
+                    channels = ["ticker"]
+                    if os.getenv("KALSHI_WS_BOOK", "true").lower() != "false":
+                        # per-event book deltas: ~200ms fresher than the conflated
+                        # ticker feed AND carries the full ladder. ticker stays
+                        # subscribed as a live fallback; the livebook keeps whichever
+                        # quote is freshest.
+                        channels.append("orderbook_delta")
                     params: dict[str, Any] = {
-                        "channels": ["ticker"],
+                        "channels": channels,
                         # Get an immediate sized top-of-book on subscribe instead of
                         # waiting for the first field change (which could be a while on a
                         # quiet market) — primes the live book over the WS itself.
@@ -483,13 +600,29 @@ class KalshiVenue:
                         params["market_tickers"] = market_ids
                     await ws.send(json.dumps({"id": 1, "cmd": "subscribe", "params": params}))
                     backoff = 1.0  # reset on a healthy connection
+                    books: dict[str, Any] = {}
+                    seqs: dict[Any, int] = {}
                     async for raw in ws:
                         data = json.loads(raw)
-                        if data.get("type") == "ticker":
+                        typ = data.get("type")
+                        if typ == "ticker":
                             quote = parse_ticker(data)
                             if quote is not None:
                                 yield quote
-                        elif data.get("type") == "error":
+                        elif typ in ("orderbook_snapshot", "orderbook_delta"):
+                            try:
+                                quote, gap = apply_book_message(books, seqs, data)
+                            except Exception as exc:
+                                log.warning("kalshi book message failed (%s) — "
+                                            "ignoring: %.220s", exc, raw)
+                                continue
+                            if gap:
+                                log.warning("kalshi ws book seq gap — reconnecting "
+                                            "for fresh snapshots")
+                                break        # reconnect loop resubscribes
+                            if quote is not None:
+                                yield quote
+                        elif typ == "error":
                             log.warning("kalshi ws error: %s", data.get("msg"))
             except asyncio.CancelledError:
                 raise
@@ -510,7 +643,7 @@ class KalshiVenue:
                 headers = self._ws_auth_headers()
                 async with websockets.connect(
                     self.cfg.ws_base, additional_headers=headers, open_timeout=10
-                ) as ws:
+                , compression=None, ping_timeout=45) as ws:
                     await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
                                               "params": {"channels": ["fill"]}}))
                     backoff = 1.0
@@ -551,7 +684,7 @@ class KalshiVenue:
                 headers = self._ws_auth_headers()
                 async with websockets.connect(
                     self.cfg.ws_base, additional_headers=headers, open_timeout=10
-                ) as ws:
+                , compression=None, ping_timeout=45) as ws:
                     await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
                                               "params": {"channels": ["market_lifecycle_v2"]}}))
                     backoff = 1.0
@@ -619,7 +752,7 @@ class KalshiVenue:
             body["expiration_ts"] = int(expiration_ts)
 
         endpoint = "/portfolio/events/orders"
-        await self._limiter.wait()
+        await self._order_limiter.wait()
         try:
             resp = await self._http().post(
                 endpoint, json=body, headers=self._auth_headers("POST", endpoint),
@@ -655,8 +788,12 @@ class KalshiVenue:
     async def cancel_order(self, order_id: str) -> dict:
         if not self.authenticated:
             raise OrderNotPermitted("Kalshi credentials not configured")
-        path = f"/portfolio/orders/{order_id}"
-        await self._limiter.wait()
+        # V2 cancel. The legacy DELETE /portfolio/orders/{id} was deprecated -> HTTP 410
+        # "deprecated_v1_order_endpoint" (live 2026-06-26), which silently broke maker
+        # cancel-on-timeout/drift. The V2 path mirrors the create endpoint family
+        # (POST /portfolio/events/orders); only the self-expiry was still cancelling makers.
+        path = f"/portfolio/events/orders/{order_id}"
+        await self._order_limiter.wait()
         resp = await self._http().request(
             "DELETE", path, headers=self._auth_headers("DELETE", path)
         )
@@ -703,7 +840,8 @@ class KalshiVenue:
             # reading only it silently reported every held position as flat.
             qty = float(mp.get("position_fp") or mp.get("position") or 0)
             resting = int(mp.get("resting_orders_count") or 0)
-            pos = VenuePosition(mp.get("ticker", ""), qty, resting)
+            cost = abs(float(mp.get("market_exposure_dollars") or 0))
+            pos = VenuePosition(mp.get("ticker", ""), qty, resting, cost=cost)
             if pos.is_open:
                 positions.append(pos)
         return AccountSnapshot(self.name, balance, positions)
@@ -711,12 +849,34 @@ class KalshiVenue:
     async def order_detail(self, order_id: str) -> dict:
         """Raw order record from GET /portfolio/orders/{id}: created_time, expiration_time,
         status, last_update_time — for tracing whether a maker actually expired or rested
-        until a late (naked) fill. Read-only."""
-        await self._limiter.wait()
+        until a late (naked) fill. Read-only but on the TRADE path (post-order fill
+        reconciliation), so it uses the order limiter — never queued behind scans."""
+        await self._order_limiter.wait()
         path = f"/portfolio/orders/{order_id}"
         resp = await self._http().get(path, headers=self._auth_headers("GET", path))
         resp.raise_for_status()
         return resp.json()
+
+    async def order_filled_qty(self, order_id: str, requested: float, side) -> float | None:
+        """Authoritative filled contracts for one order from GET /portfolio/orders/{id}
+        (``fill_count``), or None if it couldn't be read. Lets the executor reconcile a
+        maker's true fill instead of trusting a private-stream count that under-reported."""
+        try:
+            data = await self.order_detail(order_id)
+        except Exception as exc:
+            log.warning("kalshi order-fill read failed for %s: %s", order_id, exc)
+            return None
+        order = data.get("order") if isinstance(data, dict) else None
+        order = order if isinstance(order, dict) else (data if isinstance(data, dict) else {})
+        # The order RECORD reports fills as the fixed-point string `fill_count_fp` (e.g.
+        # "0.00"/"2.00") — NOT `fill_count` (which is null here). Reading the wrong field
+        # returned None for a cleanly-unfilled maker, which the executor's fail-closed
+        # path read as "venue unreadable" and HALTED on. Prefer fill_count_fp; "0.00"
+        # is an authoritative ZERO fill (clean no-trade), not an unreadable state.
+        fc = order.get("fill_count_fp")
+        if fc in (None, ""):
+            fc = order.get("fill_count")
+        return float(fc) if fc not in (None, "") else None
 
     async def fills(self, *, limit: int = 200, ticker: str | None = None) -> list[dict]:
         """Recent fills (executed trades) from /portfolio/fills — the authoritative order
@@ -732,6 +892,22 @@ class KalshiVenue:
         resp.raise_for_status()
         return resp.json().get("fills") or []
 
+    async def market_rules(self, ticker: str) -> str | None:
+        """The market's resolution rules text (``rules_primary`` + ``rules_secondary``)
+        from GET /markets/{ticker} — the contract itself, for rules-verification.
+        Read-only; None on any failure (the verifier just skips the pair this pass)."""
+        path = f"/markets/{ticker}"
+        await self._limiter.wait()
+        try:
+            resp = await self._http().get(path, headers=self._auth_headers("GET", path))
+            resp.raise_for_status()
+            m = resp.json().get("market") or {}
+        except Exception as exc:
+            log.warning("market_rules fetch failed for %s: %s", ticker, exc)
+            return None
+        text = " ".join(t for t in (m.get("rules_primary"), m.get("rules_secondary")) if t)
+        return text or None
+
     async def settlements(self, *, limit: int = 200) -> list[dict]:
         """Settled markets from /portfolio/settlements: each carries ticker, market_result,
         yes/no counts, revenue, and settled_time — where a closed position's actual payout
@@ -742,6 +918,48 @@ class KalshiVenue:
                                       headers=self._auth_headers("GET", path))
         resp.raise_for_status()
         return resp.json().get("settlements") or []
+
+    async def series_list(self) -> list[dict]:
+        """All series metadata from /series — the data-driven source of each series'
+        semantics (title like 'F1 Fastest Lap', category, tags like ['Motorsport']).
+        Powers deterministic id parsing: a new series Kalshi launches is understood
+        from its own metadata, not from code changes."""
+        await self._limiter.wait()
+        path = "/series"
+        resp = await self._http().get(path, headers=self._auth_headers("GET", path))
+        resp.raise_for_status()
+        out = []
+        for s in resp.json().get("series") or []:
+            out.append({"ticker": s.get("ticker"), "title": s.get("title"),
+                        "category": s.get("category"),
+                        "tags": list(s.get("tags") or [])})
+        return out
+
+    async def transfers(self) -> list[dict]:
+        """External cash flows (deposits + withdrawals) from /portfolio/deposits and
+        /portfolio/withdrawals — the ground truth for separating DEPOSITS from GAINS in
+        equity-based PnL. Returns [{id, ts, amount, fee}] with amount SIGNED in dollars
+        (+ = money in, − = money out) NET of the venue's deposit fee (a $20 debit-card
+        deposit with a $0.40 fee credits $19.60 to the balance)."""
+        out: list[dict] = []
+        for path, sign in (("/portfolio/deposits", 1.0), ("/portfolio/withdrawals", -1.0)):
+            await self._limiter.wait()
+            resp = await self._http().get(path, headers=self._auth_headers("GET", path))
+            resp.raise_for_status()
+            body = resp.json()
+            rows = body.get("deposits") or body.get("withdrawals") or []
+            for r in rows:
+                if str(r.get("status", "")).lower() not in ("applied", "completed", "finalized", ""):
+                    continue                     # pending/failed -> hasn't moved the balance
+                amt = float(r.get("amount_cents") or 0) / 100.0
+                fee = float(r.get("fee_cents") or 0) / 100.0
+                out.append({
+                    "id": r.get("id"),
+                    "ts": float(r.get("finalized_ts") or r.get("created_ts") or 0),
+                    "amount": sign * (amt - fee),
+                    "fee": fee,
+                })
+        return out
 
     async def aclose(self) -> None:
         if self._client is not None:

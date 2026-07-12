@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import logging
 import time
 from dataclasses import dataclass, field
@@ -31,7 +32,7 @@ from bot.execution.risk import RiskManager
 from bot.fees import FeeModel, ZeroFeeModel
 from bot.matching.embed import candidate_pairs, semantic_candidate_pairs
 from bot.matching.llm_match import MatchVerdict, confirm_match
-from bot.matching.scope import scope_mismatch
+from bot.matching.scope import id_scope_mismatch, scope_mismatch
 from bot.models import MarketQuote
 from bot.modes import RunMode
 from bot.strategies.arbitrage import (
@@ -102,6 +103,10 @@ async def run_cycle(
     use_fingerprint: bool = False,
     fingerprint_metrics=None,
     close_within_days: float = 0.0,
+    kalshi_close_within_days: float = 0.0,
+    kalshi_ticker_patterns: tuple[str, ...] = (),
+    kalshi_deny_patterns: tuple[str, ...] = (),
+    kalshi_nonsport_patterns: tuple[str, ...] = (),
     match_cross_venue: bool = True,
 ) -> CycleResult:
     result = CycleResult()
@@ -115,6 +120,19 @@ async def run_cycle(
     if max_close_ts is not None:
         log.info("targeted scan: markets closing within %.2g days (max_close_ts=%d)",
                  close_within_days, max_close_ts)
+    # Kalshi-only window (see Settings.scan_kalshi_close_within_days): Kalshi's per-game lines
+    # sit past the --limit cap behind far-future noise, so scope IT to imminent markets while
+    # leaving Polymarket's full scan intact (its per-game markets carry far-future endDates).
+    kalshi_max_close_ts: int | None = (
+        int(time.time() + kalshi_close_within_days * 86400)
+        if kalshi_close_within_days > 0 else None
+    )
+    if kalshi_max_close_ts is not None:
+        log.info("kalshi targeted scan: markets closing within %.2g days (unbounded limit)",
+                 kalshi_close_within_days)
+    if kalshi_ticker_patterns:
+        log.info("kalshi per-game scan: unbounded board filtered to %d ticker patterns (%s)",
+                 len(kalshi_ticker_patterns), ",".join(kalshi_ticker_patterns))
 
     # ----- Phase 1: cheap wide price scan (one list call per venue) -----
     # Price-only quotes (no depth) for every market, so we can match/shortlist
@@ -122,8 +140,32 @@ async def run_cycle(
     # down must not kill the cycle.
     quotes_by_venue: dict[str, list[MarketQuote]] = {}
     for v in venues:
+        # Per-venue scan params. Kalshi's arbable head-to-head markets sit behind 61k of
+        # election/crypto noise past the --limit cap, so scope ITS scan: the per-game pattern
+        # allowlist (preferred — unbounded board, embeds only ~3.2k arbable tickers) or a
+        # close-time window, both with an UNBOUNDED limit. Other venues keep the shared
+        # limit + global window. The pattern filter is a Kalshi-only kwarg.
+        v_limit, v_kw = limit, {"max_close_ts": max_close_ts}
+        if v.name == "polymarket_us":
+            # Whole-board here too: the CLI --limit capped the FLAT scan at exactly
+            # 5000 while the feed holds more (the per-game /events path was never
+            # capped) — silent tail truncation of futures/props. The list endpoint
+            # is cheap; kalshi already scans 71k unbounded.
+            v_limit = 0
+        if v.name == "kalshi":
+            # Whole-board scan, ALWAYS (the list endpoint is cheap). Category
+            # allowlists are gone: they required hand-curation and silently dropped
+            # whole categories (F1, elections). Memory safety now comes from the
+            # chunked float32 similarity in the matcher, not from scanning less.
+            # Patterns remain optional narrowing knobs if ever configured.
+            v_limit = 0
+            v_kw = {"max_close_ts": kalshi_max_close_ts or max_close_ts}
+            if kalshi_ticker_patterns:
+                v_kw["ticker_patterns"] = kalshi_ticker_patterns
+            if kalshi_deny_patterns:
+                v_kw["deny_patterns"] = kalshi_deny_patterns
         try:
-            qs = await v.scan_quotes(limit, max_close_ts=max_close_ts)
+            qs = await v.scan_quotes(v_limit, **v_kw)
         except Exception as exc:
             log.warning("scan_quotes failed for %s: %s", v.name, exc)
             quotes_by_venue[v.name] = []
@@ -166,6 +208,20 @@ async def run_cycle(
             log.warning("matching failed this cycle (%s); skipping cross-venue", exc)
             return []
 
+    # OOM guardrail: keep NON-SPORTS markets out of the embedding shortlist. Non-sports
+    # matches via the canon join (DB-cached, no embeddings) — embedding thousands of
+    # election/macro titles is exactly what OOM'd the 4GB box. Scope the embed inputs to
+    # sports tickers; canon still matches non-sports off the trade path.
+    if match_cross_venue and kalshi_nonsport_patterns:
+        ksports = [q for q in quotes_by_venue.get("kalshi", [])
+                   if not any(p in q.market_id for p in kalshi_nonsport_patterns)]
+        dropped = len(quotes_by_venue.get("kalshi", [])) - len(ksports)
+        if dropped:
+            quotes_by_venue = dict(quotes_by_venue)
+            quotes_by_venue["kalshi"] = ksports
+            log.info("embed shortlist scoped to sports: held %d non-sports Kalshi markets "
+                     "out of embeddings (canon matches them off-path)", dropped)
+
     confirmed_lite: list[tuple[MarketQuote, MarketQuote]] = []
     # Skip the cross-venue match loop (embedding shortlist + LLM confirm) when discovery is
     # off: the fingerprint sweep builds the watchlist straight from the scanned markets, so
@@ -187,13 +243,18 @@ async def run_cycle(
                 # (e.g. "win 2nd half" vs "win the match") is not the same market.
                 if scope_mismatch(c.a.title, c.b.title):
                     continue
+                # Identifier-level scope: Poly encodes handicap/half lines ONLY in the
+                # slug (-neg-2pt5 / -fh-), with a plain-matchup title — the source of
+                # the spread-vs-moneyline false matches the LLM rubber-stamps.
+                if id_scope_mismatch(c.a.market_id, c.b.market_id):
+                    continue
                 # Structured complement gate (when enabled): skip non-complementary
                 # pairs BEFORE the LLM — stops wasting confirmations on junk (e.g.
                 # KXWCMENTION novelty cross-products) and keeps discovery aligned with
                 # what the watchlist will actually trade.
                 if use_fingerprint:
                     from bot.matching.fingerprint import (
-                        are_complementary, from_kalshi, from_polymarket,
+                        complement_reason, from_kalshi, from_polymarket,
                     )
 
                     def _fpq(q):
@@ -201,9 +262,27 @@ async def run_cycle(
                                 else from_polymarket(q.market_id, q.title))
 
                     fa, fb = _fpq(c.a), _fpq(c.b)
-                    if not are_complementary(fa, fb):
+                    reason = complement_reason(fa, fb)
+                    # "subject-sub-org" is AMBIGUOUS, not a mismatch: 'X' vs 'X Academy'
+                    # is either one venue shortening the SAME academy team's name (a real
+                    # pair) or the org vs its academy squad (the BESTIA false match). The
+                    # deterministic sweep never trades these, but discovery FORWARDS them
+                    # to the LLM (full titles, warned about academy squads); any verdict-
+                    # admitted pair still faces the empirical sum gate + rules
+                    # verification (material divergence demotes) before real size fires.
+                    # Gate policy: kill only what the fingerprint POSITIVELY rejects —
+                    # mismatches between well-parsed prints (metric/date/matchup/...)
+                    # and types it CLASSIFIED as junk ("unmatchable": novelty/futures,
+                    # e.g. MENTION). "a-unknown"/"b-unknown" = a side the sports-tuned
+                    # parser simply CAN'T READ (F1 props, politics, awards): no opinion
+                    # is not a "no" — forward to the LLM (budgeted, similarity-ranked);
+                    # the truth stack vets whatever it admits. Killing on unknown was
+                    # why the watchlist stopped growing once the allowlist retired.
+                    unparsed = reason in ("a-unknown", "b-unknown")
+                    if reason not in ("ok", "subject-sub-org") and not unparsed:
                         continue
-                    if fingerprint_metrics and fa.metric not in fingerprint_metrics:
+                    if (reason == "ok" and fingerprint_metrics
+                            and fa.metric not in fingerprint_metrics):
                         continue
                 result.candidate_pairs += 1
 
@@ -308,6 +387,25 @@ async def run_cycle(
     return result
 
 
+def imbalance_alert(balances: dict, drained_since: float, now: float, recyclable: bool,
+                    alert_secs: float, last_alert: float) -> str | None:
+    """Structural-imbalance alert (pure, testable): when one venue stays drained, the
+    recycler has NOTHING to recycle, and enough time has passed, tell the operator the
+    exact manual bank transfer to make — the one rebalance no code can automate."""
+    if alert_secs <= 0 or recyclable or len(balances) < 2:
+        return None
+    if now - drained_since < alert_secs:
+        return None
+    if last_alert > 0 and now - last_alert < 3600.0:    # at most one alert per hour
+        return None
+    items = sorted(balances.items(), key=lambda kv: kv[1])
+    (drained, dbal), (funded, fbal) = items[0], items[-1]
+    move = max(10.0, round((sum(balances.values()) / 2.0 - dbal) / 10.0) * 10.0)
+    return (f"STRUCTURAL IMBALANCE: {drained}=${dbal:.2f} vs {funded}=${fbal:.2f} and "
+            f"nothing to recycle. MANUAL ACTION: withdraw ${move:.0f} from {funded} and "
+            f"deposit to {drained} (target ~50/50). Bank transfer takes days — start it now.")
+
+
 def apply_balance_caps(risk, snapshots, per_market_fraction: float = 1.0) -> float:
     """Set the per-market and total exposure caps from the live balance check.
 
@@ -393,6 +491,7 @@ async def run(
             max_order_contracts=settings.risk.max_order_contracts,
             min_leg_depth=settings.exec_min_leg_depth,
             depth_safety=settings.exec_depth_fraction,
+            hedge_depth_fraction=settings.exec_hedge_depth_fraction,
         )
         log.warning(
             "LIVE EXECUTION ENABLED (mode=%s) — placing REAL orders, max %s contracts/order, "
@@ -410,9 +509,11 @@ async def run(
 
     embed_fn = None
     if use_embed:
+        from bot.matching.embed_cache import CachingEmbedFn
         from bot.matching.embed_client import make_embed_fn
 
-        embed_fn = make_embed_fn(settings.llm)
+        embed_fn = CachingEmbedFn(make_embed_fn(settings.llm), store, max_new_per_call=1500,
+                                  model=settings.llm.embedding_model)
 
     last: CycleResult | None = None
     try:
@@ -423,6 +524,11 @@ async def run(
                 complete_fn=complete_fn, limit=limit, embed_fn=embed_fn,
                 max_confirms=max_confirms, max_resolve_gap_days=max_resolve_gap_days,
                 executor=executor, close_within_days=close_within_days,
+                kalshi_close_within_days=settings.scan_kalshi_close_within_days,
+                kalshi_ticker_patterns=(settings.kalshi_scan_patterns
+                                        + settings.kalshi_nonsport_patterns),
+                kalshi_deny_patterns=settings.kalshi_scan_deny,
+                kalshi_nonsport_patterns=settings.kalshi_nonsport_patterns,
             )
             log.info("cycle: %s", last.summary())
             if once:
@@ -642,7 +748,39 @@ async def stream(
         max_order_contracts=settings.risk.max_order_contracts, fill_confirmer=tracker,
         min_leg_depth=settings.exec_min_leg_depth,
         depth_safety=settings.exec_depth_fraction,
+        hedge_depth_fraction=settings.exec_hedge_depth_fraction,
         take_first_venue=settings.exec_take_first_venue or None,
+        min_venue_balance=settings.exec_min_venue_balance,
+        scarcity_balance=settings.exec_scarcity_balance,
+        scarcity_min_edge=settings.exec_scarcity_min_edge,
+        edge_full_budget=settings.exec_edge_full_budget,
+        edge_budget_floor=settings.exec_edge_budget_floor,
+        fresh_hedge_secs=settings.exec_fresh_hedge_secs,
+        recross_epsilon=settings.exec_recross_epsilon,
+        rebalance_floor=settings.exec_rebalance_floor,
+        recycle_floor=settings.exec_recycle_floor,
+        recycle_itm_bid=settings.exec_recycle_itm_bid,
+        recycle_max_cost=settings.exec_recycle_max_cost,
+        recycle_max_contracts=settings.exec_recycle_max_contracts,
+        recycle_target=settings.exec_recycle_target,
+        recycle_cooldown=settings.exec_recycle_cooldown_secs,
+        recycle_pair_cooldown=settings.exec_recycle_pair_cooldown_secs,
+        recycle_max_settle_days=settings.exec_recycle_max_settle_days,
+        recycle_decided_bid=settings.exec_recycle_decided_bid,
+        recycle_min_settle_hours=settings.exec_recycle_min_settle_hours,
+        early_exit_enabled=settings.exec_early_exit_enabled,
+        early_exit_margin=settings.exec_early_exit_margin,
+        early_exit_cooldown=settings.exec_early_exit_cooldown_secs,
+        early_exit_max_pairs=settings.exec_early_exit_max_pairs,
+        early_exit_max_contracts=settings.exec_early_exit_max_contracts,
+        early_exit_min_bid_depth=settings.exec_early_exit_min_bid_depth,
+        early_exit_min_settle_days=settings.exec_early_exit_min_settle_days,
+        max_settle_days=settings.exec_max_settle_days,
+        longdated_min_edge=settings.exec_longdated_min_edge,
+        probe_contracts=settings.exec_probe_contracts,
+        market_proven_fills=settings.exec_market_proven_fills,
+        market_max_fails=settings.exec_market_max_fails,
+        market_ramp_factor=settings.exec_market_ramp_factor,
         hedge_buffer=settings.exec_hedge_buffer,
         maker_timeout=settings.exec_maker_timeout,
         maker_improvement=settings.exec_maker_improvement,
@@ -662,6 +800,14 @@ async def stream(
         if v is None:
             return None
         return await v.fetch_quote(RawMarket(market_id=market_id, title="", raw={}))
+
+    async def open_check(venue_name: str, market_id: str):
+        # Authoritative open/settled status for one market (reads the venue's status field,
+        # which the orderbook quote omits) — lets the reconcile tell a settled-leg leftover
+        # from a stranded hedge. True=open, False=settled/closed, None=unknown.
+        v = venue_by_name.get(venue_name)
+        fn = getattr(v, "is_open", None) if v is not None else None
+        return await fn(market_id) if fn is not None else None
 
     # Maker mode captures the spread (no slippage), so thin edges need no hedge buffer —
     # fire at just min_edge. Taker mode requires the buffer (fire at min_edge + buffer)
@@ -700,6 +846,7 @@ async def stream(
 
     engine = StreamingEngine(
         executor=executor, fee_models=fee_models, min_edge=fire_threshold, depth_fetch=depth_fetch,
+        open_check=open_check,
         maker_eligible=maker_eligible,
         max_plausible_edge=settings.exec_max_plausible_edge,
         empirical_min_obs=settings.match_empirical_min_obs,
@@ -714,13 +861,33 @@ async def stream(
         edge_persist_secs=settings.stream_edge_persist_secs,
         sync_window_secs=settings.stream_sync_window_secs,
         prime_concurrency=settings.stream_prime_concurrency,
+        ws_trust_min=settings.stream_ws_trust_min,
+        ws_trust_eps=settings.stream_ws_trust_eps,
+        require_rules_verify=settings.stream_require_rules_verify,
     )
+    executor.live_quote = engine.livebook.get   # drift guard reads the WS book
 
     # Discovery (embedding shortlist + LLM confirm) only feeds match_verdicts, which the
     # fingerprint sweep ignores — so skip the clients entirely when it's off.
-    discover = settings.stream_discovery
+    # Deterministic matching replaces the embedding+LLM discovery pass entirely
+    # (the id-parse join runs inside confirmed_pairs); rules-verify stays.
+    discover = settings.stream_discovery and not settings.match_deterministic
+    # DISCOVERY's LLM is off in deterministic mode — but the RULES-VERIFY loop is a
+    # standing safety layer and needs its own handle regardless (tying it to
+    # ``discover`` silently disabled all rules verification at the deterministic
+    # cutover: zero verdicts for 40h, straight into the FTTS ET-scope incident).
     complete_fn = make_complete_fn(settings.llm) if (use_llm and discover) else None
-    embed_fn = make_embed_fn(settings.llm) if (use_embed and discover) else None
+    rules_complete_fn = make_complete_fn(settings.llm) if use_llm else None
+    embed_fn = None
+    if use_embed and discover:
+        from bot.matching.embed_cache import CachingEmbedFn
+
+        # Cache title->vector (memory LRU + SQLite): each discovery pass embeds only
+        # NEW titles instead of the whole board — the ~8-minute cycle becomes seconds.
+        embed_fn = CachingEmbedFn(make_embed_fn(settings.llm), store, max_new_per_call=1500,
+                                  model=settings.llm.embedding_model)
+
+    _bal_fails: dict = {}
 
     async def refresh_balances():
         # Re-read available cash per venue so each arb is sized against what's actually
@@ -732,15 +899,104 @@ async def stream(
                 continue
             try:
                 snaps.append(await fn())
+                # account plane healthy again -> fires may resume
+                if v.name in getattr(executor, "venue_down", set()):
+                    executor.venue_down.discard(v.name)
+                    log.warning("ACCOUNT PLANE recovered for %s — fires resume", v.name)
+                _bal_fails[v.name] = 0
             except Exception as exc:
                 log.warning("balance refresh failed for %s: %s", v.name, exc)
+                # ACCOUNT-PLANE gate: market data can be up while account/auth is
+                # still recovering from maintenance (poly 401s, 2026-07-09) — an
+                # order placed then fails at best and strands a leg at worst. Two
+                # consecutive failures suspend fires touching this venue.
+                _bal_fails[v.name] = _bal_fails.get(v.name, 0) + 1
+                if _bal_fails[v.name] >= 2 and hasattr(executor, "venue_down") \
+                        and v.name not in executor.venue_down:
+                    executor.venue_down.add(v.name)
+                    log.warning("ACCOUNT PLANE down for %s (%d consecutive) — "
+                                "suspending fires touching it", v.name, _bal_fails[v.name])
         if snaps:
             executor.set_balances(snaps)
             if settings.risk_caps_from_balance:
                 apply_balance_caps(risk, snaps, settings.risk.max_position_fraction)
+            # Release risk exposure held on markets the venues no longer report open
+            # (settled/expired) — record_fill only adds, so without this the caps
+            # tighten monotonically until a restart.
+            open_labels = {
+                f"{snap.venue}:{pos.market_id}"
+                for snap in snaps for pos in (getattr(snap, "positions", None) or [])
+                if getattr(pos, "is_open", False)
+            }
+            released = risk.retain_markets(open_labels)
+            if released > 1e-9:
+                log.info("risk: released $%.2f of exposure on settled markets", released)
+            # Pending-aware gating (auto-rebalance v2 part B): a venue with settled-leg
+            # payouts hours away is not actually drained — count the KNOWN inflows for
+            # the steering gates so they stop over-steering favorites onto it. Only
+            # computed when a venue is genuinely below the floor (zero cost otherwise);
+            # sizing still uses real cash (a pending payout can't pay today's hedge).
+            try:
+                await _refresh_pending(snaps)
+            except Exception as exc:
+                log.warning("pending-payout refresh failed: %s", exc)
             # Cross-venue naked-exposure backstop: catch a position whose hedge never
             # landed (the failure mode behind the Ruzic loss), not just at startup.
-            engine.reconcile_positions(snaps)
+            _vmap = {v.name: v for v in venues}
+
+            async def _snap_one(vn):
+                fn = getattr(_vmap.get(vn), "account_snapshot", None)
+                return await fn() if fn else None
+            engine.snapshot_fn = _snap_one
+            await engine.reconcile_positions(snaps)
+
+    _pending_cache: dict = {}          # (venue, market) -> (verdict_ts, counts: bool)
+
+    async def _refresh_pending(snaps):
+        floor = settings.exec_rebalance_floor
+        bals = {s.venue: s.balance for s in snaps if getattr(s, "balance", None) is not None}
+        if floor <= 0 or not bals or min(bals.values()) >= floor or store is None:
+            if getattr(executor, "_pending", None):
+                executor.set_pending({})
+            return
+        pair_map = store.acted_pair_map()
+        held = {(s.venue, p.market_id): float(p.quantity)
+                for s in snaps for p in (getattr(s, "positions", None) or [])
+                if getattr(p, "is_open", False)}
+        pending: dict = {}
+        now = time.time()
+        budget = 8                                  # bounded venue reads per pass
+        for (v, m), q in held.items():
+            counter = pair_map.get((v, m))
+            if counter is None or abs(held.get(counter, 0.0)) > 0.5:
+                continue                            # counterpart still open -> not pending
+            cached = _pending_cache.get((v, m))
+            if cached is not None and now - cached[0] < 300.0:
+                counts = cached[1]
+            elif budget <= 0:
+                continue
+            else:
+                budget -= 1
+                counts = False
+                try:
+                    if (await open_check(*counter)) is False:   # authoritative settled
+                        quote = await depth_fetch(v, m)
+                        bid = None
+                        if quote is not None:
+                            bid = (round(1.0 - quote.no_ask, 4)
+                                   if q > 0 and quote.no_ask is not None else
+                                   round(1.0 - quote.yes_ask, 4)
+                                   if q < 0 and quote.yes_ask is not None else None)
+                        counts = bid is not None and bid >= 0.95
+                except Exception:
+                    counts = False
+                _pending_cache[(v, m)] = (now, counts)
+            if counts:
+                pending[v] = pending.get(v, 0.0) + abs(q) * 1.0
+        executor.set_pending(pending)
+        if pending:
+            log.info("pending payouts counted for gating: %s",
+                     {k: round(x, 2) for k, x in pending.items()})
 
     async def refresh_specs():
         # Discovery cycle: scans markets + confirms/caches new pairs (embeddings/LLM).
@@ -752,17 +1008,66 @@ async def stream(
             use_fingerprint=settings.match_use_fingerprint,
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             close_within_days=settings.scan_close_within_days,
+            kalshi_close_within_days=settings.scan_kalshi_close_within_days,
+            kalshi_ticker_patterns=(settings.kalshi_scan_patterns
+                                    + settings.kalshi_nonsport_patterns),
+            kalshi_deny_patterns=settings.kalshi_scan_deny,
+            kalshi_nonsport_patterns=settings.kalshi_nonsport_patterns,
             match_cross_venue=discover,
         )
+        # Push the strongest-evidence pair set (rules-verified identical + settlement-
+        # verified consistent) to the fast path: these may fire fat edges history-free.
+        try:
+            _ic = store.identity_certain_keys()
+            engine.identity_certain = _ic
+            engine.verified_pairs = store.verified_pair_keys() | _ic
+            engine.rules_checked = store.rules_checked_keys()
+            pol = store.pair_divergence_policies()
+            engine.one_way_yes = {k: v[2] for k, v in pol.items()
+                                  if v[0] == "one_way" and v[2]}
+            engine.pair_edge_floor = {k: v[1] for k, v in pol.items()
+                                      if v[0] == "edge_floor" and v[1] > 0}
+        except Exception as exc:
+            if not engine.one_way_yes and not engine.rules_checked:
+                # No last-good safety maps exist (boot-time failure): streaming
+                # without the one-way lane traded the SUI-COL shape for 2.5h
+                # (NameError, 2026-07-09). Refuse to run unprotected — a crash
+                # loop is visible; an unmanned gate is not.
+                raise
+            log.error("SAFETY-MAP refresh failed — keeping last-good maps "
+                      "(one-way %d, floors %d): %s",
+                      len(engine.one_way_yes), len(engine.pair_edge_floor), exc)
         await refresh_balances()
-        cached = store.confirmed_pairs(
+        # THREAD, not inline: the fingerprint sweep is ~50s of pure CPU on the
+        # unbounded 80k-market board — run inline it starves the WS keepalives
+        # (both venues 1011-disconnected during every refresh). The GIL still
+        # interleaves the event loop between bytecodes, so pings survive.
+        cached = await asyncio.to_thread(
+            store.confirmed_pairs,
             use_fingerprint=settings.match_use_fingerprint,
             fingerprint_metrics=settings.match_fingerprint_metrics or None,
             sweep_max_past_s=(settings.match_sweep_past_days * 86400) or None,
             combine_verdicts=settings.match_combine_verdicts,
+            use_canon=settings.match_use_canon,
         )
         return await build_watchlist(cached, res.scanned, venues, store=store,
                                      min_poly_depth=settings.stream_min_poly_depth)
+
+    async def poll_balances():
+        # Fast, INDEPENDENT balance refresh — decoupled from the slow (~minutes) discovery
+        # cycle so a deposit/settlement registers within seconds instead of waiting for the
+        # next scan pass (which otherwise caused low-balance skips right after a refill).
+        secs = settings.stream_balance_refresh_secs
+        if secs <= 0:
+            return
+        try:
+            while True:
+                await asyncio.sleep(secs)
+                await refresh_balances()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("balance poll ended: %s", exc)
 
     async def feed_private(v):
         try:
@@ -799,11 +1104,25 @@ async def stream(
     # a market-neutral arb into naked risk; this fails closed (kill switch) if so.
     from bot.execution.startup_guard import reconcile_startup
 
-    guard = await reconcile_startup(
-        venues, risk,
-        min_balance=settings.startup_min_balance,
-        allow_existing_positions=settings.startup_allow_positions,
-    )
+    # OUTAGE-PATIENT: an UNREADABLE venue is a maintenance window, not a verdict
+    # (poly 2-4am EST 503d; the guard exited cleanly and systemd Restart=on-failure
+    # never brought the bot back). Wait for the venue and re-run the guard —
+    # definitive states (unfunded / not flat) still refuse below.
+    while True:
+        guard = await reconcile_startup(
+            venues, risk,
+            min_balance=settings.startup_min_balance,
+            allow_existing_positions=settings.startup_allow_positions,
+        )
+        if guard.ok or not any("unreadable" in r for r in guard.reasons):
+            break
+        log.warning("startup guard: venue unreadable (outage?) — retrying in 60s: %s",
+                    "; ".join(guard.reasons))
+        try:
+            risk.reset_kill_switch()
+        except Exception:
+            pass
+        await asyncio.sleep(60.0)
     if not guard.ok:
         log.critical("aborting stream — startup guard failed: %s", "; ".join(guard.reasons))
         for v in venues:
@@ -818,8 +1137,464 @@ async def stream(
     if settings.risk_caps_from_balance:
         apply_balance_caps(risk, guard.snapshots, settings.risk.max_position_fraction)
 
+    async def settlement_truth_loop():
+        # Ground-truth match verification (bot/matching/settlement_truth.py): every
+        # ~10 min, compare how settled pairs ACTUALLY resolved on both venues. A
+        # divergent settlement is PROOF of a false match -> blacklist; consistent
+        # settlements accumulate positive evidence. Off the trade path; a failed pass
+        # just skips to the next.
+        from bot.matching.settlement_truth import audit_settlements
+        kalshi_v = next((v for v in venues if v.name == "kalshi"), None)
+        poly_v = next((v for v in venues if v.name == "polymarket_us"), None)
+        if kalshi_v is None or poly_v is None or store is None:
+            return
+        while True:
+            await asyncio.sleep(600)
+            try:
+                setts = await kalshi_v.settlements(limit=200)
+                ppos = await poly_v.settled_positions()
+                n = audit_settlements(setts, ppos, store.acted_pair_map(), store)
+                if n:
+                    ok, bad = store.settlement_consistency()
+                    log.info("settlement truth: %d new check(s); track record "
+                             "%d consistent / %d divergent", n, ok, bad)
+                # Series metadata sync (daily): data-driven semantics for the
+                # deterministic id-parse matcher — new Kalshi series self-describe.
+                try:
+                    row = store.conn.execute(
+                        "SELECT MAX(ts) t FROM kalshi_series").fetchone()
+                    if not row["t"] or time.time() - row["t"] > 86400:
+                        store.upsert_series(await kalshi_v.series_list())
+                        log.info("kalshi series metadata synced (%d series)",
+                                 len(store.series_meta_map()))
+                except Exception as exc:
+                    log.warning("series sync failed: %s", exc)
+                # Housekeeping: drop markets not scanned in a week (dead/settled) so the
+                # sweep + canon scans and RAM don't grow unbounded. Preserves markets
+                # referenced by a canon extraction or verdict.
+                pruned = store.prune_stale_markets(older_than_days=7.0)
+                if pruned:
+                    log.info("pruned %d stale market rows (>7d unscanned)", pruned)
+                # Equity snapshot: the reliable PnL baseline (cash + open-position cost per
+                # venue). Every ~10 min -> a 'last N hours' PnL is a simple subtraction.
+                try:
+                    ksnap = await kalshi_v.account_snapshot()
+                    psnap = await poly_v.account_snapshot()
+                    kpos = sum(abs(getattr(x, "cost", 0.0) or 0.0)
+                               for x in getattr(ksnap, "positions", []) or []
+                               if getattr(x, "is_open", False))
+                    ppos = sum(abs(getattr(x, "cost", 0.0) or 0.0)
+                               for x in getattr(psnap, "positions", []) or []
+                               if getattr(x, "is_open", False))
+                    store.record_equity(ksnap.balance, psnap.balance, kpos, ppos)
+                except Exception as exc:
+                    log.warning("equity snapshot failed: %s", exc)
+                # Sync Kalshi deposits/withdrawals (idempotent by external id) so the
+                # equity PnL can subtract them — a deposit is not a gain. Poly has no
+                # transfer API; record those manually via --record-transfer.
+                try:
+                    new_x = 0
+                    for x in await kalshi_v.transfers():
+                        if store.record_transfer("kalshi", x["amount"], source="kalshi_api",
+                                                 external_id=x["id"], ts=x["ts"]):
+                            new_x += 1
+                    if new_x:
+                        log.info("synced %d new kalshi transfer(s)", new_x)
+                except Exception as exc:
+                    log.warning("kalshi transfer sync failed: %s", exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("settlement truth pass failed: %s", exc)
+
+    rules_kick = asyncio.Event()   # set by idparse_sync_loop when new pairs land
+
+    async def rules_verify_loop():
+        # Rules-text verification (bot/matching/rules_match.py): compare the two markets'
+        # RESOLUTION RULES via the LLM for watchlist pairs that lack a verdict. A few per
+        # pass (LLM ~seconds each, run in a thread so the loop never blocks); verdicts
+        # cached forever. identical=1 pairs join engine.verified_pairs (history-free
+        # fat-edge firing). Off the trade path entirely.
+        from bot.matching.idparse import names_fully_align
+        from bot.matching.rules_match import confirm_rules
+        kalshi_v = next((v for v in venues if v.name == "kalshi"), None)
+        poly_v = next((v for v in venues if v.name == "polymarket_us"), None)
+        if kalshi_v is None or poly_v is None or store is None or rules_complete_fn is None:
+            log.warning("rules-verify loop NOT RUNNING (no LLM handle) — the pre-trade "
+                        "rules gate would block all new pairs; check LLM config")
+            return
+        async def verify_pair(p):
+            ka = p.market_a if p.venue_a == "kalshi" else p.market_b
+            pm = p.market_a if p.venue_a == "polymarket_us" else p.market_b
+            rules_k = await kalshi_v.market_rules(ka)
+            rules_p = await poly_v.market_rules(pm)
+            row0 = store.conn.execute(
+                "SELECT venue, market_id, title FROM markets WHERE market_id IN (?, ?)",
+                (ka, pm)).fetchall()
+            titles0 = {r["market_id"]: r["title"] for r in row0}
+            # A venue with NO published rules must not park the pair
+            # unverifiable forever (small poly markets never get a
+            # description — the gate froze real edges on exactly those).
+            # The TITLE carries the proposition; verify against it, labeled.
+            fallback_used = not rules_p or not rules_k
+            if not rules_p:
+                rules_p = ("[This venue published no resolution rules. "
+                           f"The market title is:] {titles0.get(pm, pm)}")
+            if not rules_k:
+                rules_k = ("[This venue published no resolution rules. "
+                           f"The market title is:] {titles0.get(ka, ka)}")
+            row = store.conn.execute(
+                "SELECT venue, market_id, title FROM markets WHERE market_id IN (?, ?)",
+                (ka, pm)).fetchall()
+            titles = {r["market_id"]: r["title"] for r in row}
+            v = await asyncio.to_thread(
+                confirm_rules, rules_complete_fn,
+                venue_a="kalshi", title_a=titles.get(ka, ka), rules_a=rules_k,
+                venue_b="polymarket_us", title_b=titles.get(pm, pm), rules_b=rules_p)
+            # ID-EVIDENCE OVERRIDE: prompt-patching the local model's
+            # pedantry has not converged (different_event -> timing_scope ->
+            # absence-as-difference). When the deterministic ids STRONGLY
+            # match (teams+date+metric+outcome), a different_event verdict
+            # about metadata is overruled to tail-divergent at write time —
+            # the same cross-examination the offline audits ran, made online.
+            # ID-OVERRIDE, name-level: a different_event verdict is downgraded
+            # only when ids match AND every participant (or the single subject)
+            # aligns BY NAME across venues — deterministic, wording-independent.
+            # Full alignment means the "different players" claim is name-form
+            # pedantry (Zampardo vs Maddy Zampardo); partial alignment is a
+            # genuine collision (BONWEI: 1 of 2 aligned) and the drop stands.
+            if v.material and names_fully_align(
+                    titles0.get(ka, "") or "", titles0.get(pm, "") or "", pm):
+                try:
+                    from bot.matching.idparse import (keys_match, parse_kalshi,
+                                                      parse_poly)
+                    meta = store.series_meta_map().get(ka.split("-")[0])
+                    if keys_match(
+                            parse_kalshi(ka, titles0.get(ka, "") or "", meta),
+                            parse_poly(pm, titles0.get(pm, "") or "")):
+                        log.info("rules verify: ID-OVERRIDE %s|%s — deterministic "
+                                 "ids match; downgrading different_event to tail",
+                                 ka, pm)
+                        v.material = False
+                        v.divergence = "tail_scenarios"
+                        v.rationale = "[id-override: ids match] " + v.rationale
+                except Exception:
+                    pass
+            if fallback_used and v.identical:
+                # a nameless TITLE cannot prove identity ("MLB Draft: Top 5 Picks -
+                # Yes" verified against "Eric Booth Jr. drafted top 5" — venues
+                # priced it 27% vs 63%). Fallback verdicts PASS the gate but are
+                # capped below the privilege bar: no fat-fire, no observation
+                # bypass, no empirical immunity.
+                v.confidence = min(v.confidence, 0.85)
+            store.record_rules_verdict(
+                "kalshi", ka, "polymarket_us", pm,
+                identical=v.identical, confidence=v.confidence,
+                rationale=v.rationale, material=v.material,
+                divergence=v.divergence, stricter_side=v.stricter_side)
+            # take effect IMMEDIATELY: pairs stayed gate-blocked for minutes
+            # after their verdict landed because the in-memory set refreshed
+            # only at pass boundaries
+            engine.rules_checked.add(
+                store._pair_key("kalshi", ka, "polymarket_us", pm))
+            _llm_health["last_ok"] = time.time()
+            log.info("rules verify: %s|%s -> %s (%.2f) %s", ka, pm,
+                     "IDENTICAL" if v.identical
+                     else "DIFFERENT-EVENT" if v.material
+                     else "TIMING-SCOPE (one-way)" if v.divergence == "timing_scope"
+                     else "tail-divergent",
+                     v.confidence, v.rationale[:120])
+
+        async def rules_fast_lane():
+            # blocked-with-live-edge pairs verified the moment they block: one LLM
+            # call of latency (~7-10s) instead of waiting for a pass slot. Errors
+            # only skip the item — the pass loop remains the backstop.
+            q = asyncio.Queue()
+            engine.rules_priority_q = q
+            while True:
+                p = await q.get()
+                try:
+                    if not store.rules_checked(p.venue_a, p.market_a,
+                                               p.venue_b, p.market_b):
+                        await verify_pair(p)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("rules fast lane failed for %s: %s", p.event_key, exc)
+                finally:
+                    engine._rules_enqueued.discard(p.key)
+
+        fast_lane_task = asyncio.ensure_future(rules_fast_lane())
+        _llm_health = {"last_ok": time.time()}
+
+        async def llm_watchdog():
+            # The dead-verifier incident (2026-07-07, 40h silent) was rules-LLM
+            # unreachability decaying income quietly behind a fail-closed gate.
+            # Escalate to CRITICAL when no verdict has SUCCEEDED for 30min while
+            # pairs are waiting — the monitors page on CRITICAL.
+            while True:
+                await asyncio.sleep(300.0)
+                idle = time.time() - _llm_health["last_ok"]
+                if idle > 1800.0:
+                    try:
+                        pending = len(store.rules_unverified_cached(limit=200))
+                    except Exception:
+                        pending = -1
+                    if pending != 0:
+                        log.critical("RULES LLM appears DOWN: no successful verdict "
+                                     "in %.0f min with %s pair(s) pending — new "
+                                     "pairs cannot trade (gate fails closed). Check "
+                                     "llm.keyahn.com (Cloudflare tunnel).",
+                                     idle / 60, pending if pending >= 0 else "?")
+
+        asyncio.ensure_future(llm_watchdog())
+
+        while True:
+            try:
+                budget = 20
+                # blocked-with-live-edge pairs jump the queue: they are the ones
+                # costing money RIGHT NOW (the 7c ITFW dislocation of 2026-07-07).
+                # After the watchlist, PRE-verify cached pairs whose books haven't
+                # fattened yet — so game-day arrivals are already checked.
+                blocked = getattr(engine, "_rules_blocked", {})
+                ordered = list(sorted(engine._pairs.values(),
+                                      key=lambda p: -blocked.get(p.key, 0.0)))
+                from bot.streaming.engine import ConfirmedPair as _CP
+                for (va, ma, vb, mb) in store.rules_unverified_cached(limit=budget):
+                    ordered.append(_CP(f"{va}:{ma}|{vb}:{mb}", va, ma, vb, mb))
+                for p in ordered:
+                    if budget <= 0:
+                        break
+                    if store.rules_checked(p.venue_a, p.market_a, p.venue_b, p.market_b):
+                        continue
+                    await verify_pair(p)
+                    budget -= 1
+                _ic = store.identity_certain_keys()
+                engine.identity_certain = _ic
+                engine.verified_pairs = store.verified_pair_keys() | _ic
+                engine.rules_checked = store.rules_checked_keys()
+                pol = store.pair_divergence_policies()
+                engine.one_way_yes = {k: v[2] for k, v in pol.items()
+                                      if v[0] == "one_way" and v[2]}
+                engine.pair_edge_floor = {k: v[1] for k, v in pol.items()
+                                          if v[0] == "edge_floor" and v[1] > 0}
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("rules verify pass failed: %s", exc)
+            # sleep 45s OR wake immediately when the idparse sync lands new pairs —
+            # shaves the first-sighting verification window for game-time arrivals
+            try:
+                await asyncio.wait_for(rules_kick.wait(), timeout=45)
+            except asyncio.TimeoutError:
+                pass
+            rules_kick.clear()
+
+    async def idparse_sync_loop():
+        """Deterministic matching cadence: spawn `--idparse-sync` as a SUBPROCESS
+        (pure-CPU minutes; a thread would hold the GIL against the trading loop)
+        every interval. Results land in match_verdicts; the watchlist refresh picks
+        them up like any confirm."""
+        import sys as _sys
+        while True:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    _sys.executable, "-m", "bot.dryrun", "--idparse-sync",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT)
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=900)
+                for line in (out or b"").decode().splitlines():
+                    if "idparse-sync" in line:
+                        log.info("%s", line.strip())
+                        if " 0 new verdicts" not in line:
+                            rules_kick.set()   # verify the newcomers right now
+            except Exception as exc:
+                log.warning("idparse sync failed: %s", exc)
+            await asyncio.sleep(settings.match_idparse_interval)
+
+    async def canon_extract_loop():
+        # Canonicalize-then-join (bot/matching/canon.py): ONE cached LLM extraction per
+        # market from its resolution rules; matching then happens as a deterministic join
+        # in confirmed_pairs (use_canon). A few extractions per pass, recent markets
+        # first, LLM in a thread — the cache builds over hours and never re-pays.
+        from bot.matching.canon import extract_canon
+        kalshi_v = next((v for v in venues if v.name == "kalshi"), None)
+        poly_v = next((v for v in venues if v.name == "polymarket_us"), None)
+        if store is None or complete_fn is None or not settings.match_use_canon:
+            return
+        while True:
+            await asyncio.sleep(150)
+            try:
+                # Select un-extracted markets, NON-SPORTS FIRST. Two reasons non-sports
+                # was starved: (1) the old recency window was saturated by constantly-
+                # updating sports books, and (2) even un-extracted, sports outnumber
+                # non-sports and sort ahead by updated_at. But sports is matched by the
+                # fingerprint sweep WITHOUT canon — canon exists ONLY for non-sports, so
+                # prioritize it. Non-sports is identifiable by title keyword on BOTH
+                # venues (CPI/GDP/Nobel/IPO/Oscar/election...). LEFT JOIN sweeps each
+                # market once regardless of churn.
+                kw = ("CPI", "GDP", "NOBEL", "OSCAR", "IPO", "SENATE", "GOVERNOR",
+                      "MIDTERM", "ELECTION", "PRESIDENT", "LOVE ISLAND", "INFLATION",
+                      "RIKSBANK", "PRICE OF")
+                like = " OR ".join("upper(m.title) LIKE '%%%s%%'" % k for k in kw)
+                # Only consider RECENTLY-SCANNED markets (last 2 days) — the markets table
+                # accumulates ~100k+ stale rows from history that are no longer tradeable;
+                # canonicalizing them wastes budget and the ORDER BY would sort the whole
+                # table each pass. Recent scan => fresh updated_at, so current markets qualify.
+                recent_floor = time.time() - 2 * 86400
+                pool = store.conn.execute(
+                    "SELECT m.venue, m.market_id, m.title FROM markets m "
+                    "LEFT JOIN market_canon c "
+                    "  ON c.venue = m.venue AND c.market_id = m.market_id "
+                    "WHERE c.market_id IS NULL AND m.updated_at >= ? "
+                    f"ORDER BY (CASE WHEN {like} THEN 0 ELSE 1 END), "
+                    "m.updated_at DESC LIMIT 600", (recent_floor,)).fetchall()
+                budget = 12
+                done = 0
+                attempts = 0                          # cap rules-fetches per pass so a
+                                                      # run of no-rules markets (which stay
+                                                      # in the un-extracted pool) can't spin
+                                                      # the whole 600 in one pass
+                for r in pool:
+                    if budget <= 0 or attempts >= 60:
+                        break
+                    venue, mid, title = r["venue"], r["market_id"], r["title"]
+                    attempts += 1
+                    if venue == "kalshi" and kalshi_v is not None:
+                        rules = await kalshi_v.market_rules(mid)
+                    elif venue == "polymarket_us" and poly_v is not None:
+                        rules = await poly_v.market_rules(mid)
+                    else:
+                        continue
+                    if not rules:
+                        continue                      # poly desc arrives with a scan
+                    c = await asyncio.to_thread(
+                        extract_canon, complete_fn,
+                        venue=venue, market_id=mid, title=title or "", rules=rules)
+                    budget -= 1
+                    if c is not None:
+                        store.record_canon(c)
+                        done += 1
+                if done:
+                    total = store.conn.execute(
+                        "SELECT COUNT(*) c FROM market_canon").fetchone()["c"]
+                    log.info("canon: extracted %d contract(s) this pass (%d total cached)",
+                             done, total)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("canon extraction pass failed: %s", exc)
+
+    async def capital_recycler_loop():
+        # Auto-rebalance v2 (executor.recycle_capital): when one venue is drained and
+        # the other holds >=3x its cash, early-exit DECIDED pairs' ITM legs on the
+        # drained venue — hedged pairs are portable capital; selling a ~$0.95 leg frees
+        # the cash days before settlement at a bounded give-up. Off the hot path.
+        if settings.exec_recycle_floor <= 0:
+            return
+        drained_since = 0.0
+        last_alert = 0.0
+        while True:
+            await asyncio.sleep(settings.exec_recycle_interval_secs)
+            try:
+                # Busy set: never touch a pair mid-execution (take/maker inflight).
+                busy = set()
+                for key in (getattr(engine, "_take_inflight", set())
+                            | getattr(engine, "_maker_inflight", set())):
+                    p = engine._pairs.get(key)
+                    if p is not None:
+                        busy.add((p.venue_a, p.market_a))
+                        busy.add((p.venue_b, p.market_b))
+
+                async def _snapshot(venue_name: str):
+                    v = venue_by_name.get(venue_name)
+                    fn = getattr(v, "account_snapshot", None) if v is not None else None
+                    return await fn() if fn is not None else None
+
+                pair_map = store.acted_pair_map() if store is not None else {}
+                reports = await executor.recycle_capital(
+                    pair_map=pair_map, quote_fetch=depth_fetch,
+                    busy=frozenset(busy), open_check=open_check,
+                    snapshot_fn=_snapshot)
+                if reports:
+                    freed = sum(r.get("freed", 0.0) for r in reports)
+                    log.warning("capital recycler: %d early exit(s), freed $%.2f on the "
+                                "drained venue", len(reports), freed)
+                    await refresh_balances()
+                # Structural alert: drained + nothing recyclable for long enough ->
+                # tell the operator the exact manual transfer (code can't wire money).
+                trig = executor.recycle_trigger()
+                if trig is None:
+                    drained_since = 0.0
+                else:
+                    now = time.time()
+                    if drained_since <= 0:
+                        drained_since = now
+                    msg = imbalance_alert(
+                        dict(executor._balances), drained_since, now,
+                        recyclable=bool(reports),
+                        alert_secs=settings.exec_imbalance_alert_secs,
+                        last_alert=last_alert)
+                    if msg is not None:
+                        last_alert = now
+                        log.critical(msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("capital recycler pass failed: %s", exc)
+
+    async def early_exit_loop():
+        # Early-profit exit (executor.early_exit): realize any held hedged pair's locked
+        # profit BEFORE settlement whenever both venues' exit bids recover >= entry cost
+        # + margin. Frees capital months early on long-dated markets; never exits below
+        # entry. Off the hot path, bounded REST.
+        if not settings.exec_early_exit_enabled or store is None:
+            return
+        while True:
+            await asyncio.sleep(settings.exec_early_exit_interval_secs)
+            try:
+                busy = set()
+                for key in (getattr(engine, "_take_inflight", set())
+                            | getattr(engine, "_maker_inflight", set())):
+                    p = engine._pairs.get(key)
+                    if p is not None:
+                        busy.add((p.venue_a, p.market_a))
+                        busy.add((p.venue_b, p.market_b))
+                reports = await executor.early_exit(
+                    pair_map=store.acted_pair_map(), quote_fetch=depth_fetch,
+                    store=store, busy=frozenset(busy))
+                if reports:
+                    gained = sum(r.get("delta", 0.0) for r in reports)
+                    log.warning("early-profit exit: %d pair(s) unwound early for a booked "
+                                "$%.2f, freeing capital before settlement", len(reports), gained)
+                    await refresh_balances()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("early-exit pass failed: %s", exc)
+
     private_tasks = [asyncio.create_task(feed_private(v)) for v in venues]
     private_tasks += [asyncio.create_task(feed_lifecycle(v)) for v in venues]
+    private_tasks.append(asyncio.create_task(poll_balances()))
+    private_tasks.append(asyncio.create_task(settlement_truth_loop()))
+    private_tasks.append(asyncio.create_task(rules_verify_loop()))
+    if settings.match_deterministic:
+        private_tasks.append(asyncio.create_task(idparse_sync_loop()))
+    else:
+        private_tasks.append(asyncio.create_task(canon_extract_loop()))
+    private_tasks.append(asyncio.create_task(capital_recycler_loop()))
+    private_tasks.append(asyncio.create_task(early_exit_loop()))
+    if settings.exec_recycle_floor > 0:
+        log.warning("capital recycler ON: floor $%.0f + 3x imbalance -> early-exit decided "
+                    "pairs at <= %.0fc/ct give-up (EXEC_RECYCLE_*)",
+                    settings.exec_recycle_floor, settings.exec_recycle_max_cost * 100)
+    if settings.exec_early_exit_enabled:
+        log.warning("early-profit exit ON: unwind hedged pairs early when exit value >= "
+                    "entry + %.0fc margin (EXEC_EARLY_EXIT_*)",
+                    settings.exec_early_exit_margin * 100)
+    if settings.exec_max_settle_days > 0:
+        log.warning("horizon gate ON: reject entries settling > %.0fd unless edge >= %.3f",
+                    settings.exec_max_settle_days, settings.exec_longdated_min_edge)
     log.warning("matching mode: %s metrics=%s (MATCH_USE_FINGERPRINT/MATCH_COMBINE_VERDICTS)",
                 ("fingerprint+LLM verdicts UNION"
                  if settings.match_use_fingerprint and settings.match_combine_verdicts
@@ -843,6 +1618,11 @@ async def stream(
     log.warning("settling guard: skip fires when a leg is <= $%.2f or >= $%.2f "
                 "(STREAM_MIN_LEG_PRICE)", settings.stream_min_leg_price,
                 1.0 - settings.stream_min_leg_price)
+    log.warning("balance refresh: %s (STREAM_BALANCE_REFRESH_SECS) — independent of the "
+                "discovery cycle, so deposits/settlements register fast",
+                f"every {settings.stream_balance_refresh_secs:g}s"
+                if settings.stream_balance_refresh_secs > 0
+                else "discovery-cycle only (no fast poll)")
     if settings.exec_maker_mode:
         guard = (f"cancel-on-drift every {settings.exec_maker_poll:g}s"
                  if settings.exec_maker_poll > 0 else "NO drift guard")
@@ -1639,6 +2419,259 @@ def poly_depth_report(settings: Settings, *, top: int = 40) -> int:
     return 0
 
 
+_time_mod = __import__('time')
+
+
+def idparse_sync(settings: Settings) -> int:
+    """Run the deterministic id-parse join once and persist results as verdicts.
+    Runs as a SUBPROCESS from the streaming loop (the whole-board join takes minutes
+    of pure CPU — a thread would fight the trading loop for the GIL)."""
+    import asyncio as _asyncio
+
+    from bot.data.store import Store, drop_fanout_pairs
+
+    async def run() -> int:
+        store = Store(settings.db_path)
+        stale = store.conn.execute("SELECT MAX(ts) t FROM kalshi_series").fetchone()
+        if not stale["t"] or _time_mod.time() - stale["t"] > 86400:
+            venues = _build_venues(settings)
+            kv = next((v for v in venues if v.name == "kalshi"), None)
+            if kv is not None:
+                store.upsert_series(await kv.series_list())
+                await kv.aclose()
+        pairs = drop_fanout_pairs(store.idparse_pairs(max_age_days=2.0), max_fanout=1)
+        bl = store.blacklisted_keys()
+        pairs = [p for p in pairs
+                 if store._pair_key(p[0], p[1], p[2], p[3]) not in bl]
+        added = store.record_idparse_verdicts(pairs)
+        print(f"idparse-sync: {len(pairs)} pairs, {added} new verdicts")
+        store.close()
+        return 0
+
+    return _asyncio.run(run())
+
+
+def match_shadow(settings: Settings) -> int:
+    """SHADOW: score the deterministic id-parse matcher against labeled history —
+    the cutover gate for retiring the LLM from discovery. Positives = LLM-confirmed
+    pairs CLEANED of known false matches (blacklist, material rules divergence,
+    settlement-divergent); negatives = LLM-rejected pairs + the blacklist."""
+    import asyncio as _asyncio
+    from collections import Counter
+
+    from bot.data.store import Store
+
+    async def run() -> int:
+        store = Store(settings.db_path)
+        if not store.series_meta_map():
+            venues = _build_venues(settings)
+            kv = next((v for v in venues if v.name == "kalshi"), None)
+            if kv is not None:
+                print("syncing kalshi series metadata...")
+                store.upsert_series(await kv.series_list())
+                await kv.aclose()
+        print(f"series metadata: {len(store.series_meta_map())} series")
+
+        from bot.data.store import drop_fanout_pairs as _dfp
+        det = _dfp(store.idparse_pairs(max_age_days=30.0), max_fanout=1)
+        det_keys = {store._pair_key(p[0], p[1], p[2], p[3]) for p in det}
+        print(f"deterministic join produced {len(det)} pairs over 30d of markets")
+
+        bl = store.blacklisted_keys()
+        divergent = set()
+        for r in store.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM settlement_checks "
+                "WHERE consistent = 0"):
+            divergent.add(store._pair_key(r["venue_a"], r["market_a"],
+                                          r["venue_b"], r["market_b"]))
+        material = store.rules_divergent_keys()
+
+        # TRUTH SET: the raw verdict cache is drenched in LLM false positives (golf
+        # fields confirmed cross-golfer, F1 cross-driver, totals across lines) that
+        # only the fan-out backstop kept from trading. Honest positives = confirms
+        # that SURVIVE fan-out, plus pairs that actually traded, plus settlement-
+        # consistent pairs; minus every known-false set.
+        from bot.data.store import drop_fanout_pairs
+        raw_confirms = [(r["venue_a"], r["market_a"], r["venue_b"], r["market_b"], "")
+                        for r in store.conn.execute(
+                            "SELECT venue_a, market_a, venue_b, market_b "
+                            "FROM match_verdicts WHERE same_event=1")]
+        surviving = drop_fanout_pairs(raw_confirms, max_fanout=1)
+        pos_keys = {store._pair_key(p[0], p[1], p[2], p[3]) for p in surviving}
+        for r in store.conn.execute(
+                "SELECT DISTINCT buy_yes_venue a, buy_yes_market b, buy_no_venue c,"
+                " buy_no_market d FROM opportunities WHERE acted=1"):
+            pos_keys.add(store._pair_key(r["a"], r["b"], r["c"], r["d"]))
+        for r in store.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b FROM settlement_checks "
+                "WHERE consistent=1"):
+            pos_keys.add(store._pair_key(r["venue_a"], r["market_a"],
+                                         r["venue_b"], r["market_b"]))
+        present = {r["market_id"] for r in store.conn.execute(
+            "SELECT market_id FROM markets")}
+        pos, neg = {}, {}
+        for key in pos_keys:
+            if key in bl or key in divergent or key in material:
+                continue
+            if key[1] not in present or key[3] not in present:
+                continue        # market rows pruned -> unparseable, not a fair miss
+            kalshi_mkt = key[1] if key[0] == "kalshi" else key[3]
+            pos[key] = kalshi_mkt.split("-")[0]
+        for r in store.conn.execute(
+                "SELECT venue_a, market_a, venue_b, market_b, same_event "
+                "FROM match_verdicts WHERE same_event=0"):
+            key = store._pair_key(r["venue_a"], r["market_a"], r["venue_b"], r["market_b"])
+            fam = (r["market_a"] if r["venue_a"] == "kalshi" else r["market_b"]).split("-")[0]
+            neg[key] = fam
+
+        hit = Counter(); miss = Counter(); fp = Counter()
+        for key, fam in pos.items():
+            (hit if key in det_keys else miss)[fam] += 1
+        for key, fam in neg.items():
+            if key in det_keys:
+                fp[fam] += 1
+        fp_bl = sum(1 for k in det_keys if k in bl or k in divergent or k in material)
+
+        # UNION with the fingerprint sweep — post-cutover discovery is fp + idparse
+        # (legacy caches also persist, but they trivially cover cache-derived truth;
+        # fp+idparse is the honest number for FUTURE pairs)
+        from bot.matching.fingerprint import are_complementary, from_kalshi, from_polymarket
+        titles = {r["market_id"]: r["title"] for r in store.conn.execute(
+            "SELECT market_id, title FROM markets")}
+        fp_hit = set()
+        for key in pos:
+            ka = key[1] if key[0] == "kalshi" else key[3]
+            pb = key[3] if key[0] == "kalshi" else key[1]
+            try:
+                if are_complementary(from_kalshi(ka, titles.get(ka) or ""),
+                                     from_polymarket(pb, titles.get(pb) or "")):
+                    fp_hit.add(key)
+            except Exception:
+                pass
+        union_tp = sum(1 for k in pos if k in det_keys or k in fp_hit)
+        tp, fn = sum(hit.values()), sum(miss.values())
+        print(f"\nRECALL vs cleaned truth: {tp}/{tp+fn} ({tp/max(tp+fn,1)*100:.0f}%)")
+        print(f"UNION (fingerprint sweep + idparse): {union_tp}/{len(pos)} "
+              f"({union_tp/max(len(pos),1)*100:.0f}%)  [fingerprint alone: {len(fp_hit)}]")
+        print(f"FALSE POSITIVES vs LLM-rejected: {sum(fp.values())} | "
+              f"vs blacklist/divergent/material: {fp_bl}")
+        print("\nper-family recall (hit/miss):")
+        for fam in sorted(set(hit) | set(miss), key=lambda f: -(hit[f]+miss[f])):
+            t = hit[fam] + miss[fam]
+            print(f"  {fam:28} {hit[fam]:4}/{t:<4} ({hit[fam]/t*100:3.0f}%)")
+        if fp:
+            print("\nper-family FPs vs LLM-rejected (INSPECT — may be LLM errors):")
+            for fam, n in fp.most_common(10):
+                print(f"  {fam:28} {n}")
+        store.close()
+        return 0
+
+    return _asyncio.run(run())
+
+
+def pnl_report(settings: Settings, hours: float = 24.0) -> int:
+    """Accurate profit report (read-only). Three sections, each from its most
+    authoritative source (see bot/analysis/pnl_report.py for why the naive methods
+    were wrong): LOCKED from the average-cost fills ledger; SETTLED from Kalshi's
+    settlement records (+ Poly venue realized where visible); the equity-snapshot
+    delta as the untrickable cross-check."""
+    import asyncio as _asyncio
+    import time as _time
+
+    from bot.analysis.pnl_report import kalshi_settled_pnl, locked_pairs_report
+    from bot.data.store import Store
+
+    async def run() -> int:
+        store = Store(settings.db_path)
+        fee_models = {}
+        try:
+            from bot.fees import KalshiFeeModel, PolymarketUSFeeModel
+            fee_models = {"kalshi": KalshiFeeModel(0.07),
+                          "polymarket_us": PolymarketUSFeeModel(0.05)}
+        except Exception:
+            pass
+        venues = _build_venues(settings)
+        # Venue positions are the authoritative open-pair mask (the fills ledger can't
+        # see settlements) and the authoritative hedged count.
+        open_pos: dict = {}
+        for v in venues:
+            fn = getattr(v, "account_snapshot", None)
+            if fn is None:
+                continue
+            try:
+                snap = await fn()
+                for x in getattr(snap, "positions", None) or []:
+                    if getattr(x, "is_open", False):
+                        open_pos[(snap.venue, x.market_id)] = abs(float(x.quantity))
+            except Exception as exc:
+                print(f"  ({v.name} positions unavailable: {exc})")
+        print(f"=== LOCKED (open hedged pairs, avg-cost basis incl. buy fees) ===")
+        total_locked = 0.0
+        for pr in locked_pairs_report(store, fee_models, open_positions=open_pos):
+            total_locked += pr.locked
+            imb = f"  (imbalance {pr.imbalance:g})" if pr.imbalance >= 1 else ""
+            print(f"  {pr.event_key[:58]:60} {pr.hedged:5.0f}ct  "
+                  f"cost {pr.cost_basis:7.2f}  locked {pr.locked:+7.2f}{imb}")
+        print(f"  TOTAL LOCKED: {total_locked:+.2f}")
+
+        print(f"\n=== SETTLED, last {hours:g}h (venue-authoritative) ===")
+        kalshi_v = next((v for v in venues if v.name == "kalshi"), None)
+        poly_v = next((v for v in venues if v.name == "polymarket_us"), None)
+        since = _time.time() - hours * 3600
+        ktot = 0.0
+        if kalshi_v is not None:
+            try:
+                for x in await kalshi_v.transfers():
+                    store.record_transfer("kalshi", x["amount"], source="kalshi_api",
+                                          external_id=x["id"], ts=x["ts"])
+            except Exception:
+                pass
+            try:
+                rows = kalshi_settled_pnl(await kalshi_v.settlements(limit=400), since)
+                for tk, amt in sorted(rows, key=lambda r: r[1]):
+                    ktot += amt
+                    print(f"  K {tk[:56]:58} {amt:+7.2f}")
+                print(f"  KALSHI settled total: {ktot:+.2f}")
+            except Exception as exc:
+                print(f"  kalshi settlements unavailable: {exc}")
+        ptot = 0.0
+        if poly_v is not None:
+            try:
+                ppos = await poly_v.settled_positions()
+                for slug, q in ppos.items():
+                    real = float((q.get("realized") or {}).get("value") or 0)
+                    if abs(real) > 1e-6:
+                        ptot += real
+                        print(f"  P {slug[:56]:58} {real:+7.2f}")
+                print(f"  POLY realized (visible window; cumulative, not strictly "
+                      f"{hours:g}h): {ptot:+.2f}")
+            except Exception as exc:
+                print(f"  poly settled positions unavailable: {exc}")
+        print(f"  NOTE: kalshi+poly settled sides of the SAME pair offset — judge pairs, "
+              f"not venues.")
+
+        print(f"\n=== EQUITY cross-check (snapshots every ~10min) ===")
+        ep = store.equity_pnl(hours=hours)
+        if ep is None:
+            print("  not enough snapshot history yet")
+        else:
+            pnl, frm, to, ts, xfers = ep
+            age_h = (_time.time() - ts) / 3600
+            xnote = f" − transfers {xfers:+.2f}" if abs(xfers) > 0.005 else ""
+            print(f"  equity {frm:.2f} -> {to:.2f} over {age_h:.1f}h{xnote} = "
+                  f"TRADING pnl {pnl:+.2f}")
+            print(f"  (kalshi transfers auto-synced; POLY deposits must be recorded via "
+                  f"--record-transfer or they appear as phantom pnl)")
+        for v in venues:
+            aclose = getattr(v, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        store.close()
+        return 0
+
+    return _asyncio.run(run())
+
+
 def check_flat(settings: Settings) -> int:
     """Print each venue's balance, open positions, and resting orders, with a FLAT / NOT
     FLAT verdict per venue. 'Flat' = no held positions and no resting orders. Read-only."""
@@ -1847,6 +2880,22 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--check-flat", action="store_true",
                    help="print each venue's balance, open positions, and resting orders "
                         "with a FLAT / NOT FLAT verdict (read-only)")
+    p.add_argument("--record-transfer", nargs=2, metavar=("VENUE", "AMOUNT"),
+                   help="record an external deposit (+) / withdrawal (-) so equity PnL "
+                        "doesn't count it as trading gains — needed for POLY (no API); "
+                        "kalshi transfers sync automatically. e.g. --record-transfer "
+                        "polymarket_us 100")
+    p.add_argument("--idparse-sync", action="store_true",
+                   help="run the deterministic id-parse join once, persist results "
+                        "as verdicts, exit (spawned by the stream loop)")
+    p.add_argument("--match-shadow", action="store_true",
+                   help="score the deterministic id-parse matcher against labeled "
+                        "verdict/settlement history (read-only; the LLM-retirement gate)")
+    p.add_argument("--pnl-report", nargs="?", const=24.0, type=float, metavar="HOURS",
+                   help="accurate profit report (read-only): per-pair LOCKED profit of "
+                        "open hedged pairs from the average-cost fills ledger, venue-"
+                        "authoritative SETTLED pnl over the last HOURS (default 24), and "
+                        "the equity-snapshot delta as cross-check")
     p.add_argument("--poly-depth-report", action="store_true",
                    help="rank matched pairs by real Polymarket book depth + show the live "
                         "edge at each, to find the tradeable overlap (read-only)")
@@ -1946,6 +2995,25 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.check_flat:
         raise SystemExit(check_flat(load_settings()))
+
+    if args.record_transfer:
+        from bot.data.store import Store
+        _st = Store(load_settings().db_path)
+        _st.record_transfer(args.record_transfer[0], float(args.record_transfer[1]),
+                            source="manual")
+        print(f"recorded transfer: {args.record_transfer[0]} "
+              f"{float(args.record_transfer[1]):+.2f}")
+        _st.close()
+        raise SystemExit(0)
+
+    if args.idparse_sync:
+        raise SystemExit(idparse_sync(load_settings()))
+
+    if args.match_shadow:
+        raise SystemExit(match_shadow(load_settings()))
+
+    if args.pnl_report is not None:
+        raise SystemExit(pnl_report(load_settings(), hours=args.pnl_report))
 
     if args.poly_depth_report:
         raise SystemExit(poly_depth_report(

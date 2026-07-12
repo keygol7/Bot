@@ -237,3 +237,32 @@ def test_first_goal_metric_matches_and_is_distinct():
     # Must differ from a 2+ goals count prop for the same team:
     k2 = from_kalshi("KXWCGOAL-26JUN18KORMEX-KOR2", "Korea Republic: 2+ goals - Korea Republic: 2+")
     assert not are_complementary(p, k2)
+
+
+def test_fingerprint_sub_org_academy_never_aligns():
+    # BESTIA (main org) vs BESTIA Academy: token-subset tolerance must NOT match them —
+    # the residue token "academy" marks a related-but-different team.
+    from bot.matching.fingerprint import from_kalshi, from_polymarket, are_complementary
+    fk = from_kalshi("KXCS2GAME-26JUL021800BSTAPDAF-BSTA",
+                     "Will BESTIA Academy win the BESTIA Academy vs. Patins da Ferrari CS2 match? - Yes")
+    fp = from_polymarket("aec-cs2-pdaf-bsta-2026-07-02",
+                         "Who will win in the upcoming esports event Patins da Ferrari vs BESTIA - BESTIA")
+    assert not are_complementary(fk, fp)
+
+
+def test_sub_org_reason_is_distinct_for_escalation():
+    # 'X' vs 'X Academy' must NOT complement (never sweep-traded) but must return the
+    # distinct "subject-sub-org" reason so discovery can escalate it to the LLM/rules
+    # stack — a one-sided name shortening of a REAL academy pair would otherwise be
+    # unreachable forever.
+    from bot.matching.fingerprint import complement_reason, from_kalshi, from_polymarket
+    fk = from_kalshi("KXCS2GAME-26JUL021800BSTAPDAF-BSTA",
+                     "BESTIA Academy vs. Patins da Ferrari CS2 match - BESTIA Academy")
+    fp = from_polymarket("aec-cs2-pdaf-bsta-2026-07-02",
+                         "Who will win in the upcoming esports event Patins da Ferrari vs BESTIA - BESTIA")
+    assert complement_reason(fk, fp) == "subject-sub-org"
+    # a genuinely different subject is NOT the escalatable class
+    fp2 = from_polymarket("aec-cs2-pdaf-liq-2026-07-02",
+                          "Who will win in the upcoming esports event Patins da Ferrari vs Liquid - Liquid")
+    r2 = complement_reason(fk, fp2)
+    assert r2 not in ("ok", "subject-sub-org")        # rejected outright, not escalated

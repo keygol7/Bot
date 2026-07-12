@@ -109,6 +109,54 @@ def test_kalshi_v2_rejection_surfaces_body():
     assert r.raw.get("http_status") == 400
 
 
+def test_kalshi_cancel_uses_v2_events_orders_endpoint():
+    # The legacy DELETE /portfolio/orders/{id} was deprecated -> 410; cancel must hit the
+    # V2 path /portfolio/events/orders/{id} (mirrors the create endpoint family).
+    cap = {}
+
+    def handler(req):
+        cap["method"] = req.method
+        cap["url"] = req.url.path
+        return httpx.Response(200, json={"order": {"order_id": "o1", "status": "canceled"}})
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    asyncio.run(v.cancel_order("o1"))
+    assert cap["method"] == "DELETE"
+    assert cap["url"].endswith("/portfolio/events/orders/o1")
+
+
+def test_kalshi_order_filled_qty_reads_fill_count_fp():
+    # The order RECORD reports fills as the fixed-point string `fill_count_fp`, not
+    # `fill_count` (null). order_filled_qty must read fill_count_fp -> the true fill.
+    def handler(req):
+        return httpx.Response(200, json={"order": {
+            "order_id": "o", "status": "canceled",
+            "fill_count": None, "fill_count_fp": "2.00"}})
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    qty = asyncio.run(v.order_filled_qty("o", 2, Side.NO))
+    assert qty == 2.0
+
+
+def test_kalshi_order_filled_qty_zero_fill_is_zero_not_unreadable():
+    # fill_count_fp "0.00" is an AUTHORITATIVE zero fill (clean no-trade) -> 0.0, NOT None.
+    # Returning None here is what made the maker fix false-HALT on a cleanly-unfilled maker.
+    def handler(req):
+        return httpx.Response(200, json={"order": {
+            "order_id": "o", "status": "canceled",
+            "fill_count": None, "fill_count_fp": "0.00"}})
+
+    v = KalshiVenue(KalshiConfig(api_key_id="k", private_key_path="x"))
+    v._client = _client(handler, v.cfg.api_base)
+    v._auth_headers = lambda m, p: {}
+    qty = asyncio.run(v.order_filled_qty("o", 2, Side.NO))
+    assert qty == 0.0 and qty is not None
+
+
 def _exec_response(order_id, state, cum, last_shares, avg_yes, etype="EXECUTION_TYPE_FILL"):
     """Build a synchronous CreateOrderResponse ({id, executions:[Execution]})."""
     order = {"id": order_id, "state": state, "cumQuantity": cum}
@@ -271,6 +319,27 @@ def test_polymarket_scan_quotes_volume_gate_drops_thin_markets():
     assert "liquid-game" in ids       # vol 9000 >= 1000 -> kept
     assert "thin-prop" not in ids     # vol 120 < 1000 -> dropped (the 500-prone set)
     assert "no-vol-field" in ids      # missing volume -> fail open (kept)
+
+
+def test_polymarket_close_time_falls_back_to_slug_date():
+    # Per-game markets carry endDate=null; the game date is in the slug. close_time must
+    # fall back to the slug date so the matcher's resolve-date guard has a date to compare
+    # (else it fails open and pairs same-teams games on DIFFERENT dates -> stranded leg).
+    from datetime import datetime, timezone
+
+    def handler(req):
+        if req.url.path.endswith("/v1/events"):
+            return httpx.Response(200, json={"events": []})
+        return httpx.Response(200, json={"markets": [
+            {"slug": "aec-mlb-kc-cws-2026-06-26", "question": "KC@CWS",
+             "bestAsk": "0.40", "bestBid": "0.38", "endDate": None},
+        ]})
+
+    cfg = QcexConfig()
+    v = PolymarketUSVenue(cfg)
+    v._gateway_client = _client(handler, cfg.gateway_base)
+    q = next(q for q in asyncio.run(v.scan_quotes(5000)) if q.market_id == "aec-mlb-kc-cws-2026-06-26")
+    assert q.close_time == datetime(2026, 6, 26, tzinfo=timezone.utc).timestamp()
 
 
 def test_kalshi_account_snapshot_reads_position_fp():
