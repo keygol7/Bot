@@ -1297,6 +1297,7 @@ async def stream(
             # only at pass boundaries
             engine.rules_checked.add(
                 store._pair_key("kalshi", ka, "polymarket_us", pm))
+            _llm_health["last_ok"] = time.time()
             log.info("rules verify: %s|%s -> %s (%.2f) %s", ka, pm,
                      "IDENTICAL" if v.identical
                      else "DIFFERENT-EVENT" if v.material
@@ -1324,6 +1325,29 @@ async def stream(
                     engine._rules_enqueued.discard(p.key)
 
         fast_lane_task = asyncio.ensure_future(rules_fast_lane())
+        _llm_health = {"last_ok": time.time()}
+
+        async def llm_watchdog():
+            # The dead-verifier incident (2026-07-07, 40h silent) was rules-LLM
+            # unreachability decaying income quietly behind a fail-closed gate.
+            # Escalate to CRITICAL when no verdict has SUCCEEDED for 30min while
+            # pairs are waiting — the monitors page on CRITICAL.
+            while True:
+                await asyncio.sleep(300.0)
+                idle = time.time() - _llm_health["last_ok"]
+                if idle > 1800.0:
+                    try:
+                        pending = len(store.rules_unverified_cached(limit=200))
+                    except Exception:
+                        pending = -1
+                    if pending != 0:
+                        log.critical("RULES LLM appears DOWN: no successful verdict "
+                                     "in %.0f min with %s pair(s) pending — new "
+                                     "pairs cannot trade (gate fails closed). Check "
+                                     "llm.keyahn.com (Cloudflare tunnel).",
+                                     idle / 60, pending if pending >= 0 else "?")
+
+        asyncio.ensure_future(llm_watchdog())
 
         while True:
             try:
