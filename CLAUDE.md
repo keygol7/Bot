@@ -1,4 +1,4 @@
-# CLAUDE.md — Prediction-Market Arbitrage Bot (Kalshi + Polymarket US/QCEX)
+# CLAUDE.md — Prediction-Market Arbitrage Bot (Kalshi + two Polymarket venues)
 
 Operating notes for Claude Code sessions. The repo docs are the source of truth for
 *design*; this file is for *operating* the live system and the few things not obvious
@@ -6,9 +6,10 @@ from the code.
 
 ## What this is
 
-A self-hosted bot that does risk-free cross-venue arbitrage (buy YES on one venue, NO
-on the other when combined cost < $1 after fees) on **Kalshi** (CFTC) and **Polymarket
-US / QCEX** (CFTC-licensed). A local LLM confirms two markets are the *same event*
+A self-hosted bot that does cross-venue arbitrage (buy YES on one venue, NO on the
+other when combined cost < $1 after fees) on **Kalshi**, **Polymarket US / QCEX**, and
+an explicitly opt-in **Polymarket.com** CLOB V2 adapter covering its open binary board.
+A local LLM confirms two markets are the *same event*
 before any trade; it never sits on the trade path (verdicts are precomputed + cached).
 
 Read these for design/runbook context:
@@ -31,7 +32,8 @@ subcommands (`--check-flat`, `--show-book`, `--find`, `--watchlist`, `--test-ord
   applies risk caps, persists, and in a live mode hands each `ArbOpportunity` to the
   executor. Arb math: a binary market pays $1; if YES+NO cost < $1 after fees, the
   spread is risk-free.
-- **Venue adapters** (`venues/base.py` Protocol + `kalshi.py`, `polymarket_us.py`) —
+- **Venue adapters** (`venues/base.py` Protocol + `kalshi.py`, `polymarket_us.py`,
+  `polymarket_com.py`) —
   the *only* code that branches per-exchange. Everything else is written once against
   `Venue`. They lazily import `httpx`/`websockets`/`cryptography`, normalize to
   `MarketQuote`, and expose `scan_quotes` (cheap wide list), `fetch_quote` (sized depth

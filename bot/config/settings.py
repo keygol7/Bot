@@ -100,6 +100,57 @@ class QcexConfig:
 
 
 @dataclass
+class PolymarketComConfig:
+    """International Polymarket CLOB V2 configuration.
+
+    This is intentionally independent from :class:`QcexConfig`: polymarket.com uses
+    Polygon wallet/EIP-712 order signatures plus CLOB API credentials, while
+    polymarket.us uses QCEX Ed25519 credentials.  ``enabled`` is an explicit safety
+    switch so adding credentials alone cannot change the bot's venue set.
+    """
+
+    enabled: bool = False
+    gamma_base: str = "https://gamma-api.polymarket.com"
+    clob_base: str = "https://clob.polymarket.com"
+    data_base: str = "https://data-api.polymarket.com"
+    ws_market: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    ws_user: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+    chain_id: int = 137
+    private_key: str = ""
+    private_key_path: str = "secrets/polymarket_com_private_key"
+    api_key: str = ""
+    api_secret: str = ""
+    api_passphrase: str = ""
+    funder_address: str = ""
+    signature_type: int = 3
+    read_rate_per_min: float = 600.0
+    # ``*`` (or an empty list) discovers every binary CLOB market. Operators can still
+    # narrow this to one or more slug prefixes when investigating a specific family.
+    market_slug_prefixes: tuple[str, ...] = ("*",)
+    # 0 disables the venue-specific close-time cap. The runner's shared
+    # SCAN_CLOSE_WITHIN_DAYS policy can still impose a global settlement horizon.
+    lookahead_minutes: float = 0.0
+
+    @property
+    def is_trading_configured(self) -> bool:
+        from pathlib import Path
+
+        has_key = bool(self.private_key) or (
+            bool(self.private_key_path)
+            and Path(self.private_key_path).expanduser().exists()
+        )
+        return bool(
+            self.enabled
+            and has_key
+            and self.api_key
+            and self.api_secret
+            and self.api_passphrase
+            and self.funder_address
+            and self.signature_type in (0, 1, 2, 3)
+        )
+
+
+@dataclass
 class LLMConfig:
     base_url: str = "http://localhost:8000/v1"
     reasoning_model: str = "qwen2.5-instruct"
@@ -111,6 +162,7 @@ class Settings:
     run_mode: RunMode = RunMode.DRY_RUN
     kalshi: KalshiConfig = field(default_factory=KalshiConfig)
     qcex: QcexConfig = field(default_factory=QcexConfig)
+    polymarket_com: PolymarketComConfig = field(default_factory=PolymarketComConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     risk: RiskLimits = field(default_factory=RiskLimits)
     db_path: str = "data/bot.db"
@@ -427,6 +479,35 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
             use_sandbox=(env("QCEX_USE_SANDBOX", "false") or "false").lower() == "true",
             read_rate_per_min=_env_float("QCEX_READ_RATE_PER_MIN", QcexConfig.read_rate_per_min),
             min_volume_24h=_env_float("QCEX_MIN_VOLUME_24H", 0.0),
+        ),
+        polymarket_com=PolymarketComConfig(
+            enabled=(env("POLYMARKET_COM_ENABLED", "false") or "false").lower() == "true",
+            gamma_base=env("POLYMARKET_COM_GAMMA_BASE", PolymarketComConfig.gamma_base),
+            clob_base=env("POLYMARKET_COM_CLOB_BASE", PolymarketComConfig.clob_base),
+            data_base=env("POLYMARKET_COM_DATA_BASE", PolymarketComConfig.data_base),
+            ws_market=env("POLYMARKET_COM_WS_MARKET", PolymarketComConfig.ws_market),
+            ws_user=env("POLYMARKET_COM_WS_USER", PolymarketComConfig.ws_user),
+            chain_id=int(_env_float("POLYMARKET_COM_CHAIN_ID", 137)),
+            private_key=env("POLYMARKET_COM_PRIVATE_KEY", "") or "",
+            private_key_path=env(
+                "POLYMARKET_COM_PRIVATE_KEY_PATH",
+                PolymarketComConfig.private_key_path,
+            ),
+            api_key=env("POLYMARKET_COM_API_KEY", "") or "",
+            api_secret=env("POLYMARKET_COM_API_SECRET", "") or "",
+            api_passphrase=env("POLYMARKET_COM_API_PASSPHRASE", "") or "",
+            funder_address=env("POLYMARKET_COM_FUNDER_ADDRESS", "") or "",
+            signature_type=int(_env_float("POLYMARKET_COM_SIGNATURE_TYPE", 3)),
+            read_rate_per_min=_env_float("POLYMARKET_COM_READ_RATE_PER_MIN", 600.0),
+            market_slug_prefixes=tuple(
+                p.strip().lower()
+                for p in (env(
+                    "POLYMARKET_COM_MARKET_SLUG_PREFIXES",
+                    ",".join(PolymarketComConfig.market_slug_prefixes),
+                ) or "").split(",")
+                if p.strip()
+            ),
+            lookahead_minutes=_env_float("POLYMARKET_COM_LOOKAHEAD_MINUTES", 0.0),
         ),
         llm=LLMConfig(
             base_url=env("LLM_BASE_URL", LLMConfig.base_url),

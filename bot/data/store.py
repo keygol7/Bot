@@ -10,11 +10,14 @@ Standard-library ``sqlite3`` only. Use ``":memory:"`` for tests.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from bot.matching.scope import (
     id_scope_mismatch,
@@ -81,6 +84,73 @@ CREATE TABLE IF NOT EXISTS edge_observations (
     edge        REAL,        -- per-contract edge after fees (can be negative post-depth)
     size        REAL,        -- contracts available at top of book
     outcome     TEXT         -- executed/unwound/skipped reason: the actionable result
+);
+
+-- Read-only WebSocket shadow observations. One row is a continuous episode where a
+-- cross-venue pair showed a positive, fee-adjusted, sized edge. ``qualification``
+-- distinguishes funding-grade verified edges from exact crypto-window candidates whose
+-- settlement oracles differ; ``screen_reason`` preserves the gate being audited.
+CREATE TABLE IF NOT EXISTS shadow_edge_episodes (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_ts            REAL NOT NULL,
+    last_seen_ts          REAL NOT NULL,
+    ended_ts              REAL,
+    duration_s            REAL NOT NULL DEFAULT 0,
+    event_key             TEXT,
+    yes_venue             TEXT,
+    yes_market            TEXT,
+    no_venue              TEXT,
+    no_market             TEXT,
+    yes_price             REAL,
+    no_price              REAL,
+    gross_cost            REAL,
+    fee_per_contract      REAL,
+    edge_per_contract     REAL,
+    size                  REAL,
+    achievable_profit     REAL,
+    peak_edge             REAL,
+    peak_size             REAL,
+    peak_profit           REAL,
+    peak_edge_size        REAL,
+    min_edge              REAL,
+    min_size              REAL,
+    processing_latency_ms REAL,
+    quote_skew_ms         REAL,
+    max_quote_skew_ms     REAL,
+    observations          INTEGER NOT NULL DEFAULT 1,
+    eligible_observations INTEGER NOT NULL DEFAULT 0,
+    qualification         TEXT NOT NULL DEFAULT 'verified',
+    screen_reason         TEXT NOT NULL DEFAULT 'eligible',
+    qualified_ts          REAL,
+    qualified_edge        REAL,
+    qualified_size        REAL,
+    qualified_yes_price   REAL,
+    qualified_no_price    REAL,
+    qualified_skew_ms     REAL,
+    settlement_checked_ts REAL,
+    yes_result            TEXT,
+    no_result             TEXT,
+    settlement_payout     REAL,
+    realized_edge_per_contract REAL,
+    realized_profit       REAL,
+    status                TEXT NOT NULL DEFAULT 'open',
+    close_reason          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_edge_started
+    ON shadow_edge_episodes(started_ts);
+CREATE INDEX IF NOT EXISTS idx_shadow_edge_status
+    ON shadow_edge_episodes(status);
+
+CREATE TABLE IF NOT EXISTS crypto_oracle_windows (
+    window_start          INTEGER NOT NULL,
+    window_end            INTEGER NOT NULL,
+    asset                 TEXT NOT NULL,
+    kalshi_market         TEXT NOT NULL,
+    polymarket_com_market TEXT NOT NULL,
+    kalshi_open           REAL,
+    polymarket_com_open   REAL,
+    updated_ts            REAL NOT NULL,
+    PRIMARY KEY (window_start, asset)
 );
 
 CREATE TABLE IF NOT EXISTS fills (
@@ -281,9 +351,9 @@ class Store:
             parent = Path(path).expanduser().parent
             if parent and not parent.exists():
                 parent.mkdir(parents=True, exist_ok=True)
-        # check_same_thread=False: the heavy fingerprint sweep runs via
-        # asyncio.to_thread so it can't starve the WS keepalives; access remains
-        # serialized (the event loop awaits the thread — no concurrent use).
+        # check_same_thread=False supports the light verdict-only async fallback. The
+        # CPU-heavy all-board fingerprint sweep opens its own Store in a worker process
+        # so it cannot contend with the WebSocket event loop's GIL.
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         # WAL + NORMAL sync: many small writes per cycle without an fsync per commit.
@@ -320,6 +390,50 @@ class Store:
         _pnl_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(pnl)")}
         if "event_key" not in _pnl_cols:
             self.conn.execute("ALTER TABLE pnl ADD COLUMN event_key TEXT")
+        _shadow_cols = {r[1] for r in
+                        self.conn.execute("PRAGMA table_info(shadow_edge_episodes)")}
+        if "qualification" not in _shadow_cols:
+            self.conn.execute(
+                "ALTER TABLE shadow_edge_episodes ADD COLUMN qualification "
+                "TEXT NOT NULL DEFAULT 'verified'")
+        if "screen_reason" not in _shadow_cols:
+            self.conn.execute(
+                "ALTER TABLE shadow_edge_episodes ADD COLUMN screen_reason "
+                "TEXT NOT NULL DEFAULT 'eligible'")
+        _shadow_additions = {
+            "peak_edge_size": "REAL", "min_edge": "REAL", "min_size": "REAL",
+            "max_quote_skew_ms": "REAL",
+            "eligible_observations": "INTEGER NOT NULL DEFAULT 0",
+            "qualified_ts": "REAL", "qualified_edge": "REAL",
+            "qualified_size": "REAL", "qualified_yes_price": "REAL",
+            "qualified_no_price": "REAL", "qualified_skew_ms": "REAL",
+            "settlement_checked_ts": "REAL", "yes_result": "TEXT",
+            "no_result": "TEXT", "settlement_payout": "REAL",
+            "realized_edge_per_contract": "REAL", "realized_profit": "REAL",
+            "oracle_checked_ts": "REAL", "oracle_eligible": "INTEGER",
+            "oracle_reason": "TEXT", "oracle_cf_move_bps": "REAL",
+            "oracle_chainlink_move_bps": "REAL", "oracle_path_gap_bps": "REAL",
+            "oracle_min_distance_bps": "REAL", "oracle_remaining_s": "REAL",
+            "oracle_cf_age_ms": "REAL", "oracle_chainlink_age_ms": "REAL",
+            "oracle_uncertainty_bps": "REAL", "oracle_cf_samples": "INTEGER",
+            "source_qualified_ts": "REAL", "source_qualified_edge": "REAL",
+            "source_qualified_size": "REAL", "source_qualified_yes_price": "REAL",
+            "source_qualified_no_price": "REAL", "source_qualified_skew_ms": "REAL",
+            "source_cf_move_bps": "REAL", "source_chainlink_move_bps": "REAL",
+            "source_path_gap_bps": "REAL", "source_min_distance_bps": "REAL",
+            "source_remaining_s": "REAL", "source_uncertainty_bps": "REAL",
+            "source_cf_samples": "INTEGER",
+            "path_qualified_ts": "REAL", "path_qualified_edge": "REAL",
+            "path_qualified_size": "REAL", "path_qualified_yes_price": "REAL",
+            "path_qualified_no_price": "REAL", "path_qualified_skew_ms": "REAL",
+            "path_cf_move_bps": "REAL", "path_chainlink_move_bps": "REAL",
+            "path_gap_bps": "REAL", "path_min_distance_bps": "REAL",
+            "path_remaining_s": "REAL", "path_uncertainty_bps": "REAL",
+        }
+        for column, definition in _shadow_additions.items():
+            if column not in _shadow_cols:
+                self.conn.execute(
+                    f"ALTER TABLE shadow_edge_episodes ADD COLUMN {column} {definition}")
         self.conn.commit()
 
     def close(self) -> None:
@@ -393,6 +507,233 @@ class Store:
              edge, size, outcome),
         )
         self.conn.commit()
+
+    def start_shadow_edge(
+        self, *, event_key: str, yes_venue: str, yes_market: str,
+        no_venue: str, no_market: str, yes_price: float, no_price: float,
+        edge: float, size: float, fee_per_contract: float,
+        processing_latency_ms: float | None = None,
+        quote_skew_ms: float | None = None,
+        qualification: str = "verified",
+        screen_reason: str = "eligible",
+    ) -> int:
+        """Open one continuous read-only WebSocket edge episode."""
+        now = time.time()
+        gross = yes_price + no_price
+        profit = edge * size
+        cur = self.conn.execute(
+            """INSERT INTO shadow_edge_episodes
+               (started_ts, last_seen_ts, event_key, yes_venue, yes_market,
+                no_venue, no_market, yes_price, no_price, gross_cost,
+                fee_per_contract, edge_per_contract, size, achievable_profit,
+                peak_edge, peak_size, peak_profit, processing_latency_ms,
+                quote_skew_ms, qualification, screen_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (now, now, event_key, yes_venue, yes_market, no_venue, no_market,
+             yes_price, no_price, gross, fee_per_contract, edge, size, profit,
+             edge, size, profit, processing_latency_ms, quote_skew_ms,
+             qualification, screen_reason),
+        )
+        episode_id = int(cur.lastrowid)
+        self.conn.execute(
+            """UPDATE shadow_edge_episodes SET peak_edge_size=?, min_edge=?, min_size=?,
+                     max_quote_skew_ms=?, eligible_observations=? WHERE id=?""",
+            (size, edge, size, quote_skew_ms,
+             1 if screen_reason == "eligible" else 0, episode_id),
+        )
+        self.conn.commit()
+        return episode_id
+
+    def update_shadow_edge(
+        self, episode_id: int, *, duration_s: float, yes_price: float,
+        no_price: float, edge: float, size: float, fee_per_contract: float,
+        processing_latency_ms: float | None = None,
+        quote_skew_ms: float | None = None,
+        qualification: str | None = None,
+        screen_reason: str | None = None,
+    ) -> None:
+        """Refresh an open episode and retain its best executable observation."""
+        gross = yes_price + no_price
+        profit = edge * size
+        self.conn.execute(
+            """UPDATE shadow_edge_episodes SET
+                 last_seen_ts=?, duration_s=?, yes_price=?, no_price=?,
+                 gross_cost=?, fee_per_contract=?, edge_per_contract=?, size=?,
+                 achievable_profit=?, peak_edge=MAX(peak_edge, ?),
+                 peak_size=MAX(peak_size, ?), peak_profit=MAX(peak_profit, ?),
+                 processing_latency_ms=?, quote_skew_ms=?,
+                 peak_edge_size=CASE WHEN ?>peak_edge THEN ? ELSE peak_edge_size END,
+                 min_edge=MIN(COALESCE(min_edge, ?), ?),
+                 min_size=MIN(COALESCE(min_size, ?), ?),
+                 max_quote_skew_ms=CASE
+                   WHEN ? IS NULL THEN max_quote_skew_ms
+                   ELSE MAX(COALESCE(max_quote_skew_ms, ?), ?) END,
+                 qualification=COALESCE(?, qualification),
+                 screen_reason=COALESCE(?, screen_reason),
+                 eligible_observations=eligible_observations+?,
+                 observations=observations+1
+               WHERE id=? AND status='open'""",
+            (time.time(), max(0.0, duration_s), yes_price, no_price, gross,
+             fee_per_contract, edge, size, profit, edge, size, profit,
+             processing_latency_ms, quote_skew_ms,
+             edge, size, edge, edge, size, size,
+             quote_skew_ms, quote_skew_ms, quote_skew_ms,
+             qualification, screen_reason,
+             1 if screen_reason == "eligible" else 0, episode_id),
+        )
+        self.conn.commit()
+
+    def qualify_shadow_edge(
+        self, episode_id: int, *, edge: float, size: float, yes_price: float,
+        no_price: float, quote_skew_ms: float,
+    ) -> bool:
+        """Freeze the first persistence/synchronization-qualified simulated entry."""
+        cur = self.conn.execute(
+            """UPDATE shadow_edge_episodes SET qualified_ts=?, qualified_edge=?,
+                     qualified_size=?, qualified_yes_price=?, qualified_no_price=?,
+                     qualified_skew_ms=?
+               WHERE id=? AND status='open' AND qualified_ts IS NULL""",
+            (time.time(), edge, size, yes_price, no_price, quote_skew_ms, episode_id),
+        )
+        self.conn.commit()
+        return bool(cur.rowcount)
+
+    def update_shadow_oracle(self, episode_id: int, assessment) -> None:
+        """Attach the latest live settlement-source assessment to an episode."""
+        self.conn.execute(
+            """UPDATE shadow_edge_episodes SET oracle_checked_ts=?, oracle_eligible=?,
+                     oracle_reason=?, oracle_cf_move_bps=?,
+                     oracle_chainlink_move_bps=?, oracle_path_gap_bps=?,
+                     oracle_min_distance_bps=?, oracle_remaining_s=?,
+                     oracle_cf_age_ms=?, oracle_chainlink_age_ms=?,
+                     oracle_uncertainty_bps=?, oracle_cf_samples=?
+               WHERE id=? AND status='open'""",
+            (time.time(), int(bool(assessment.eligible)), assessment.reason,
+             assessment.cf_move_bps, assessment.chainlink_move_bps,
+             assessment.path_gap_bps, assessment.min_distance_bps,
+             assessment.remaining_s, assessment.cf_age_ms,
+             assessment.chainlink_age_ms,
+             getattr(assessment, "uncertainty_bps", None),
+             getattr(assessment, "cf_samples", None), episode_id),
+        )
+        self.conn.commit()
+
+    def qualify_shadow_source(
+        self, episode_id: int, *, edge: float, size: float, yes_price: float,
+        no_price: float, quote_skew_ms: float, assessment=None,
+    ) -> bool:
+        """Freeze the first quote-qualified entry that also passes the oracle gate."""
+        cur = self.conn.execute(
+            """UPDATE shadow_edge_episodes SET source_qualified_ts=?,
+                     source_qualified_edge=?, source_qualified_size=?,
+                     source_qualified_yes_price=?, source_qualified_no_price=?,
+                     source_qualified_skew_ms=?, source_cf_move_bps=?,
+                     source_chainlink_move_bps=?, source_path_gap_bps=?,
+                     source_min_distance_bps=?, source_remaining_s=?,
+                     source_uncertainty_bps=?, source_cf_samples=?
+               WHERE id=? AND status='open' AND source_qualified_ts IS NULL""",
+            (time.time(), edge, size, yes_price, no_price, quote_skew_ms,
+             getattr(assessment, "cf_move_bps", None),
+             getattr(assessment, "chainlink_move_bps", None),
+             getattr(assessment, "path_gap_bps", None),
+             getattr(assessment, "min_distance_bps", None),
+             getattr(assessment, "remaining_s", None),
+             getattr(assessment, "uncertainty_bps", None),
+             getattr(assessment, "cf_samples", None), episode_id),
+        )
+        self.conn.commit()
+        return bool(cur.rowcount)
+
+    def qualify_shadow_path(
+        self, episode_id: int, *, edge: float, size: float, yes_price: float,
+        no_price: float, quote_skew_ms: float, assessment,
+    ) -> bool:
+        """Freeze the first technically valid entry with currently aligned sources."""
+        cur = self.conn.execute(
+            """UPDATE shadow_edge_episodes SET path_qualified_ts=?,
+                     path_qualified_edge=?, path_qualified_size=?,
+                     path_qualified_yes_price=?, path_qualified_no_price=?,
+                     path_qualified_skew_ms=?, path_cf_move_bps=?,
+                     path_chainlink_move_bps=?, path_gap_bps=?,
+                     path_min_distance_bps=?, path_remaining_s=?,
+                     path_uncertainty_bps=?
+               WHERE id=? AND status='open' AND path_qualified_ts IS NULL""",
+            (time.time(), edge, size, yes_price, no_price, quote_skew_ms,
+             assessment.cf_move_bps, assessment.chainlink_move_bps,
+             assessment.path_gap_bps, assessment.min_distance_bps,
+             assessment.remaining_s, assessment.uncertainty_bps, episode_id),
+        )
+        self.conn.commit()
+        return bool(cur.rowcount)
+
+    def upsert_crypto_oracle_window(
+        self, *, window_start: int, asset: str, kalshi_market: str,
+        polymarket_com_market: str, kalshi_open: float | None,
+        polymarket_com_open: float | None,
+    ) -> None:
+        """Persist the two source-specific opening thresholds for one exact window."""
+        self.conn.execute(
+            """INSERT INTO crypto_oracle_windows
+                 (window_start,window_end,asset,kalshi_market,polymarket_com_market,
+                  kalshi_open,polymarket_com_open,updated_ts)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(window_start,asset) DO UPDATE SET
+                 kalshi_market=excluded.kalshi_market,
+                 polymarket_com_market=excluded.polymarket_com_market,
+                 kalshi_open=COALESCE(excluded.kalshi_open,kalshi_open),
+                 polymarket_com_open=COALESCE(
+                   excluded.polymarket_com_open,polymarket_com_open),
+                 updated_ts=excluded.updated_ts""",
+            (window_start, window_start + 900, asset, kalshi_market,
+             polymarket_com_market, kalshi_open, polymarket_com_open, time.time()),
+        )
+        self.conn.commit()
+
+    def settle_shadow_episode(
+        self, episode_id: int, *, yes_result: str, no_result: str,
+        payout: float,
+    ) -> int:
+        """Attach counterfactual payout/P&L to one resolved shadow episode.
+
+        ``yes_result`` and ``no_result`` are the underlying market outcomes for the
+        episode's YES and NO venues respectively. P&L is evaluated at the first
+        synchronized/persistent qualified entry, never at a cherry-picked peak.
+        """
+        cur = self.conn.execute(
+            """UPDATE shadow_edge_episodes SET settlement_checked_ts=?,
+                     yes_result=?, no_result=?, settlement_payout=?,
+                     realized_edge_per_contract=CASE WHEN qualified_edge IS NOT NULL
+                       THEN qualified_edge + ? - 1.0 END,
+                     realized_profit=CASE WHEN qualified_edge IS NOT NULL
+                       THEN (qualified_edge + ? - 1.0) * qualified_size END
+               WHERE id=?""",
+            (time.time(), yes_result, no_result, payout, payout, payout, episode_id),
+        )
+        self.conn.commit()
+        return int(cur.rowcount)
+
+    def close_shadow_edge(
+        self, episode_id: int, *, duration_s: float, reason: str,
+    ) -> None:
+        self.conn.execute(
+            """UPDATE shadow_edge_episodes SET ended_ts=?, duration_s=?,
+                 status='closed', close_reason=?
+               WHERE id=? AND status='open'""",
+            (time.time(), max(0.0, duration_s), reason, episode_id),
+        )
+        self.conn.commit()
+
+    def close_open_shadow_edges(self, reason: str = "process_restart") -> int:
+        """Close episodes orphaned by a prior process exit and return the count."""
+        cur = self.conn.execute(
+            """UPDATE shadow_edge_episodes SET ended_ts=last_seen_ts,
+                 duration_s=MAX(duration_s, last_seen_ts-started_ts),
+                 status='closed', close_reason=?
+               WHERE status='open'""",
+            (reason,),
+        )
+        self.conn.commit()
+        return int(cur.rowcount)
 
     # ---- fills / pnl ----
     def record_fill(
@@ -492,7 +833,64 @@ class Store:
         for a, b in join_pairs(kk, pk):
             pairs.append(("kalshi", a.market_id, "polymarket_us", b.market_id,
                           f"kalshi:{a.market_id}|polymarket_us:{b.market_id}"))
-        return pairs
+        return [*pairs, *self.crypto_short_pairs(max_age_days=max_age_days)]
+
+    def crypto_short_pairs(
+        self, *, max_age_days: float = 2.0, assets: set[str] | None = None,
+    ) -> list[tuple]:
+        """Exact-window Kalshi/Polymarket.com 15-minute crypto pairs.
+
+        This small targeted join is safe to run in every watchlist refresh. Kalshi
+        encodes the interval END in New York time; Polymarket.com encodes its START as
+        Unix seconds. Exact end equality is the identity key. The resolution-rules gate
+        remains mandatory because the exchanges can use different price sources.
+        """
+        supported = {
+            "BTC": "btc", "ETH": "eth", "SOL": "sol", "XRP": "xrp",
+            "DOGE": "doge", "HYPE": "hype", "BNB": "bnb",
+        }
+        selected = {a.upper() for a in assets} if assets is not None else set(supported)
+        selected &= supported.keys()
+        if not selected:
+            return []
+        cutoff = time.time() - max_age_days * 86400.0
+        kalshi: dict[tuple[str, int], str] = {}
+        pcom: dict[tuple[str, int], str] = {}
+        k_re = re.compile(r"^KX([A-Z0-9]+)15M-(\d{2}[A-Z]{3}\d{2})(\d{4})-[^-]+$")
+        p_re = re.compile(r"^([a-z0-9]+)-updown-15m-(\d+)$")
+        rows = self.conn.execute(
+            "SELECT venue, market_id FROM markets WHERE updated_at >= ? AND "
+            "((venue='kalshi' AND market_id LIKE 'KX%15M-%') OR "
+            " (venue='polymarket_com' AND market_id LIKE '%-updown-15m-%'))",
+            (cutoff,),
+        )
+        for row in rows:
+            market_id = row["market_id"] or ""
+            if row["venue"] == "kalshi" and (m := k_re.fullmatch(market_id)):
+                asset = m.group(1)
+                if asset not in selected:
+                    continue
+                try:
+                    local_end = datetime.strptime(
+                        m.group(2) + m.group(3), "%y%b%d%H%M"
+                    ).replace(tzinfo=ZoneInfo("America/New_York"))
+                    kalshi[(asset, int(local_end.timestamp()))] = market_id
+                except ValueError:
+                    pass
+            elif row["venue"] == "polymarket_com" and (m := p_re.fullmatch(market_id)):
+                reverse = {slug: asset for asset, slug in supported.items()}
+                asset = reverse.get(m.group(1))
+                if asset in selected:
+                    pcom[(asset, int(m.group(2)) + 15 * 60)] = market_id
+        return [
+            ("kalshi", kalshi[key], "polymarket_com", pcom[key],
+             f"kalshi:{kalshi[key]}|polymarket_com:{pcom[key]}")
+            for key in sorted(kalshi.keys() & pcom.keys())
+        ]
+
+    def btc_short_pairs(self, *, max_age_days: float = 2.0) -> list[tuple]:
+        """Backward-compatible BTC-only view of :meth:`crypto_short_pairs`."""
+        return self.crypto_short_pairs(max_age_days=max_age_days, assets={"BTC"})
 
     def record_transfer(self, venue: str, amount: float, *, source: str = "manual",
                         external_id: str | None = None, ts: float | None = None) -> bool:

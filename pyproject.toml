@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "prediction-arb-bot"
 version = "0.1.0"
-description = "Self-hosted arbitrage + directional trading bot for Kalshi and Polymarket US (QCEX)."
+description = "Self-hosted prediction-market bot for Kalshi and both Polymarket venues."
 requires-python = ">=3.11"
 # The deterministic core (models, fees, arbitrage, risk, book, store) depends only
 # on the standard library so the test suite runs with no third-party installs.
@@ -17,6 +17,7 @@ venues = [
     "httpx>=0.27",
     "websockets>=12",
     "cryptography>=42",   # Ed25519 request signing for Polymarket US / QCEX
+    "py-clob-client-v2>=1.0.2,<2",  # wallet signing + CLOB V2 for polymarket.com
     "numpy>=1.26",        # fast all-pairs cosine for semantic matching
 ]
 dev = [

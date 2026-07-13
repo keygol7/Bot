@@ -332,6 +332,107 @@ def test_indices_exist():
         assert idx in names
 
 
+def test_shadow_edge_episode_tracks_peak_duration_and_close():
+    s = Store(":memory:")
+    episode_id = s.start_shadow_edge(
+        event_key="E", yes_venue="kalshi", yes_market="K",
+        no_venue="polymarket_com", no_market="P",
+        yes_price=0.40, no_price=0.55, edge=0.04, size=10,
+        fee_per_contract=0.01, processing_latency_ms=3.0, quote_skew_ms=8.0,
+        qualification="oracle_unproven", screen_reason="below_divergence_floor",
+    )
+    s.update_shadow_edge(
+        episode_id, duration_s=1.25, yes_price=0.38, no_price=0.55,
+        edge=0.06, size=12, fee_per_contract=0.01,
+        processing_latency_ms=2.0, quote_skew_ms=5.0,
+    )
+    s.close_shadow_edge(episode_id, duration_s=2.5, reason="edge_gone")
+    row = s.conn.execute(
+        "SELECT * FROM shadow_edge_episodes WHERE id=?", (episode_id,)
+    ).fetchone()
+    assert row["status"] == "closed" and row["close_reason"] == "edge_gone"
+    assert row["duration_s"] == 2.5 and row["observations"] == 2
+    assert row["peak_edge"] == 0.06 and row["peak_size"] == 12
+    assert round(row["peak_profit"], 2) == 0.72
+    assert row["qualification"] == "oracle_unproven"
+    assert row["screen_reason"] == "below_divergence_floor"
+
+
+def test_shadow_qualification_and_settlement_use_frozen_entry_not_peak():
+    s = Store(":memory:")
+    episode_id = s.start_shadow_edge(
+        event_key="E", yes_venue="kalshi", yes_market="K",
+        no_venue="polymarket_com", no_market="P",
+        yes_price=0.40, no_price=0.55, edge=0.04, size=10,
+        fee_per_contract=0.01, quote_skew_ms=8.0,
+        qualification="oracle_unproven", screen_reason="eligible",
+    )
+    assert s.qualify_shadow_edge(
+        episode_id, edge=0.04, size=10, yes_price=0.40, no_price=0.55,
+        quote_skew_ms=8.0,
+    )
+    assert not s.qualify_shadow_edge(
+        episode_id, edge=0.20, size=99, yes_price=0.20, no_price=0.55,
+        quote_skew_ms=2.0,
+    )
+    s.update_shadow_edge(
+        episode_id, duration_s=1, yes_price=0.20, no_price=0.55,
+        edge=0.20, size=99, fee_per_contract=0.05, quote_skew_ms=2.0,
+        qualification="oracle_unproven", screen_reason="eligible",
+    )
+    s.settle_shadow_episode(
+        episode_id, yes_result="no", no_result="yes", payout=0.0,
+    )
+    row = s.conn.execute(
+        "SELECT * FROM shadow_edge_episodes WHERE id=?", (episode_id,)
+    ).fetchone()
+    assert row["qualified_edge"] == 0.04 and row["qualified_size"] == 10
+    assert row["peak_edge"] == 0.20 and row["peak_edge_size"] == 99
+    assert row["settlement_payout"] == 0
+    assert row["realized_edge_per_contract"] == -0.96
+    assert row["realized_profit"] == -9.6
+    s.close()
+
+
+def test_shadow_source_qualification_and_oracle_window_are_frozen():
+    from types import SimpleNamespace
+
+    s = Store(":memory:")
+    episode_id = s.start_shadow_edge(
+        event_key="E", yes_venue="kalshi", yes_market="K",
+        no_venue="polymarket_com", no_market="P",
+        yes_price=0.40, no_price=0.55, edge=0.04, size=10,
+        fee_per_contract=0.01,
+    )
+    assessment = SimpleNamespace(
+        eligible=True, reason="eligible", cf_move_bps=-12.0,
+        chainlink_move_bps=-10.0, path_gap_bps=2.0,
+        min_distance_bps=10.0, remaining_s=8.0,
+        cf_age_ms=100.0, chainlink_age_ms=80.0,
+    )
+    s.update_shadow_oracle(episode_id, assessment)
+    assert s.qualify_shadow_source(
+        episode_id, edge=0.04, size=10, yes_price=0.40, no_price=0.55,
+        quote_skew_ms=8.0,
+    )
+    assert not s.qualify_shadow_source(
+        episode_id, edge=0.20, size=99, yes_price=0.20, no_price=0.55,
+        quote_skew_ms=2.0,
+    )
+    s.upsert_crypto_oracle_window(
+        window_start=900, asset="BTC", kalshi_market="K", polymarket_com_market="P",
+        kalshi_open=100.0, polymarket_com_open=101.0,
+    )
+    row = s.conn.execute(
+        "SELECT * FROM shadow_edge_episodes WHERE id=?", (episode_id,)
+    ).fetchone()
+    assert row["oracle_eligible"] == 1 and row["oracle_reason"] == "eligible"
+    assert row["source_qualified_edge"] == 0.04
+    window = s.conn.execute("SELECT * FROM crypto_oracle_windows").fetchone()
+    assert window["kalshi_open"] == 100 and window["polymarket_com_open"] == 101
+    s.close()
+
+
 def test_rules_divergent_pairs_dropped_from_watchlist():
     # A pair whose rules the LLM confidently judged NON-identical is not a hedge and
     # must drop from confirmed_pairs, exactly like a blacklisted pair.

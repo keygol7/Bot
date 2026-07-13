@@ -116,3 +116,33 @@ class PolymarketUSFeeModel:
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return f"PolymarketUSFeeModel(rate={self.rate})"
+
+
+class PolymarketComFeeModel:
+    """Polymarket.com taker fee for crypto markets.
+
+    CLOB V2 applies fees at match time using ``C * rate * p * (1-p)``.  The current
+    published crypto rate is 0.07; makers pay no platform fee.  The bot's detector
+    models the taker path conservatively because it cannot know during discovery
+    whether a quote will later be posted as a maker.
+    """
+
+    def __init__(self, rate: float = 0.07) -> None:
+        if rate < 0:
+            raise ValueError("fee rate must be >= 0")
+        self.rate = rate
+
+    def fee(self, price: float, contracts: float) -> float:
+        if not (0.0 <= price <= 1.0):
+            raise ValueError(f"price must be in [0, 1], got {price}")
+        if contracts < 0:
+            raise ValueError("contracts must be >= 0")
+        # V2 fees are protocol-calculated with sub-cent precision; do not impose the
+        # QCEX nearest-cent rule on this separate venue.
+        return self.rate * contracts * price * (1.0 - price)
+
+    def per_contract(self, price: float) -> float:
+        return self.rate * price * (1.0 - price)
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return f"PolymarketComFeeModel(rate={self.rate})"

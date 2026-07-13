@@ -1,5 +1,6 @@
 # Secrets — never commit real credentials
 .env
+secrets/
 *.key
 *.pem
 

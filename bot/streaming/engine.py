@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections import deque
 from collections import defaultdict, deque
@@ -57,15 +58,27 @@ class LiveBook:
         self._q: dict[tuple[str, str], MarketQuote] = {}
         self._hist: dict[tuple[str, str], deque] = {}
 
-    def update(self, q: MarketQuote) -> None:
-        self._q[(q.venue, q.market_id)] = q
+    def update(self, q: MarketQuote) -> bool:
+        key = (q.venue, q.market_id)
+        previous = self._q.get(key)
         ts = getattr(q, "exchange_ts", None)
+        previous_ts = getattr(previous, "exchange_ts", None) if previous else None
+        if ts is not None and previous_ts is not None:
+            if ts < previous_ts:
+                return False
+            if ts == previous_ts:
+                new_has_depth = bool(q.yes_ask_levels or q.no_ask_levels)
+                old_has_depth = bool(previous.yes_ask_levels or previous.no_ask_levels)
+                if old_has_depth and not new_has_depth:
+                    return False
+        self._q[key] = q
         if ts:
-            h = self._hist.setdefault((q.venue, q.market_id), deque())
+            h = self._hist.setdefault(key, deque())
             h.append((ts, q))
             cutoff = ts - self.HISTORY_SECS
             while h and h[0][0] < cutoff:
                 h.popleft()
+        return True
 
     def get(self, venue: str, market_id: str) -> MarketQuote | None:
         return self._q.get((venue, market_id))
@@ -101,7 +114,7 @@ class StreamingEngine:
     def __init__(
         self,
         *,
-        executor: Executor,
+        executor: Executor | None,
         fee_models: dict[str, FeeModel] | None = None,
         min_edge: float = 0.01,
         max_plausible_edge: float = 0.0,
@@ -127,8 +140,18 @@ class StreamingEngine:
         ws_trust_min: int = 3,
         ws_trust_eps: float = 0.01,
         require_rules_verify: bool = False,
+        read_only: bool = False,
+        oracle_guard=None,
     ) -> None:
+        if read_only and executor is not None:
+            raise ValueError("read_only streaming requires executor=None")
         self.executor = executor
+        # Read-only WebSocket shadowing shares the exact live-book, fee, depth and
+        # settlement guards, but terminates before an ArbOpportunity or order is built.
+        self.read_only = read_only
+        # Synchronous, memory-only callable(event_key)->OracleAssessment. The source
+        # feeds run in separate async tasks; the quote hot path never performs I/O.
+        self.oracle_guard = oracle_guard
         self.fee_models = fee_models or {}
         self.min_edge = min_edge
         # Implausible-edge guard: a genuine cross-venue arb is bounded by arbitrage to a few
@@ -211,6 +234,10 @@ class StreamingEngine:
         self.prime_concurrency = prime_concurrency
         self._maker_inflight: set = set()
         self._take_inflight: set = set()        # pairs with a spawned hybrid TAKE running
+        # A liquid crypto book can publish hundreds of deltas per second.  Keep every
+        # delta on the hot path, but rate-limit the informational fast-path message so
+        # journald I/O does not become part of the latency budget.
+        self._last_fast_path_log: dict[tuple, float] = {}
         # Pair keys with the STRONGEST match evidence (rules-verified identical, or
         # settlement-verified consistent) — allowed to fire FAT edges with no price
         # history. Fed by the slow loop from Store.verified_pair_keys().
@@ -284,11 +311,19 @@ class StreamingEngine:
         # `state` (carried on the quote) and Kalshi's lifecycle channel. Used to skip
         # firing into a non-OPEN (halted/suspended/pre-open/settled) market.
         self._market_state: dict[tuple[str, str], str] = {}
+        # pair key -> episode state. Persistent rows live in shadow_edge_episodes;
+        # this map only tracks the active episode id and monotonic start time.
+        self._shadow_active: dict[tuple, dict] = {}
 
     def _fee(self, venue: str) -> FeeModel:
         return self.fee_models.get(venue, ZeroFeeModel())
 
     def set_pairs(self, pairs: list[ConfirmedPair]) -> None:
+        incoming = {p.key for p in pairs}
+        if self.read_only:
+            for key in list(self._shadow_active):
+                if key not in incoming:
+                    self._close_shadow_edge(key, "watchlist_removed")
         self._pairs = {p.key: p for p in pairs}
         self._index = {}
         for p in pairs:
@@ -521,6 +556,201 @@ class StreamingEngine:
         except Exception as exc:
             log.warning("edge log failed for %s: %s", p.event_key, exc)
 
+    @staticmethod
+    def _shadow_timing(yq, nq) -> tuple[float | None, float | None]:
+        """Return processing latency and inter-venue quote skew in milliseconds."""
+        ty = float(getattr(yq, "timestamp", 0.0) or 0.0)
+        tn = float(getattr(nq, "timestamp", 0.0) or 0.0)
+        if ty <= 0 or tn <= 0:
+            return None, None
+        now = time.time()
+        return max(0.0, (now - max(ty, tn)) * 1000.0), abs(ty - tn) * 1000.0
+
+    def _touch_shadow_edge(
+        self, key, p, edge, yq, nq, size, *, qualification="verified",
+        screen_reason="eligible",
+    ) -> None:
+        """Open/update a continuous read-only edge or explicitly labeled candidate."""
+        # Screening labels can flip on adjacent ticks while the same executable
+        # direction remains continuously positive. They are episode attributes, not
+        # episode identity; splitting on them turned one spread into hundreds of rows.
+        direction = (yq.venue, yq.market_id, nq.venue, nq.market_id)
+        state = self._shadow_active.get(key)
+        if state is not None and state["direction"] != direction:
+            self._close_shadow_edge(key, "direction_changed")
+            state = None
+        fee = max(0.0, 1.0 - yq.yes_ask - nq.no_ask - edge)
+        latency_ms, skew_ms = self._shadow_timing(yq, nq)
+        now = self.clock()
+        oracle = None
+        if self.oracle_guard is not None and self._is_exact_crypto_window_pair(p):
+            try:
+                oracle = self.oracle_guard(p.event_key)
+            except Exception as exc:
+                log.warning("crypto oracle assessment failed for %s: %s", p.event_key, exc)
+        if state is None:
+            episode_id = None
+            if self.store is not None:
+                try:
+                    episode_id = self.store.start_shadow_edge(
+                        event_key=p.event_key,
+                        yes_venue=yq.venue, yes_market=yq.market_id,
+                        no_venue=nq.venue, no_market=nq.market_id,
+                        yes_price=yq.yes_ask, no_price=nq.no_ask,
+                        edge=edge, size=size, fee_per_contract=fee,
+                        processing_latency_ms=latency_ms, quote_skew_ms=skew_ms,
+                        qualification=qualification, screen_reason=screen_reason,
+                    )
+                except Exception as exc:
+                    log.warning("shadow edge start failed for %s: %s", p.event_key, exc)
+            self._shadow_active[key] = {
+                "episode_id": episode_id, "started": now, "direction": direction,
+                "event_key": p.event_key, "peak_edge": edge,
+                "peak_profit": edge * size,
+                "qualification": qualification, "screen_reason": screen_reason,
+                "qualified": False,
+                "source_qualified": False,
+                "path_qualified": False,
+                "oracle_last_write": now,
+                "oracle_reason": getattr(oracle, "reason", None),
+            }
+            if self.store is not None and episode_id is not None and oracle is not None:
+                try:
+                    self.store.update_shadow_oracle(episode_id, oracle)
+                except Exception as exc:
+                    log.warning("shadow oracle start failed for %s: %s", p.event_key, exc)
+            log.info(
+                "SHADOW EDGE OPEN [%s/%s] | %s | YES@%s=%.3f + NO@%s=%.3f | "
+                "fees=%.4f edge=%+.4f depth=%g profit=$%.2f latency=%s skew=%s",
+                qualification, screen_reason, p.event_key,
+                yq.venue, yq.yes_ask, nq.venue, nq.no_ask,
+                fee, edge, size, edge * size,
+                f"{latency_ms:.1f}ms" if latency_ms is not None else "n/a",
+                f"{skew_ms:.1f}ms" if skew_ms is not None else "n/a",
+            )
+            return
+        duration = max(0.0, now - state["started"])
+        state["peak_edge"] = max(state["peak_edge"], edge)
+        state["peak_profit"] = max(state["peak_profit"], edge * size)
+        episode_id = state.get("episode_id")
+        if self.store is not None and episode_id is not None:
+            try:
+                self.store.update_shadow_edge(
+                    episode_id, duration_s=duration,
+                    yes_price=yq.yes_ask, no_price=nq.no_ask,
+                    edge=edge, size=size, fee_per_contract=fee,
+                    processing_latency_ms=latency_ms, quote_skew_ms=skew_ms,
+                    qualification=qualification, screen_reason=screen_reason,
+                )
+            except Exception as exc:
+                log.warning("shadow edge update failed for %s: %s", p.event_key, exc)
+            if oracle is not None and (
+                oracle.reason != state.get("oracle_reason")
+                or oracle.eligible
+                or now - state.get("oracle_last_write", 0.0) >= 1.0
+            ):
+                try:
+                    self.store.update_shadow_oracle(episode_id, oracle)
+                    state["oracle_last_write"] = now
+                    state["oracle_reason"] = oracle.reason
+                except Exception as exc:
+                    log.warning("shadow oracle update failed for %s: %s", p.event_key, exc)
+        # Counterfactual entry rule: the edge must survive long enough to be actionable
+        # and the two received books must be close in arrival time. Freeze the FIRST
+        # qualifying observation; settlement reporting uses it instead of peak hindsight.
+        microstructure_qualifies = (
+            duration >= 0.250 and qualification != "rules_pending"
+            and skew_ms is not None and skew_ms <= 100.0 and size >= 1.0
+        )
+        quote_qualifies = microstructure_qualifies and screen_reason == "eligible"
+        if not state.get("qualified") and quote_qualifies:
+            qualified = episode_id is None
+            if self.store is not None and episode_id is not None:
+                try:
+                    qualified = self.store.qualify_shadow_edge(
+                        episode_id, edge=edge, size=size,
+                        yes_price=yq.yes_ask, no_price=nq.no_ask,
+                        quote_skew_ms=skew_ms,
+                    )
+                except Exception as exc:
+                    log.warning("shadow edge qualification failed for %s: %s",
+                                p.event_key, exc)
+            if qualified:
+                state["qualified"] = True
+                log.info("SHADOW EDGE QUALIFIED | %s | duration=%.3fs edge=%+.4f "
+                         "size=%g skew=%.1fms", p.event_key, duration, edge, size, skew_ms)
+        if (not state.get("path_qualified") and microstructure_qualifies and edge > 0.01
+                and oracle is not None and getattr(oracle, "path_aligned", False)):
+            path_qualified = episode_id is None
+            if self.store is not None and episode_id is not None:
+                try:
+                    path_qualified = self.store.qualify_shadow_path(
+                        episode_id, edge=edge, size=size,
+                        yes_price=yq.yes_ask, no_price=nq.no_ask,
+                        quote_skew_ms=skew_ms, assessment=oracle,
+                    )
+                except Exception as exc:
+                    log.warning("shadow path qualification failed for %s: %s",
+                                p.event_key, exc)
+            if path_qualified:
+                state["path_qualified"] = True
+                log.info("PATH-ALIGNED CRYPTO CANDIDATE | %s | remaining=%.1fs "
+                         "CF=%+.2fbp CL=%+.2fbp gap=%.2fbp edge=%+.4f size=%g",
+                         p.event_key, oracle.remaining_s, oracle.cf_move_bps,
+                         oracle.chainlink_move_bps, oracle.path_gap_bps, edge, size)
+        if (not state.get("source_qualified") and microstructure_qualifies and edge > 0.01
+                and oracle is not None and oracle.eligible):
+            source_qualified = episode_id is None
+            if self.store is not None and episode_id is not None:
+                try:
+                    source_qualified = self.store.qualify_shadow_source(
+                        episode_id, edge=edge, size=size,
+                        yes_price=yq.yes_ask, no_price=nq.no_ask,
+                        quote_skew_ms=skew_ms, assessment=oracle,
+                    )
+                except Exception as exc:
+                    log.warning("shadow source qualification failed for %s: %s",
+                                p.event_key, exc)
+            if source_qualified:
+                state["source_qualified"] = True
+                log.warning("SOURCE-GATED CRYPTO ENTRY | %s | remaining=%.2fs "
+                            "CF=%+.2fbp CL=%+.2fbp gap=%.2fbp edge=%+.4f size=%g",
+                            p.event_key, oracle.remaining_s, oracle.cf_move_bps,
+                            oracle.chainlink_move_bps, oracle.path_gap_bps, edge, size)
+
+    @staticmethod
+    def _is_exact_crypto_window_pair(p: ConfirmedPair) -> bool:
+        """Whether this is one of the deterministic Kalshi/Pcom 15-minute joins."""
+        markets = {p.venue_a: p.market_a, p.venue_b: p.market_b}
+        kalshi = markets.get("kalshi", "")
+        pcom = markets.get("polymarket_com", "")
+        km = re.fullmatch(r"KX(BTC|ETH|SOL|XRP|DOGE|HYPE|BNB)15M-.+", kalshi)
+        pm = re.fullmatch(r"(btc|eth|sol|xrp|doge|hype|bnb)-updown-15m-\d+", pcom)
+        return bool(km and pm and km.group(1).lower() == pm.group(1))
+
+    def _close_shadow_edge(self, key, reason: str) -> None:
+        state = self._shadow_active.pop(key, None)
+        if state is None:
+            return
+        duration = max(0.0, self.clock() - state["started"])
+        episode_id = state.get("episode_id")
+        if self.store is not None and episode_id is not None:
+            try:
+                self.store.close_shadow_edge(
+                    episode_id, duration_s=duration, reason=reason)
+            except Exception as exc:
+                log.warning("shadow edge close failed for %s: %s", state["event_key"], exc)
+        log.info(
+            "SHADOW EDGE CLOSED | %s | duration=%.3fs peak_edge=%+.4f "
+            "peak_profit=$%.2f reason=%s",
+            state["event_key"], duration, state["peak_edge"],
+            state["peak_profit"], reason,
+        )
+
+    def close_shadow_edges(self, reason: str = "shutdown") -> None:
+        for key in list(self._shadow_active):
+            self._close_shadow_edge(key, reason)
+
     def _comove_corr(self, key):
         """corr(dYes_A, -dNo_B) over paired ticks, or None below 8 observations.
         +1 = the legs reprice on the same news (same event); ~0 = strangers."""
@@ -611,6 +841,8 @@ class StreamingEngine:
         threshold, cooldown, and a depth re-validation. Returns a report or None."""
         p = self._pairs.get(key)
         if p is None:
+            if self.read_only:
+                self._close_shadow_edge(key, "watchlist_removed")
             return None
         # When the kill switch is tripped the executor SKIPs every order anyway, so doing
         # the per-tick edge math + a REST depth-confirm round trip is pure waste — and a
@@ -623,8 +855,13 @@ class StreamingEngine:
             return None                # already resting a maker / running a take for this pair
         ev = self._best_direction(p)
         if ev is None:
+            if self.read_only:
+                self._close_shadow_edge(key, "book_not_two_sided")
             return None
         edge, yq, nq, size = ev
+        crypto_shadow = self.read_only and self._is_exact_crypto_window_pair(p)
+        shadow_qualification = "verified"
+        shadow_screen_reason = "eligible"
         # EMPIRICAL observation: sample this pair's YES+NO sum on EVERY tick (incl. no-edge
         # ticks where the sum is >= 1), building the price-behavior history the same-event
         # gate below relies on. Cheap, in-memory, bounded.
@@ -641,6 +878,8 @@ class StreamingEngine:
                     h.append((dy, dn))
         if edge <= self.min_edge:                # price-edge gate (size checked below)
             self._edge_since.pop(key, None)      # edge gone -> reset persistence timer
+            if self.read_only:
+                self._close_shadow_edge(key, "edge_gone")
             return None
         # Implausible-edge guard (empirical sanity): an edge this large can't be a real arb —
         # it means the two legs are NOT complements (a false same-event match). Skip + record
@@ -698,14 +937,22 @@ class StreamingEngine:
                                  "observing",
                                  p.event_key, edge, n, need_n, mean_sum, need_mean,
                                  max_mean, f"{corr:.2f}" if corr is not None else "n/a")
-                    self._observe(p, edge, yq, nq, size, "fat_edge_unproven")
-                    # Evidence-based blacklisting still applies: a pair whose sum history
-                    # sits far from $1 over enough samples is a false match, parked.
-                    self._maybe_blacklist(p, key, f"implausible edge {edge:+.3f}")
-                    return None
-                log.warning("STREAM %s: FAT edge %+.3f on a PROVEN complement (mean sum "
-                            "%.3f over %d samples) — genuine dislocation, firing",
-                            p.event_key, edge, mean_sum, n)
+                    if crypto_shadow:
+                        # Exact asset/window identity makes this useful evidence even when
+                        # differing settlement oracles prevent calling it guaranteed arb.
+                        # Continue through persistence, depth, lifecycle and freshness gates,
+                        # then store ONE labeled episode instead of one row per WS tick.
+                        shadow_screen_reason = "fat_edge_unproven"
+                    else:
+                        self._observe(p, edge, yq, nq, size, "fat_edge_unproven")
+                        # Evidence-based blacklisting still applies: a pair whose sum history
+                        # sits far from $1 over enough samples is a false match, parked.
+                        self._maybe_blacklist(p, key, f"implausible edge {edge:+.3f}")
+                        return None
+                else:
+                    log.warning("STREAM %s: FAT edge %+.3f on a PROVEN complement (mean sum "
+                                "%.3f over %d samples) — genuine dislocation, firing",
+                                p.event_key, edge, mean_sum, n)
         # EMPIRICAL same-event gate: only TRADE a pair once its observed YES+NO sum confirms
         # the legs are complements. Insufficient history -> OBSERVE, don't trade yet (a new
         # real pair confirms within minutes as ticks accrue). Mean sum below the floor -> a
@@ -720,7 +967,10 @@ class StreamingEngine:
                 if n == 1 or n == self.empirical_min_obs // 2:   # occasional heartbeat
                     log.info("STREAM %s: observing (%d/%d samples) before trading",
                              p.event_key, n, self.empirical_min_obs)
-                return None
+                if crypto_shadow:
+                    shadow_screen_reason = "price_history_unproven"
+                else:
+                    return None
             mean_sum = (sum(obs) / n) if n else 1.0
             if n >= self.empirical_min_obs and mean_sum < self.empirical_sum_floor:
                 # Defense in depth: an empirical NON-complement blocks even a verified
@@ -742,16 +992,34 @@ class StreamingEngine:
                     log.warning("STREAM %s: CONFLICT — pair is rules/settlement-verified "
                                 "but its price history says non-complement (mean %.3f); "
                                 "trusting the prices, not trading", p.event_key, mean_sum)
+                elif crypto_shadow:
+                    # Exact symbol/window identity is deterministic here.  Since the
+                    # venues settle from different price sources, a cheap sum is oracle
+                    # divergence evidence, not evidence of a false market match.
+                    now_l = self.clock()
+                    log_key = ("crypto_oracle_divergence",) + tuple(key)
+                    if now_l - self._rules_block_logged.get(log_key, 0.0) > 60:
+                        self._rules_block_logged[log_key] = now_l
+                        log.info("STREAM %s: exact crypto pair has cheap sum %.3f; "
+                                 "routing to CF/Chainlink oracle guard",
+                                 p.event_key, mean_sum)
                 else:
                     log.warning("STREAM %s: empirical reject — mean YES+NO sum %.3f < %.3f "
                                 "over %d samples (legs not complementary -> FALSE MATCH)",
                                 p.event_key, mean_sum, self.empirical_sum_floor, n)
-                    self._maybe_blacklist(p, key, f"mean sum {mean_sum:.3f} < "
-                                                  f"{self.empirical_sum_floor}")
+                    if not crypto_shadow:
+                        self._maybe_blacklist(p, key, f"mean sum {mean_sum:.3f} < "
+                                                      f"{self.empirical_sum_floor}")
                 if key not in self.identity_certain:
-                    self._observe(p, edge, yq, nq, size, "empirical_reject_false_match")
-                    self._backoff_until[key] = self.clock() + self._backoff_cap
-                    return None
+                    if crypto_shadow:
+                        shadow_screen_reason = "crypto_oracle_divergence"
+                    else:
+                        self._observe(p, edge, yq, nq, size,
+                                      "empirical_reject_false_match")
+                        self._backoff_until[key] = self.clock() + self._backoff_cap
+                        if self.read_only:
+                            self._close_shadow_edge(key, "empirical_reject_false_match")
+                        return None
         # SUB-100ms SYNC PATH: when BOTH legs just ticked within the tight sync window the
         # cross-feed is synchronized NOW, so this is a genuine edge — not a one-sided flicker.
         # Skip the persist wait entirely and take it in tens of ms. Gated to deep books (the
@@ -764,11 +1032,18 @@ class StreamingEngine:
         req_yes = self.one_way_yes.get(key)
         if req_yes and yq.venue != req_yes:
             self._observe(p, edge, yq, nq, size, "unsafe_direction_timing_scope")
+            if self.read_only:
+                self._close_shadow_edge(key, "unsafe_direction_timing_scope")
             return None       # only the windfall-shaped direction may trade
         extra = self.pair_edge_floor.get(key, 0.0)
         if extra > 0 and edge < self.min_edge + extra - 1e-9:
-            self._observe(p, edge, yq, nq, size, "edge_below_divergence_floor")
-            return None       # the edge must also pay for the divergence risk
+            if crypto_shadow:
+                shadow_screen_reason = "below_divergence_floor"
+            else:
+                self._observe(p, edge, yq, nq, size, "edge_below_divergence_floor")
+                if self.read_only:
+                    self._close_shadow_edge(key, "edge_below_divergence_floor")
+                return None       # the edge must also pay for the divergence risk
         if (self.require_rules_verify and key not in self.rules_checked
                 and key not in self.verified_pairs):
             # visible + prioritized: the rules loop verifies blocked-with-live-edge
@@ -787,7 +1062,22 @@ class StreamingEngine:
                 log.info("STREAM %s: edge %.4f BLOCKED pending rules verification "
                          "(prioritized for next pass)", p.event_key, edge)
             self._observe(p, edge, yq, nq, size, "rules_pending")
-            return None                       # never trade ahead of the rules pass
+            if crypto_shadow:
+                shadow_qualification = "rules_pending"
+            else:
+                if self.read_only:
+                    self._close_shadow_edge(key, "rules_pending")
+                return None                       # never trade ahead of the rules pass
+        if self.read_only and key not in self.verified_pairs:
+            # Shadow reports are evidence for funding decisions, so admit only the
+            # strongest truth class: identical rules (or consistent prior settlement).
+            # Merely "checked" tail-divergent contracts are not guaranteed hedges.
+            if crypto_shadow:
+                if shadow_qualification != "rules_pending":
+                    shadow_qualification = "oracle_unproven"
+            else:
+                self._close_shadow_edge(key, "rules_not_identical")
+                return None
         deep = self.hybrid_take_depth > 0 and size >= self.hybrid_take_depth
         sync_fast_take = self.maker_mode and deep and self._ws_synced(yq, nq)
         if not sync_fast_take and self.maker_mode and deep and self.sync_window_secs > 0:
@@ -808,11 +1098,12 @@ class StreamingEngine:
                 return None                       # first sighting — wait for it to persist
             if self.clock() - first < self.edge_persist_secs:
                 return None                       # not held long enough yet
-        if self.clock() < self._backoff_until.get(key, 0.0):
-            return None                           # market keeps rejecting -> backing off
-        if self.clock() - self._last_acted.get(key, -1e9) < self.cooldown:
-            return None
-        self._last_acted[key] = self.clock()      # cooldown set now to avoid REST storms
+        if not self.read_only:
+            if self.clock() < self._backoff_until.get(key, 0.0):
+                return None                       # market keeps rejecting -> backing off
+            if self.clock() - self._last_acted.get(key, -1e9) < self.cooldown:
+                return None
+            self._last_acted[key] = self.clock()  # avoid order/REST storms
         # LATENCY FAST PATH: a FRESH, SIZED WS book deep enough to TAKE fires WITHOUT the
         # REST depth-confirm round-trip — so we beat slower actors to the edge instead of
         # losing it in the ~35ms confirm window (the "edge gone after depth check" misses).
@@ -858,11 +1149,15 @@ class StreamingEngine:
                 # edge-gones in a 4h sample). Skip silently; a real order arriving
                 # ticks the book and re-triggers with size. (size == 0 means
                 # SIZELESS/unknown — those still confirm to learn real depth.)
+                if self.read_only:
+                    self._close_shadow_edge(key, "insufficient_depth")
                 return None
             ws_claim = edge
             log.info("STREAM %s: price edge %.4f -> confirming real depth", p.event_key, edge)
             ev = await self._confirm_depth(p)
             if ev is None:
+                if self.read_only:
+                    self._close_shadow_edge(key, "depth_not_two_sided")
                 return None
             edge, yq, nq, size = ev
             # feed the ladder: honest book (rest within eps of the WS claim) climbs;
@@ -872,6 +1167,9 @@ class StreamingEngine:
             else:
                 self._ws_trust[key] = 0
             if edge <= self.min_edge or size < 1:
+                if self.read_only:
+                    self._close_shadow_edge(key, "edge_gone_after_depth")
+                    return None
                 # CONVERT before backing off: the confirm just fetched BOTH full
                 # ladders — exactly what a maker rest needs. No taker edge does not
                 # mean no opportunity: the maker manufactures its price deeper in
@@ -903,17 +1201,26 @@ class StreamingEngine:
                          "backoff %.0fs (miss #%d)%s", p.event_key, edge, size, delay,
                          n, maker_note)
                 self._observe(p, edge, yq, nq, size, "edge_gone_after_depth")
+                if self.read_only:
+                    self._close_shadow_edge(key, "edge_gone_after_depth")
                 return None
             self._confirm_fails.pop(key, None)     # WS agreed with REST — full cadence
         elif size < 1:
+            if self.read_only:
+                self._close_shadow_edge(key, "insufficient_depth")
             return None
         else:
-            log.info("STREAM %s: edge %.4f from fresh WS book (sz %g) -> fast executing "
-                     "(%s)", p.event_key, edge, size,
-                     "SYNC sub-100ms TAKE" if sync_fast_take
-                     else "deep TAKE, no REST confirm" if fast_take
-                     else f"TRUSTED WS x{self._ws_trust.get(key, 0)}" if trusted
-                     else "fresh WS")
+            last_fast_log = self._last_fast_path_log.get(key, float("-inf"))
+            should_log_fast = self.clock() - last_fast_log >= 1.0
+            if should_log_fast:
+                self._last_fast_path_log[key] = self.clock()
+                log.info("STREAM %s: edge %.4f from fresh WS book (sz %g) -> %s "
+                         "(%s)", p.event_key, edge, size,
+                         "shadow recording" if self.read_only else "fast executing",
+                         "SYNC sub-100ms TAKE" if sync_fast_take
+                         else "deep TAKE, no REST confirm" if fast_take
+                         else f"TRUSTED WS x{self._ws_trust.get(key, 0)}" if trusted
+                         else "fresh WS")
         # State guard: never fire into a non-OPEN market (halted/suspended/pre-open/
         # closing-auction/settled) — it would reject or settle against us.
         if not (self._quote_open(yq) and self._quote_open(nq)):
@@ -921,6 +1228,8 @@ class StreamingEngine:
                      yq.venue, self._market_state.get((yq.venue, yq.market_id)) or yq.state,
                      nq.venue, self._market_state.get((nq.venue, nq.market_id)) or nq.state)
             self._observe(p, edge, yq, nq, size, "skip_not_open")
+            if self.read_only:
+                self._close_shadow_edge(key, "skip_not_open")
             return None
         # Price-extreme guard: a leg at ~$0.01/$0.99 is a settling/resolved market with
         # phantom depth (no real resting volume) — its edge is an artifact. Skip it.
@@ -937,7 +1246,16 @@ class StreamingEngine:
                 log.info("STREAM %s: skip — leg at price extreme (yes=%.3f no=%.3f), "
                          "likely settling", p.event_key, yq.yes_ask, nq.no_ask)
                 self._observe(p, edge, yq, nq, size, "skip_settling")
+                if self.read_only:
+                    self._close_shadow_edge(key, "skip_settling")
                 return None
+        if self.read_only:
+            self._touch_shadow_edge(
+                key, p, edge, yq, nq, size,
+                qualification=shadow_qualification,
+                screen_reason=shadow_screen_reason,
+            )
+            return None
         opp = self._build_opp(p, edge, yq, nq, size)
         if self.maker_mode:
             # Hybrid take-or-rest: a depth-confirmed edge that has REAL top-of-book size
@@ -966,9 +1284,10 @@ class StreamingEngine:
             # leaves the maker fill naked (the incident). Such markets stay TAKE-able above —
             # a 500 on a taker leg is a clean skip via the leg-order fix — just never rested.
             if self.maker_eligible is not None:
-                poly_v, poly_m = ((p.venue_a, p.market_a) if p.venue_a == "polymarket_us"
-                                  else (p.venue_b, p.market_b))
-                if not self.maker_eligible(poly_v, poly_m):
+                poly_legs = [(vn, mid) for vn, mid in (
+                    (p.venue_a, p.market_a), (p.venue_b, p.market_b)
+                ) if vn.startswith("polymarket_")]
+                if any(not self.maker_eligible(vn, mid) for vn, mid in poly_legs):
                     log.info("STREAM %s: maker NOT rested — hedge market below volume floor "
                              "(thin -> TAKE-only, never naked)", p.event_key)
                     return None
@@ -990,6 +1309,7 @@ class StreamingEngine:
 
     async def _run_take(self, key, p, opp, edge, yq, nq, size) -> None:
         """Run a hybrid TAKE to completion off the quote loop, then log + book it."""
+        self._require_execution_enabled()
         try:
             trig = max(getattr(yq, "timestamp", 0.0) or 0.0,
                        getattr(nq, "timestamp", 0.0) or 0.0)
@@ -1031,6 +1351,7 @@ class StreamingEngine:
 
     async def _run_maker(self, key, p, opp, edge, yq, nq, size) -> None:
         """Run a maker execution to completion off the quote loop, then log + book it."""
+        self._require_execution_enabled()
         try:
             report = await self.executor.execute_maker(opp)
             log.info("STREAM maker %s | %s", p.event_key, report)
@@ -1116,6 +1437,11 @@ class StreamingEngine:
         log.info("STREAM backing off %s for %.0fs after failed attempt #%d (%s)",
                  p.event_key, delay, n, report.reason)
 
+    def _require_execution_enabled(self) -> None:
+        """Defense-in-depth: no order helper may run in shadow mode."""
+        if self.read_only or self.executor is None:
+            raise RuntimeError("execution is disabled in read-only streaming mode")
+
     async def _execute_guarded(self, opp):
         """Run ``executor.execute`` so a refresh-boundary consumer cancellation can
         never abort a half-placed trade. The execution runs as a tracked task and is
@@ -1123,6 +1449,7 @@ class StreamingEngine:
         trade keeps running to a definitive outcome (locked / unwound / halted) and
         ``run()`` awaits it before the next cycle. Leaving an order placed-but-tracked
         is the whole point — an abandoned leg is the dangerous state, not a slow one."""
+        self._require_execution_enabled()
         task = asyncio.ensure_future(self.executor.execute(opp))
         self._inflight.add(task)
         task.add_done_callback(self._inflight.discard)
@@ -1141,7 +1468,8 @@ class StreamingEngine:
         its size, and the second level unchanged cannot change any edge decision —
         update the book, skip the eval."""
         prev = self.livebook.get(q.venue, q.market_id)
-        self.livebook.update(q)
+        if not self.livebook.update(q):
+            return None
         if prev is not None and q.exchange_ts is not None:
             def _head(x):
                 yl = getattr(x, "yes_ask_levels", None)
@@ -1542,7 +1870,10 @@ class StreamingEngine:
             self._ws_counts[venue.name] = self._ws_counts.get(venue.name, 0) + 1
             await self.on_quote(q)
 
-    async def run(self, venues: list, refresh_specs, *, refresh_interval: float = 300.0) -> None:
+    async def run(
+        self, venues: list, refresh_specs, *, refresh_interval: float = 300.0,
+        initial_pairs: list[ConfirmedPair] | None = None,
+    ) -> None:
         """Slow/fast loop: refresh confirmed pairs each interval WHILE the fast
         consumers keep streaming, hot-swap the watchlist on completion, and only
         (re)subscribe the WebSockets when the market set actually changed.
@@ -1590,6 +1921,15 @@ class StreamingEngine:
                 self.prime_and_sweep(only_markets=new_markets)))
 
         try:
+            # Start market-data sockets from the durable cached watchlist immediately.
+            # The full scan/embed/LLM refresh can take minutes; it now runs while these
+            # consumers stay hot instead of creating a dark startup window.
+            if initial_pairs:
+                self.set_pairs(initial_pairs)
+                subscribed = {v: tuple(sorted(m)) for v, m in self.market_ids.items()}
+                log.info("stream bootstrap: subscribing %d cached pairs before refresh",
+                         len(initial_pairs))
+                await _resubscribe()
             while True:
                 # Discovery/scan/match runs CONCURRENTLY with the consumers (which
                 # keep trading the last-good watchlist while this completes).
@@ -1630,6 +1970,8 @@ class StreamingEngine:
             await asyncio.gather(*consumers, return_exceptions=True)
             if self._inflight:
                 await self.drain()
+            if self.read_only:
+                self.close_shadow_edges("shutdown")
 
     def edge_snapshot(self, top: int | None = None) -> list[tuple]:
         """Current best edge per pair, computed from the live WS book.

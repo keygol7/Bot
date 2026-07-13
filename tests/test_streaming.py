@@ -1728,6 +1728,26 @@ def test_livebook_asof_rewinds_event_time():
     assert lb.asof("poly", "P1", 99.9) is None             # before history
 
 
+def test_livebook_rejects_older_and_equal_timestamp_depthless_quotes():
+    import dataclasses
+    from bot.streaming.engine import LiveBook
+    lb = LiveBook()
+    base = q("poly", "P1", yes_ask=0.40, ya=10)
+    full = dataclasses.replace(base, yes_ask_levels=((0.40, 10.0),))
+    full.exchange_ts = 100.0
+    assert lb.update(full)
+
+    old = dataclasses.replace(base, yes_ask=0.39)
+    old.exchange_ts = 99.9
+    assert not lb.update(old)
+    assert lb.get("poly", "P1").yes_ask == 0.40
+
+    ticker = dataclasses.replace(base, yes_ask=0.38)
+    ticker.exchange_ts = 100.0
+    assert not lb.update(ticker)
+    assert lb.get("poly", "P1").yes_ask_levels == ((0.40, 10.0),)
+
+
 def test_aligned_edge_separates_standing_from_skew_phantom(monkeypatch):
     import dataclasses
     import time as _time
@@ -1836,3 +1856,174 @@ def test_comovement_separates_dislocation_from_conflict():
     # below 8 paired ticks -> no verdict either way
     eng._comove[key] = deque([(0.03, -0.03)] * 5)
     assert eng._comove_corr(key) is None
+
+
+def test_read_only_stream_records_episode_and_never_needs_executor():
+    from bot.data.store import Store
+
+    now = [10.0]
+    store = Store(":memory:")
+    eng = StreamingEngine(
+        executor=None,
+        fee_models={"kalshi": ZeroFeeModel(), "polymarket_com": ZeroFeeModel()},
+        min_edge=0.0, cooldown=0.0, clock=lambda: now[0], store=store,
+        read_only=True, require_rules_verify=True,
+    )
+    pair = ConfirmedPair("E1", "kalshi", "K1", "polymarket_com", "P1")
+    eng.set_pairs([pair])
+    eng.rules_checked.add(pair.key)
+    eng.verified_pairs.add(pair.key)
+
+    asyncio.run(eng.on_quote(q(
+        "kalshi", "K1", yes_ask=0.40, ya=10, no_ask=0.65, na=10)))
+    asyncio.run(eng.on_quote(q(
+        "polymarket_com", "P1", yes_ask=0.62, ya=10, no_ask=0.55, na=10)))
+    now[0] = 11.25
+    asyncio.run(eng.on_quote(q(
+        "polymarket_com", "P1", yes_ask=0.62, ya=12, no_ask=0.53, na=12)))
+    now[0] = 12.5
+    asyncio.run(eng.on_quote(q(
+        "polymarket_com", "P1", yes_ask=0.62, ya=12, no_ask=0.62, na=12)))
+
+    row = store.conn.execute("SELECT * FROM shadow_edge_episodes").fetchone()
+    assert row["status"] == "closed" and row["close_reason"] == "edge_gone"
+    assert row["duration_s"] == 2.5 and row["observations"] == 2
+    assert round(row["peak_edge"], 2) == 0.07
+    assert round(row["peak_profit"], 2) == 0.70  # bottlenecked by K's 10-contract depth
+
+
+def test_read_only_engine_rejects_executor_and_guards_order_helpers():
+    fake = FakeExec()
+    try:
+        StreamingEngine(executor=fake, read_only=True)
+    except ValueError as exc:
+        assert "executor=None" in str(exc)
+    else:
+        assert False, "read-only engine accepted an executor"
+
+    eng = StreamingEngine(executor=None, read_only=True)
+    # Even mutation after construction cannot make a guarded helper submit an order.
+    eng.executor = fake
+    try:
+        asyncio.run(eng._execute_guarded(object()))
+    except RuntimeError as exc:
+        assert "disabled" in str(exc)
+    else:
+        assert False, "read-only order helper did not fail closed"
+    assert fake.calls == []
+
+
+def test_read_only_exact_crypto_records_oracle_unproven_candidate_separately():
+    from bot.data.store import Store
+
+    store = Store(":memory:")
+    eng = StreamingEngine(
+        executor=None,
+        fee_models={"kalshi": ZeroFeeModel(), "polymarket_com": ZeroFeeModel()},
+        min_edge=0.0, empirical_min_obs=10, store=store, read_only=True,
+        require_rules_verify=True,
+    )
+    pair = ConfirmedPair(
+        "E1", "kalshi", "KXBTC15M-26JUL130045-45",
+        "polymarket_com", "btc-updown-15m-1783917000",
+    )
+    eng.set_pairs([pair])
+    eng.rules_checked.add(pair.key)  # checked, but explicitly not identical
+    asyncio.run(eng.on_quote(q(
+        "kalshi", pair.market_a, yes_ask=0.40, ya=10, no_ask=0.65, na=10)))
+    asyncio.run(eng.on_quote(q(
+        "polymarket_com", pair.market_b,
+        yes_ask=0.62, ya=10, no_ask=0.55, na=10)))
+    row = store.conn.execute("SELECT * FROM shadow_edge_episodes").fetchone()
+    assert row["qualification"] == "oracle_unproven"
+    assert row["screen_reason"] == "price_history_unproven"
+
+
+def test_read_only_exact_crypto_freezes_first_source_gated_entry():
+    from types import SimpleNamespace
+
+    from bot.data.store import Store
+
+    now = [10.0]
+    assessment = SimpleNamespace(
+        eligible=True, reason="eligible", path_aligned=True, remaining_s=8.0,
+        cf_move_bps=-12.0, chainlink_move_bps=-10.0,
+        path_gap_bps=2.0, min_distance_bps=10.0,
+        cf_age_ms=20.0, chainlink_age_ms=30.0,
+        uncertainty_bps=4.0, cf_samples=52,
+    )
+    store = Store(":memory:")
+    eng = StreamingEngine(
+        executor=None,
+        fee_models={"kalshi": ZeroFeeModel(), "polymarket_com": ZeroFeeModel()},
+        min_edge=0.0, clock=lambda: now[0], store=store, read_only=True,
+        oracle_guard=lambda event_key: assessment,
+    )
+    pair = ConfirmedPair(
+        "kalshi:KXBTC15M-26JUL131745-45|"
+        "polymarket_com:btc-updown-15m-1783978200",
+        "kalshi", "KXBTC15M-26JUL131745-45",
+        "polymarket_com", "btc-updown-15m-1783978200",
+    )
+    yq = q("polymarket_com", pair.market_b, yes_ask=0.40, ya=10)
+    nq = q("kalshi", pair.market_a, no_ask=0.55, na=10)
+    yq.timestamp = nq.timestamp = 100.0
+    eng._touch_shadow_edge(pair.key, pair, 0.05, yq, nq, 10)
+    now[0] = 10.3
+    eng._touch_shadow_edge(pair.key, pair, 0.05, yq, nq, 10)
+    row = store.conn.execute("SELECT * FROM shadow_edge_episodes").fetchone()
+    assert row["qualified_edge"] == 0.05
+    assert row["source_qualified_edge"] == 0.05
+    assert row["path_qualified_edge"] == 0.05
+    assert row["oracle_eligible"] == 1
+
+
+def test_crypto_oracle_gate_can_override_generic_price_screen():
+    """A cheap cross-oracle sum is not a false match for an exact asset/window.
+
+    Quote-only reporting remains screened, while the independently source-qualified
+    lanes may freeze an entry after the same microstructure checks.
+    """
+    from types import SimpleNamespace
+
+    from bot.data.store import Store
+
+    now = [10.0]
+    assessment = SimpleNamespace(
+        eligible=True, reason="eligible", path_aligned=True, remaining_s=8.0,
+        cf_move_bps=20.0, chainlink_move_bps=24.0,
+        path_gap_bps=4.0, min_distance_bps=20.0,
+        cf_age_ms=20.0, chainlink_age_ms=30.0,
+        uncertainty_bps=5.0, cf_samples=52,
+    )
+    store = Store(":memory:")
+    eng = StreamingEngine(
+        executor=None,
+        fee_models={"kalshi": ZeroFeeModel(), "polymarket_com": ZeroFeeModel()},
+        min_edge=0.0, clock=lambda: now[0], store=store, read_only=True,
+        oracle_guard=lambda event_key: assessment,
+    )
+    pair = ConfirmedPair(
+        "kalshi:KXBTC15M-26JUL131745-45|"
+        "polymarket_com:btc-updown-15m-1783978200",
+        "kalshi", "KXBTC15M-26JUL131745-45",
+        "polymarket_com", "btc-updown-15m-1783978200",
+    )
+    yq = q("kalshi", pair.market_a, yes_ask=0.40, ya=10)
+    nq = q("polymarket_com", pair.market_b, no_ask=0.50, na=10)
+    yq.timestamp = nq.timestamp = 100.0
+    eng._touch_shadow_edge(
+        pair.key, pair, 0.10, yq, nq, 10,
+        qualification="oracle_unproven",
+        screen_reason="crypto_oracle_divergence",
+    )
+    now[0] = 10.3
+    eng._touch_shadow_edge(
+        pair.key, pair, 0.10, yq, nq, 10,
+        qualification="oracle_unproven",
+        screen_reason="crypto_oracle_divergence",
+    )
+    row = store.conn.execute("SELECT * FROM shadow_edge_episodes").fetchone()
+    assert row["qualified_edge"] is None
+    assert row["path_qualified_edge"] == 0.10
+    assert row["source_qualified_edge"] == 0.10

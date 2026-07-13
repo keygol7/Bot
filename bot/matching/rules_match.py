@@ -25,6 +25,41 @@ log = logging.getLogger("bot.matching.rules_match")
 
 CompleteFn = Callable[[str], str]
 
+
+def obvious_rules_mismatch(
+    rules_a: str,
+    rules_b: str,
+    title_a: str = "",
+    title_b: str = "",
+) -> str | None:
+    """Identify explicit, non-interpretive differences in named settlement sources."""
+    a, b = (rules_a or "").lower(), (rules_b or "").lower()
+    a_nws = "national weather service" in a or "nws climatological" in a
+    b_nws = "national weather service" in b or "nws climatological" in b
+    a_wu = "wunderground" in a or "weather underground" in a
+    b_wu = "wunderground" in b or "weather underground" in b
+    if (a_nws and b_wu) or (a_wu and b_nws):
+        return "settlement source mismatch: NWS Climatological Report vs Wunderground"
+
+    a_cf = "cf benchmarks" in a or "bitcoin real-time index" in a or "brti" in a
+    b_cf = "cf benchmarks" in b or "bitcoin real-time index" in b or "brti" in b
+    a_binance = "binance" in a
+    b_binance = "binance" in b
+    if (a_cf and b_binance) or (a_binance and b_cf):
+        return "settlement source mismatch: CF Benchmarks index vs Binance candle"
+
+    from bot.matching.llm_match import obvious_contract_mismatch
+    from bot.models import MarketQuote
+
+    # Reuse title-level deterministic checks after enriching each side with its
+    # published rules.  This catches scope/comparator facts omitted by one title.
+    qa = MarketQuote(venue="a", market_id="", title=f"{title_a} {rules_a}")
+    qb = MarketQuote(venue="b", market_id="", title=f"{title_b} {rules_b}")
+    mismatch = obvious_contract_mismatch(qa, qb)
+    if mismatch:
+        return mismatch
+    return None
+
 _PROMPT = """\
 You are comparing the RESOLUTION RULES of two prediction markets from different
 exchanges to decide if they are the SAME CONTRACT — such that buying YES on one and

@@ -63,3 +63,24 @@ def test_apply_book_message_live_fp_shape():
                 "ts": "2026-07-08T22:31:18.000000Z"}})
     assert not gap and q.yes_ask is None        # the only NO bid was removed
     assert q.no_ask == 0.45                     # yes side untouched
+
+
+def test_apply_book_message_preserves_subpenny_dollar_prices():
+    from bot.venues.kalshi import apply_book_message
+    books, seqs = {}, {}
+    q, gap = apply_book_message(books, seqs, {
+        "type": "orderbook_snapshot", "sid": 4, "seq": 1,
+        "msg": {"market_ticker": "KXBTC15M-TEST",
+                "yes_dollars": [["0.9990", "12.00"]],
+                "no_dollars": [["0.9980", "7.00"]]},
+    })
+    assert not gap
+    assert q.no_ask == 0.001 and q.yes_ask == 0.002
+    assert q.timestamp > 0
+
+    q, gap = apply_book_message(books, seqs, {
+        "type": "orderbook_delta", "sid": 4, "seq": 2,
+        "msg": {"market_ticker": "KXBTC15M-TEST", "side": "yes",
+                "price_dollars": "0.9990", "delta_fp": "-12.00"},
+    })
+    assert not gap and q.no_ask is None and q.yes_ask == 0.002

@@ -1452,16 +1452,25 @@ class Executor:
         if yes_susp != no_susp:
             no_first = no_susp
         else:
-            # tie (both proven or both unproven): break by FAMILY fail rate — a
-            # brand-new overnight kalshi ITF market inherits its family's refusal
-            # history, so its first-ever attempt fires kalshi first (free skip)
-            # instead of paying an unwind to discover the refusal
-            yr = _family_fail_rate(opp.buy_yes_venue, opp.buy_yes_market)
-            nr = _family_fail_rate(opp.buy_no_venue, opp.buy_no_market)
-            if yr >= 0 and nr >= 0 and abs(yr - nr) > 0.15:
-                no_first = nr > yr
+            # Polymarket.com is a separate CLOB/account from polymarket_us and is
+            # initially unproven even when the US venue has a long fill history.
+            # On a tie, probe Pcom first so an auth/balance/FOK rejection is a clean
+            # skip rather than a filled Kalshi leg that must be unwound. Once live
+            # market-specific fills exist, the reliability logic above takes over.
+            pcom = "polymarket_com"
+            if ((opp.buy_yes_venue == pcom) != (opp.buy_no_venue == pcom)):
+                no_first = opp.buy_no_venue == pcom
             else:
-                no_first = opp.buy_no_venue == tfv and opp.buy_yes_venue != tfv
+                # tie (both proven or both unproven): break by FAMILY fail rate — a
+                # brand-new overnight kalshi ITF market inherits its family's refusal
+                # history, so its first-ever attempt fires kalshi first (free skip)
+                # instead of paying an unwind to discover the refusal
+                yr = _family_fail_rate(opp.buy_yes_venue, opp.buy_yes_market)
+                nr = _family_fail_rate(opp.buy_no_venue, opp.buy_no_market)
+                if yr >= 0 and nr >= 0 and abs(yr - nr) > 0.15:
+                    no_first = nr > yr
+                else:
+                    no_first = opp.buy_no_venue == tfv and opp.buy_yes_venue != tfv
         if no_first:
             first_vn, first_m, first_side = opp.buy_no_venue, opp.buy_no_market, Side.NO
             second_vn, second_m, second_side = opp.buy_yes_venue, opp.buy_yes_market, Side.YES

@@ -338,6 +338,26 @@ def test_take_first_venue_fires_rejection_prone_leg_first():
     assert report.status is ExecStatus.SKIPPED and not risk.is_killed
 
 
+def test_unproven_polymarket_com_leg_fires_before_kalshi():
+    # The existing account may prefer polymarket_us, but Pcom is a distinct CLOB
+    # and funding/auth domain. Its first FOK must prove itself before Kalshi is taken.
+    pcom = FakeVenue(
+        "polymarket_com",
+        [res("polymarket_com", Side.NO, OrderStatus.KILLED, 0, None)],
+    )
+    kalshi = FakeVenue("kalshi", [])
+    risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))
+    ex = Executor(
+        {v.name: v for v in [pcom, kalshi]}, risk,
+        fee_models={v.name: ZeroFeeModel() for v in [pcom, kalshi]},
+        max_order_contracts=2, take_first_venue="polymarket_us",
+    )
+    report = asyncio.run(ex.execute(opp(yv="kalshi", nv="polymarket_com")))
+    assert len(pcom.calls) == 1
+    assert kalshi.calls == []
+    assert report.status is ExecStatus.SKIPPED and not risk.is_killed
+
+
 def _rel_exec(venues, store=None):
     """Executor with the empirical reliability gate armed (probe 2 / proven 3 / max-fails 2)."""
     risk = RiskManager(RiskLimits(max_position_per_market=1e9, max_total_exposure=1e12))

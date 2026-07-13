@@ -1,4 +1,4 @@
-"""Self-hosted arbitrage + directional trading bot for Kalshi and Polymarket US.
+"""Self-hosted trading bot for Kalshi, Polymarket US, and opt-in Polymarket.com.
 
 The package is split so the deterministic, latency-critical core (models, fees,
 arbitrage, risk, in-memory book, persistence) imports only the standard library.

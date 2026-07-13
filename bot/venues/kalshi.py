@@ -150,7 +150,7 @@ def apply_book_message(books: dict, seqs: dict, data: dict) -> tuple:
     number was skipped and the caller must reconnect for fresh snapshots (the local
     book can no longer be trusted). Pure: no I/O, unit-testable.
 
-    Kalshi book semantics: the book holds YES bids and NO bids (in cents); the cost
+    Kalshi book semantics: the book holds YES bids and NO bids (in dollars); the cost
     to buy YES crosses the best NO bid — normalize_orderbook owns that math (and the
     8-level ladders), so WS books and REST books CANNOT drift in interpretation."""
     typ = data.get("type")
@@ -168,9 +168,9 @@ def apply_book_message(books: dict, seqs: dict, data: dict) -> tuple:
         def _levels(side):
             out = {}
             for p, q in (m.get(side) or []):
-                out[int(p)] = float(q)
+                out[round(float(p) / 100.0, 4)] = float(q)
             for p, q in (m.get(side + "_dollars") or []):
-                out[round(float(p) * 100)] = float(q)
+                out[round(float(p), 4)] = float(q)
             return out
         books[t] = {"yes": _levels("yes"), "no": _levels("no")}
     elif typ == "orderbook_delta":
@@ -179,10 +179,10 @@ def apply_book_message(books: dict, seqs: dict, data: dict) -> tuple:
             return None, False               # delta before its snapshot — ignore
         side = m.get("side")
         price = m.get("price")
-        if price is None:
+        if price is not None:
+            price = float(price) / 100.0
+        else:
             price = m.get("price_dollars")   # fp-shape variant
-            if price is not None:
-                price = round(float(price) * 100)
         if side not in ("yes", "no") or price is None:
             global _BOOK_SHAPE_LOGGED
             if not _BOOK_SHAPE_LOGGED:
@@ -190,7 +190,7 @@ def apply_book_message(books: dict, seqs: dict, data: dict) -> tuple:
                 log.warning("kalshi book delta in unrecognized shape (keys=%s) — "
                             "ignoring this variant", sorted(m.keys()))
             return None, False
-        price = int(price)
+        price = round(float(price), 4)
         q = book[side].get(price, 0.0) + float(m.get("delta_fp") or m.get("delta") or 0.0)
         if q <= 1e-9:
             book[side].pop(price, None)
@@ -199,9 +199,10 @@ def apply_book_message(books: dict, seqs: dict, data: dict) -> tuple:
     else:
         return None, False
     book = books[t]
-    ob = {"yes": [[p, q] for p, q in book["yes"].items()],
-          "no": [[p, q] for p, q in book["no"].items()]}
+    ob = {"yes_dollars": [[p, q] for p, q in book["yes"].items()],
+          "no_dollars": [[p, q] for p, q in book["no"].items()]}
     quote = normalize_orderbook(t, "", ob)
+    quote.timestamp = time.time()
     ts = m.get("ts")
     if ts:
         try:

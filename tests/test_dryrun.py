@@ -81,6 +81,29 @@ def test_close_within_days_passes_max_close_ts_to_scan():
     assert captured == [None]                              # disabled -> no window
 
 
+def test_explicit_close_window_overrides_kalshi_specific_window(tmp_path):
+    captured = []
+
+    class RecordingKalshi(StubVenue):
+        async def scan_quotes(self, limit=500, *, max_close_ts=None, **kwargs):
+            captured.append(max_close_ts)
+            return []
+
+    settings = Settings(
+        db_path=str(tmp_path / "all-markets.db"),
+        scan_kalshi_close_within_days=7.0,
+    )
+    asyncio.run(run(
+        settings=settings,
+        venues=[RecordingKalshi("kalshi", {})],
+        once=True,
+        limit=0,
+        close_within_days=0.0,
+    ))
+
+    assert captured == [None]
+
+
 def test_kalshi_close_within_days_windows_kalshi_only():
     # The KALSHI-ONLY window scopes Kalshi to imminent markets with an UNBOUNDED limit (its
     # per-game lines sit past the --limit cap), while Polymarket keeps the shared limit and
@@ -146,6 +169,109 @@ def test_max_confirms_caps_llm_calls_per_cycle():
     )
     assert result.llm_confirms == 2          # capped
     assert len(calls) == 2                    # the model was called exactly twice
+
+
+def test_required_cross_venue_dedicates_matching_to_that_venue():
+    venues = [
+        StubVenue("kalshi", {"K": mq("kalshi", "K", "Same event", yes_ask=0.4)}),
+        StubVenue(
+            "polymarket_us",
+            {"U": mq("polymarket_us", "U", "Same event", no_ask=0.5)},
+        ),
+        StubVenue(
+            "polymarket_com",
+            {"C": mq("polymarket_com", "C", "Same event", no_ask=0.5)},
+        ),
+    ]
+    store = Store(":memory:")
+    fake = lambda _: '{"same_event": true, "confidence": 0.99}'
+    result = asyncio.run(run_cycle(
+        venues,
+        store=store,
+        risk=generous_risk(),
+        fee_models={v.name: ZeroFeeModel() for v in venues},
+        min_edge=0.01,
+        match_threshold=0.3,
+        complete_fn=fake,
+        limit=50,
+        required_cross_venue="polymarket_com",
+    ))
+    rows = store.conn.execute(
+        "SELECT venue_a, venue_b FROM match_verdicts"
+    ).fetchall()
+    assert result.candidate_pairs == 2
+    assert len(rows) == 2
+    assert all("polymarket_com" in (row["venue_a"], row["venue_b"]) for row in rows)
+
+
+def test_required_cross_venue_splits_llm_budget_across_both_existing_venues():
+    # Kalshi is encountered first and has enough candidates to consume the whole budget.
+    # The target mode must reserve half for US↔COM instead of starving that sports-heavy
+    # pair behind Kalshi↔COM.
+    venues = [
+        StubVenue("kalshi", {
+            "K1": mq("kalshi", "K1", "Shared match alpha"),
+            "K2": mq("kalshi", "K2", "Shared match alpha"),
+        }),
+        StubVenue("polymarket_us", {
+            "U1": mq("polymarket_us", "U1", "Shared match alpha"),
+        }),
+        StubVenue("polymarket_com", {
+            "C1": mq("polymarket_com", "C1", "Shared match alpha"),
+            "C2": mq("polymarket_com", "C2", "Shared match alpha"),
+        }),
+    ]
+    store = Store(":memory:")
+    result = asyncio.run(run_cycle(
+        venues,
+        store=store,
+        risk=generous_risk(),
+        fee_models={v.name: ZeroFeeModel() for v in venues},
+        min_edge=0.01,
+        match_threshold=0.3,
+        complete_fn=lambda _: '{"same_event": false, "confidence": 1}',
+        limit=50,
+        max_confirms=2,
+        required_cross_venue="polymarket_com",
+    ))
+    rows = store.conn.execute(
+        "SELECT venue_a, venue_b FROM match_verdicts ORDER BY venue_a, venue_b"
+    ).fetchall()
+    assert result.llm_confirms == 2
+    assert {frozenset((r["venue_a"], r["venue_b"])) for r in rows} == {
+        frozenset(("kalshi", "polymarket_com")),
+        frozenset(("polymarket_us", "polymarket_com")),
+    }
+
+
+def test_semantic_budget_is_interleaved_across_market_categories():
+    weather_a = {
+        f"W{i}": mq("polymarket_us", f"W{i}", "Highest temperature in Miami")
+        for i in range(3)
+    }
+    weather_b = {
+        f"C{i}": mq("polymarket_com", f"C{i}", "Highest temperature in Miami")
+        for i in range(3)
+    }
+    us = StubVenue("polymarket_us", {
+        **weather_a,
+        "S": mq("polymarket_us", "fwc-eng-arg", "England vs Argentina match"),
+    })
+    com = StubVenue("polymarket_com", {
+        **weather_b,
+        "T": mq("polymarket_com", "fifwc-eng-arg", "England vs Argentina match"),
+    })
+    prompts = []
+    result = asyncio.run(run_cycle(
+        [us, com], store=Store(":memory:"), risk=generous_risk(),
+        fee_models={us.name: ZeroFeeModel(), com.name: ZeroFeeModel()},
+        min_edge=0.01, match_threshold=0.3,
+        complete_fn=lambda prompt: prompts.append(prompt) or
+        '{"same_event": false, "confidence": 1}',
+        limit=50, max_confirms=2,
+    ))
+    assert result.llm_confirms == 2
+    assert any("England vs Argentina" in prompt for prompt in prompts)
 
 
 def test_discovery_off_skips_matching_but_still_scans():
@@ -362,6 +488,27 @@ def test_build_watchlist_keeps_pair_when_both_legs_scanned():
     venues = [StubVenue("kalshi", {}), StubVenue("polymarket_us", {})]
     out = asyncio.run(build_watchlist(cached, scanned, venues))
     assert len(out) == 1 and out[0].event_key == "ufc"
+
+
+def test_build_watchlist_polymarket_us_gate_ignores_other_venue_pairs():
+    """A live PUS scan must not drop a Kalshi <-> Polymarket.com pair."""
+    from bot.dryrun import build_watchlist
+
+    cached = [("kalshi", "K1", "polymarket_com", "C1", "world-cup")]
+    scanned = {
+        ("kalshi", "K1"),
+        ("polymarket_com", "C1"),
+        ("polymarket_us", "P-unrelated"),
+    }
+    venues = [
+        StubVenue("kalshi", {}),
+        StubVenue("polymarket_us", {}),
+        StubVenue("polymarket_com", {}),
+    ]
+
+    out = asyncio.run(build_watchlist(cached, scanned, venues))
+
+    assert len(out) == 1 and out[0].event_key == "world-cup"
 
 
 def test_build_watchlist_drops_thin_polymarket_leg():
@@ -670,6 +817,104 @@ def test_check_ws_probe_collects_quotes():
 
     ok, msg, samples = asyncio.run(_probe_stream(WSVenue(), ["K1", "K2", "K3"], n=2, timeout=5.0))
     assert ok and len(samples) == 2 and msg == "ok"
+
+
+def test_shadow_stream_constructs_no_executor_or_private_account_path(
+        tmp_path, monkeypatch):
+    import bot.dryrun as dr
+    from bot.streaming.engine import StreamingEngine
+
+    class PublicOnlyVenue:
+        name = "polymarket_com"
+        fee_model = ZeroFeeModel()
+
+        async def account_snapshot(self):
+            raise AssertionError("shadow mode read a private account")
+
+        async def stream_private(self):
+            raise AssertionError("shadow mode opened a private stream")
+
+        async def place_order(self, *args, **kwargs):
+            raise AssertionError("shadow mode placed an order")
+
+    settings = Settings(db_path=str(tmp_path / "shadow.db"))
+    venue = PublicOnlyVenue()
+    monkeypatch.setattr(dr, "_build_venues", lambda _settings: [venue])
+    seen = {}
+
+    async def fake_run(self, venues, refresh_specs, *, refresh_interval, initial_pairs=None):
+        seen.update(
+            executor=self.executor,
+            read_only=self.read_only,
+            venues=venues,
+            initial_pairs=initial_pairs,
+        )
+
+    monkeypatch.setattr(StreamingEngine, "run", fake_run)
+    asyncio.run(dr.stream(
+        settings=settings, read_only=True, shadow_venue="polymarket_com",
+        use_llm=False, use_embed=False, limit=0, min_edge=0.0,
+    ))
+    assert seen == {
+        "executor": None,
+        "read_only": True,
+        "venues": [venue],
+        "initial_pairs": [],
+    }
+
+
+def test_confirmed_pairs_worker_opens_an_independent_store(tmp_path):
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+
+    from bot.dryrun import _confirmed_pairs_from_db
+
+    path = str(tmp_path / "worker.db")
+    store = Store(path)
+    store.upsert_market("kalshi", "K1", "same market")
+    store.upsert_market("polymarket_com", "P1", "same market")
+    store.cache_verdict(
+        "kalshi", "K1", "polymarket_com", "P1",
+        same_event=True, confidence=1.0, event_key="E1",
+    )
+    store.close()
+
+    with ProcessPoolExecutor(
+        max_workers=1,
+        mp_context=multiprocessing.get_context("spawn"),
+    ) as pool:
+        pairs = pool.submit(_confirmed_pairs_from_db, path, {
+            "use_fingerprint": False,
+            "safe_types_only": False,
+            "max_fanout": 1,
+        }).result(timeout=10)
+
+    assert pairs == [("kalshi", "K1", "polymarket_com", "P1", "E1")]
+
+
+def test_shadow_stream_rejects_early_dispatch_actions(monkeypatch, capsys):
+    import bot.dryrun as dr
+
+    order_calls = []
+    monkeypatch.setattr(
+        dr, "test_order",
+        lambda *args, **kwargs: order_calls.append((args, kwargs)),
+    )
+    conflicts = [
+        ["--test-order", "kalshi:K1", "--fill"],
+        ["--probe-account"],
+        ["--check-flat"],
+        ["--record-transfer", "polymarket_us", "1"],
+    ]
+    for extra in conflicts:
+        try:
+            dr.main(["--shadow-stream", *extra])
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            assert False, f"shadow mode accepted conflicting action: {extra}"
+    assert order_calls == []
+    capsys.readouterr()
 
 
 def test_check_ws_probe_times_out_when_silent():
